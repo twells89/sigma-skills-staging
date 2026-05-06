@@ -159,10 +159,17 @@ overview_layout = "<Page>\n" \
 
 ## Multi-series chart patterns
 
-### Small multiples / trellis → multi-series line chart
+### Small multiples / trellis
 
-Tableau "small multiples" have no direct Sigma equivalent. Approximate with a single line chart,
-one series per segment value:
+Sigma supports trellis (small multiples / panel charts) on bar, line, area, scatter, pie, donut, and combo charts — but **only via the chart editor UI**. POST/PUT silently drop every trellis-shaped field tried so far (`trellisRow`, `trellisColumn`, `trellisRows`, `trellisColumns`, `trellisBy`, `format.trellis`, top-level `trellis`). A trellis applied via the UI also does not appear in GET; the spec returns only the un-trellised chart.
+
+**Workflow for a Tableau view that uses trellis:**
+
+1. Build the chart via spec with the trellising dimension(s) listed in `columns` (so they're available in the chart's column pool) — but reference only `xAxis` / `yAxis` in the spec.
+2. After PUT, open the chart in the editor → **Trellis** panel → drag the dimension into Trellis row / column.
+3. The chart's data parity stays correct (Phase 6 validation works against the un-trellised aggregates the spec exposes); only the visual paneling needs manual setup.
+
+If you need a spec-only approximation (no manual UI step) and the panel-by dimension has few values, fall back to a multi-series line chart — one series per panel value:
 
 ```json
 {
@@ -307,6 +314,7 @@ the chart editor after publish.
 | Property | Set via spec? | How to apply post-publish |
 |---|---|---|
 | Bar chart orientation (horizontal vs vertical) | No | Chart editor → Properties → Chart type → Horizontal icon |
+| Trellis (small multiples / panel charts) on any chart kind | No | Chart editor → Trellis panel → drag dimension to Trellis row / column / by-series |
 | Axis label rotation (0°, 45°, 90°) | No | Chart editor → Format → X-axis → Label rotation |
 | Series color | No (not yet) | Chart editor → Properties → Color |
 | Chart color palette | No | Chart editor → Properties → Color |
@@ -329,7 +337,7 @@ Check GET round-trip before relying on this — when GET starts returning `color
 | Sigma kind | Tableau equivalent / use |
 |---|---|
 | `kpi-chart` | Big number / scorecard |
-| `line-chart` | Line chart, small multiples (approximated) |
+| `line-chart` | Line chart, small multiples (trellis applied via UI; or multi-series approximation) |
 | `area-chart` | Area chart (filled line) |
 | `bar-chart` | Bar chart, horizontal bar, histogram, map (approximated) |
 | `combo-chart` | Dual-axis / combination chart (bar + line) |
@@ -345,7 +353,9 @@ Check GET round-trip before relying on this — when GET starts returning `color
 
 > **`pie-chart` not `pie`, `donut-chart` not `donut`.** The API rejects `"kind": "pie"` and `"kind": "donut"` with `Invalid kind`. Always use the `-chart` suffix for these two. The official example library shows the wrong values — do not follow it.
 
-Not supported: map, bullet chart, gantt, small multiples / trellis.
+Not supported via spec API: map, bullet chart, gantt.
+
+Trellis (small multiples / panel charts) is supported in Sigma but **UI-only** — see the "Small multiples / trellis" section above for the workflow.
 
 ## Element-type field requirements
 

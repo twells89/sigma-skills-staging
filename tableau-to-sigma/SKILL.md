@@ -117,8 +117,10 @@ Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `sc
 > follow it. If uncertain about a kind, GET an existing workbook spec (`GET /v2/workbooks/<id>/spec`)
 > and read the `kind` fields directly.
 
-Does **not** support: maps, small multiples / trellis, bullet, gantt.
-Approximate with: bar charts (for maps), multi-series line charts (for small multiples).
+Does **not** support via the spec API: maps, bullet, gantt.
+Approximate with: bar charts (for maps).
+
+**Trellis (small multiples) is supported in Sigma but configured UI-only.** Bar / line / area / scatter / pie / donut / combo charts can be trellised via the chart editor's **Trellis** panel (Trellis row / Trellis column / Trellis by series). The trellis configuration is **not** exposed in the workbook spec — POST/PUT silently drop fields like `trellisRow`, `trellisColumn`, `trellisRows`, `trellisColumns`, `trellisBy`, and `format.trellis`, and a trellis applied via the UI does not appear in the GET spec either. Build the chart with the right dimensions via spec, then trellis it manually post-publish.
 
 Control types supported: `list`, `date-range`, `text`, `text-area`, `segmented`, `number`, `number-range`, `slider`, `range-slider`, `top-n`.
 See `refs/workbook-layout.md` for full control element spec patterns.
