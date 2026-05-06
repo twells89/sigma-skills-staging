@@ -104,6 +104,8 @@ Use the images to understand:
 - The rough grid layout of each page (columns × rows)
 - **Page titles, section headers, and any free-text annotations on the dashboard surface** — these are real content (not metadata) and need to be recreated as `text` elements in the Sigma spec. The page tab name (`page['name']`) is *not* a substitute; it only appears in the tab bar, not on the canvas. If the Tableau dashboard shows a heading like "Orders Dashboard" at the top of the page, add a `text` element with `body: "# Orders Dashboard"` and reserve a row for it in the layout.
 
+**Also extract from each view CSV the distinct values of every dimension column and the min/max of every date column** — write them down. Phase 2.5 compares these against the warehouse to detect view-level filters that the Tableau MCP doesn't expose explicitly. A view that emits only `{Q1, Q2}` for a Quarter column when the warehouse contains all four quarters is a filter, not a coincidence.
+
 Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`, `kpi-chart`, `pie-chart`, `donut-chart`, `table`, `pivot-table`, `control`, `text`, `image`, `container`.
 
 > **Common kind mistakes — all three are rejected by the API:**
@@ -176,6 +178,52 @@ curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
 
 These are the **exact** column names to use in data model element formulas:
 `[TABLE_NAME/Column Name]`.
+
+---
+
+## Phase 2.5 — Detect view-level filters (mandatory)
+
+> **The Tableau view CSV is the source of truth for what the dashboard *renders* — not what's in the warehouse.** Tableau MCP does not expose worksheet/dashboard filters directly, so you have to **infer them from the data the view emits**. A view that omits part of a dimension's values isn't a coincidence; it's a filter, and you must translate it into Sigma. Skipping this step ships a workbook that "renders fine" but disagrees with the source on totals, axis ticks, or visible categories.
+
+### How to detect
+
+For every dimension column on every view, compare:
+
+| Source                         | Query                                              |
+|--------------------------------|----------------------------------------------------|
+| **View CSV** (Phase 1d)        | Distinct values in the column; min/max for dates   |
+| **Warehouse** (after Phase 2)  | `SELECT DISTINCT <col>` / `SELECT MIN, MAX <date>` via `mcp__sigma-mcp-v2__query` (`type: "connection"` with the table inodeId) |
+
+Any value present in the warehouse but missing from the CSV implies a filter on that column.
+
+```sql
+-- Warehouse range check
+SELECT MIN("DATE") AS min_date, MAX("DATE") AS max_date,
+       COUNT(DISTINCT DATE_TRUNC('quarter', "DATE")) AS qtr_count
+FROM "connection"."<table-inodeId>"
+```
+
+### Common patterns
+
+| View CSV symptom                                    | Likely Tableau filter            | Sigma translation |
+|-----------------------------------------------------|----------------------------------|-------------------|
+| Only some values of a categorical column appear     | "Keep only" / dimension filter   | `list` control with `mode: "include"`, or element-level filter |
+| Date min/max is narrower than warehouse             | Date / relative-date filter      | `date-range` control — `mode: "current"` + `unit: "year"\|"quarter"\|...` for relative; `mode: "between"` with explicit `startDate`/`endDate` for fixed |
+| Numeric column is bounded                           | Range filter                     | `number-range` or `range-slider` control, or element-level filter |
+| Only top N items by some measure                    | Top-N filter                     | `top-n` control or element-level `top-n` filter (see `refs/workbook-layout.md`) |
+
+### Where to apply the filter
+
+Prefer a **workbook-level control filtering the master table** — every chart that sources from master inherits the filter, matching how a Tableau dashboard filter works. Use **element-level filters** only when the filter is fixed and shouldn't be user-adjustable (a hard-coded slice).
+
+Control filter target shape:
+```json
+"filters": [{"source": {"kind": "table", "elementId": "master"}, "columnId": "<master-col-id>"}]
+```
+
+> **A relative-date filter that "rolls forward" in Tableau** ("this year", "last 30 days", "year to date") must be translated as a relative `date-range` control (`mode: "current"`, `unit: ...`) — not a fixed start/end date. Hard-coding `startDate`/`endDate` freezes the filter to today's date and breaks tomorrow.
+
+> **Phase 6 will not catch a missed filter on its own.** Data parity in Phase 6 compares Sigma rows to Tableau rows for the dimensions you query — if your Sigma chart includes extra rows the CSV never had, the comparison only flags missing rows from Tableau, not extra rows in Sigma. Always sanity-check distinct values and date ranges side-by-side before declaring parity.
 
 ---
 
@@ -535,6 +583,7 @@ alongside them. Don't mistake the noise for a real query failure.
 | Empty containers visible on page | Container elements in spec but not referenced as `<GridContainer>` in layout XML | Add them to layout as `<GridContainer>` wrapping their child KPIs |
 | Wrong endpoint — workbook created instead of data model | Called `/v2/workbooks` instead of `/v2/dataModels/spec` | Delete the workbook; re-POST to the correct endpoint |
 | Bar chart renders vertical but Tableau shows horizontal bars | Bar chart orientation is UI-only — `"orientation": "horizontal"` is silently accepted and dropped | Set it manually post-publish: chart editor → Properties → Chart type → Horizontal icon |
+| Sigma chart shows dimension values that Tableau's view never displays (e.g. extra quarters, extra regions, dates outside Tableau's range) | Tableau view has a worksheet/dashboard filter you didn't translate — the MCP does not expose filters explicitly, so they're invisible unless you compare CSV ranges to warehouse ranges | Phase 2.5 — diff distinct values / date min-max from view CSV vs the warehouse; add the missing filter as a `date-range`/`list`/`top-n` control or element-level filter |
 | Axis label rotation not applied | Axis rotation is UI-only — not stored in or returned by spec API | Set it manually post-publish: chart editor → Format → X-axis → Label rotation |
 | Dashboard title appears left-aligned despite Tableau showing it centered | Text element alignment is UI-only — `text` element spec only persists `id`/`kind`/`body` | Set in element editor → Format → Alignment after publish |
 | `mcp__sigma-mcp-v2__query` with `type: "workbook"` returns "Table X not found" | Workbook queries don't resolve element names (e.g., `"Master"`) as table refs | Use `type: "connection"` with the raw table inodeId for data validation queries |
