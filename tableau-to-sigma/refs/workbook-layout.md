@@ -459,18 +459,20 @@ Use `rowsBy`, `columnsBy`, and `values`. **Do NOT use `rows` or `columnGroups`**
 }
 ```
 
-`backgroundScale` — applies a color gradient across cell values (diverging scale):
+`backgroundScale` — applies a color gradient across cell values (diverging or sequential scale). Use this on a `pivot-table` to render a heatmap-equivalent of a Tableau heatmap view:
 
 ```json
 {
   "conditionalFormats": [{
     "type": "backgroundScale",
     "columns": ["pcy-margin"],
-    "scheme": ["rgb(140,13,37)", "rgb(255,255,255)", "rgb(19,75,133)"],
+    "scheme": ["#8C0D25", "#FFFFFF", "#134B85"],
     "includeValues": true
   }]
 }
 ```
+
+> **Use hex (`#RRGGBB`) colors, not `rgb(...)`.** Verified May 2026 — `rgb(140,13,37)` in any spec field gets blocked by Sigma's Cloudflare WAF with HTTP 403 (interpreted as a SQL-injection-like pattern). Hex strings pass cleanly. This applies to every spec field that takes a color string, not just `backgroundScale.scheme`.
 
 ### Table element extras
 

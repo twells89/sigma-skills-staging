@@ -109,6 +109,39 @@ Use whichever default value lands the null rows in the same bucket Tableau's ELS
 catching them in (-1 forces "Bronze" for the lifetime-revenue tier; pick a value below
 all thresholds).
 
+### Worse case: null misbucketed into the literal else string
+
+The same null-propagation pattern causes a **silent misbucketing** when the formula is a
+chain of equality checks on a nullable source, and the final else returns a string
+literal instead of a comparison. Example — categorizing weekday names from a nullable date:
+
+```
+If(Weekday([Ship Date]) = 1, "1 Sunday",
+  If(Weekday([Ship Date]) = 2, "2 Monday",
+    ...
+    If(Weekday([Ship Date]) = 6, "6 Friday",
+       "7 Saturday")))   // ← every null Ship Date lands here, silently
+```
+
+`Weekday(NULL)` is NULL; `NULL = 1` is NULL (treated as false); every comparison falls
+through to the literal `"7 Saturday"`. The output table now has correctly-bucketed
+weekdays for non-null rows AND null-shipping orders piled into Saturday — with no error
+indication anywhere. Verified May 2026: 53 rows with `Ship Date Key` null all rendered as
+"7 Saturday" until a null guard was added.
+
+**Fix — wrap the entire chain with an outer null guard so nulls return Null instead of
+falling through to the else:**
+
+```json
+{
+  "formula": "If(IsNull([Ship Date]), Null, If(Weekday([Ship Date]) = 1, \"1 Sunday\", If(Weekday([Ship Date]) = 2, \"2 Monday\", If(Weekday([Ship Date]) = 3, \"3 Tuesday\", If(Weekday([Ship Date]) = 4, \"4 Wednesday\", If(Weekday([Ship Date]) = 5, \"5 Thursday\", If(Weekday([Ship Date]) = 6, \"6 Friday\", \"7 Saturday\")))))))"
+}
+```
+
+Apply this defensively to every nested-If categorization formula whose source column
+might be null — date-derived dimensions (Weekday/Month/Year), lookup-derived fields,
+and any column that could carry NULL from an orphan join.
+
 ## Cross-year month rollup (Tableau MONTH part vs Sigma DateTrunc)
 
 A Tableau dimension built from `MONTH([Order Date])` (the date *part*, not a truncation)

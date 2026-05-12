@@ -65,6 +65,18 @@ mcp__tableau__list-datasources
 mcp__tableau__search-content   terms="<datasource name>"   filter.contentTypes=["workbook"]
 ```
 
+> **Check `hasExtracts` on the search result.** When `hasExtracts: true` on a workbook
+> (and especially on its datasource), the Tableau view CSVs reflect a **frozen snapshot**
+> of the warehouse — not its current state. Sigma always reads the live warehouse, so the
+> absolute counts in Tableau views will diverge from Sigma values, even when the chart
+> *structure* (dimensions, aggregations, breakdowns) is identical.
+>
+> When this happens: the Phase 6 row-count comparison will fail dramatically (one view I
+> converted showed 70 orders in Tableau while Sigma reported 526), but the relative
+> proportions and bucket structures still match. Tell the user up front that absolute
+> totals may differ, and verify shape parity (does each weekday × year combination have a
+> value? are the status categories the same?) instead of value-by-value parity.
+
 ### 1c. Get workbook views
 
 ```
@@ -274,6 +286,11 @@ for page in spec.get('pages', []):
         if el.get('name'):
             all_element_names.add(el['name'])
 
+# Spec-level scan — rgb(...) color strings anywhere in the spec get blocked by
+# Sigma's Cloudflare WAF with HTTP 403. Use hex (#RRGGBB) instead.
+if 'rgb(' in json.dumps(spec):
+    errors.append('spec contains rgb(...) color strings — Cloudflare WAF blocks these with HTTP 403. Replace every rgb(R,G,B) with hex #RRGGBB.')
+
 for page in spec.get('pages', []):
     for el in page.get('elements', []):
         kind = el.get('kind', '')
@@ -294,7 +311,8 @@ for page in spec.get('pages', []):
         # Bare formula refs without a source prefix — must resolve to a column on the same element.
         # Prefixed refs ([Prefix/Col]) — Prefix must be own source OR another element's name.
         for col in cols:
-            for ref in re.findall(r'\[([^\]]+)\]', col.get('formula', '')):
+            formula = col.get('formula', '') or ''
+            for ref in re.findall(r'\[([^\]]+)\]', formula):
                 if '/' in ref:
                     prefix = ref.split('/', 1)[0]
                     if prefix not in own_prefixes and prefix not in all_element_names:
@@ -302,6 +320,13 @@ for page in spec.get('pages', []):
                 else:
                     if ref not in el_col_names:
                         errors.append(f'{name}: bare ref [{ref}] has no match on the same element')
+
+            # Nested-If categorization on a date function with no outer IsNull guard.
+            # null Weekday/Month/etc. falls through every comparison and lands in the
+            # else string, silently misbucketing null rows.
+            if re.search(r'\b(Weekday|Month|Year|Quarter|Day|Hour|Minute)\s*\(', formula, re.IGNORECASE):
+                if 'If(' in formula and 'IsNull(' not in formula and 'Coalesce(' not in formula:
+                    errors.append(f'{name}.{col.get(\"name\")}: nested-If on a date function without IsNull/Coalesce — null source values silently fall through to the else branch. Wrap with If(IsNull([source]), Null, ...).')
 
         # Common kind mistakes — API rejects all three
         if kind == 'kpi':
