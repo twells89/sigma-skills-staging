@@ -208,7 +208,25 @@ If you need a spec-only approximation (no manual UI step) and the panel-by dimen
 
 All `yAxis` entries are shown as separate series.
 
-**No `color` channel on `bar-chart` or `line-chart`.** The API does not support a `color` field on these types. To encode color by category, add a separate `yAxis` series per category using an `If()` formula:
+**Color channel on `bar-chart` / `line-chart`.** Both kinds accept an element-level `color` object that encodes a category column as series color. Verified May 2026 — the field persists on round-trip and the element renders the per-category breakdown:
+
+```json
+{
+  "kind": "bar-chart",
+  "columns": [
+    {"id": "bar-region", "name": "Region",   "formula": "[Master/Region]"},
+    {"id": "bar-seg",    "name": "Segment",  "formula": "[Master/Segment]"},
+    {"id": "bar-sales",  "name": "Sales",    "formula": "Sum([Master/Sales])"}
+  ],
+  "xAxis": {"id": "bar-region"},
+  "yAxis": [{"id": "bar-sales"}],
+  "color": {"by": "category", "column": "bar-seg"}
+}
+```
+
+`color.by` is `"category"`, `color.column` is the column ID to encode as the color dimension.
+
+If you need an explicit one-series-per-category breakdown instead (e.g., for stacked totals where you want a known fixed series set), use multiple `yAxis` entries with `If()` formulas:
 
 ```json
 { "id": "cons", "formula": "Sum(If([Master/Segment] = \"Consumer\", [Master/Sales], Null))", "name": "Consumer" },
@@ -513,7 +531,7 @@ entry specifies which columns to group by and which to aggregate:
 
 > **`pie-chart` and `donut-chart`** — NOT `pie` / `donut`. Both are rejected by the API with `Invalid kind`.
 
-Both use `color` for the dimension (slice category) and `value` for the measure. Donut additionally requires `holeValue` for the center label.
+Both use `color` for the dimension (slice category) and `value` for the measure. Donut accepts an optional `holeValue` for the center label.
 
 ```json
 {
@@ -541,7 +559,9 @@ Both use `color` for the dimension (slice category) and `value` for the measure.
 }
 ```
 
-`holeValue` can reference the same aggregate as `value` (just a second column definition) or a different one.
+`holeValue` is optional — donuts render fine without it. When set, it must reference a column ID, not a literal float (`"holeValue": 0.5` is rejected with `Invalid object: number`).
+
+> **`holeValue.id` must NOT equal `value.id`.** If both point at the same column ID, POST returns success but the entire donut element is silently dropped from the saved spec (verified May 2026). Define a second column with a distinct ID — same formula is fine — as `mea-sales2` above.
 
 ### Text element
 
