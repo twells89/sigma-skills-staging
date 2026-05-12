@@ -266,6 +266,14 @@ python3 -c "
 import json, re, sys
 spec = json.load(open('/tmp/<name>-datamodel-spec.json'))  # update filename to match your spec
 errors = []
+
+# First pass — index every element name across the spec for cross-element ref checks
+all_element_names = set()
+for page in spec.get('pages', []):
+    for el in page.get('elements', []):
+        if el.get('name'):
+            all_element_names.add(el['name'])
+
 for page in spec.get('pages', []):
     for el in page.get('elements', []):
         kind = el.get('kind', '')
@@ -273,19 +281,35 @@ for page in spec.get('pages', []):
         cols = el.get('columns', []) + el.get('metrics', [])
         el_col_names = {c['name'] for c in cols}
 
-        # Bare formula refs without a source prefix
+        # Valid prefixes for [Prefix/Col] refs on THIS element's formulas:
+        #   1. Last segment of own source.path (for warehouse-table sources) — e.g. ORDER_FACT
+        #   2. \"Custom SQL\" literal — for source.kind == \"sql\" elements
+        #   3. Any OTHER element's name in this spec — for cross-element Lookup() refs
+        src = el.get('source', {})
+        own_prefixes = set()
+        if src.get('kind') == 'warehouse-table' and src.get('path'):
+            own_prefixes.add(src['path'][-1])
+        if src.get('kind') == 'sql':
+            own_prefixes.add('Custom SQL')
+        # Bare formula refs without a source prefix — must resolve to a column on the same element.
+        # Prefixed refs ([Prefix/Col]) — Prefix must be own source OR another element's name.
         for col in cols:
             for ref in re.findall(r'\[([^\]]+)\]', col.get('formula', '')):
-                if '/' not in ref and ref not in el_col_names:
-                    errors.append(f'{name}: bare ref [{ref}] has no match')
+                if '/' in ref:
+                    prefix = ref.split('/', 1)[0]
+                    if prefix not in own_prefixes and prefix not in all_element_names:
+                        errors.append(f'{name}.{col.get(\"name\")}: ref [{ref}] — prefix \"{prefix}\" is not the element source nor a known element name in this spec')
+                else:
+                    if ref not in el_col_names:
+                        errors.append(f'{name}: bare ref [{ref}] has no match on the same element')
 
         # Common kind mistakes — API rejects all three
         if kind == 'kpi':
-            errors.append(f'{name}: invalid kind "kpi" — must be "kpi-chart"')
+            errors.append(f'{name}: invalid kind \"kpi\" — must be \"kpi-chart\"')
         if kind == 'pie':
-            errors.append(f'{name}: invalid kind "pie" — must be "pie-chart"')
+            errors.append(f'{name}: invalid kind \"pie\" — must be \"pie-chart\"')
         if kind == 'donut':
-            errors.append(f'{name}: invalid kind "donut" — must be "donut-chart"')
+            errors.append(f'{name}: invalid kind \"donut\" — must be \"donut-chart\"')
 
         # kpi-chart must have value field
         if kind == 'kpi-chart' and 'value' not in el:
@@ -297,8 +321,18 @@ for page in spec.get('pages', []):
                 errors.append(f'{name}: {kind} missing color field')
             if 'value' not in el:
                 errors.append(f'{name}: {kind} missing value field')
-        if kind == 'donut-chart' and 'holeValue' not in el:
-            errors.append(f'{name}: donut-chart missing holeValue field')
+
+        # donut-chart holeValue is optional, but if present:
+        #   - must be an object {\"id\": \"col-id\"} (literal floats are rejected)
+        #   - id must NOT equal value.id (matching IDs silently drops the entire element)
+        if kind == 'donut-chart' and 'holeValue' in el:
+            hv = el['holeValue']
+            if not isinstance(hv, dict) or 'id' not in hv:
+                errors.append(f'{name}: donut-chart holeValue must be {{\"id\": \"<col-id>\"}} — literal floats are rejected with \"Invalid object: number\"')
+            else:
+                vid = el.get('value', {}).get('id')
+                if hv.get('id') == vid:
+                    errors.append(f'{name}: donut-chart holeValue.id ({hv[\"id\"]}) equals value.id — element is silently dropped on POST. Add a second column with a distinct id (same formula is fine).')
 
         # chart types that must use yAxis, not measures
         if kind in ('bar-chart', 'line-chart', 'area-chart', 'combo-chart', 'scatter-chart'):
@@ -307,18 +341,20 @@ for page in spec.get('pages', []):
             if 'yAxis' not in el:
                 errors.append(f'{name}: {kind} missing yAxis')
 
-        # pivot-table must use rowsBy/columnsBy (object arrays) and values (string array)
-        # rows/columnGroups are silently accepted but do not render correctly
+        # pivot-table needs rowsBy (+ optionally columnsBy). Without them, the element
+        # round-trips as a single grand-total row — silent rendering failure.
         if kind == 'pivot-table':
             if 'rows' in el or 'columnGroups' in el:
                 errors.append(f'{name}: pivot-table must use rowsBy/columnsBy, not rows/columnGroups')
+            if not el.get('rowsBy'):
+                errors.append(f'{name}: pivot-table without rowsBy renders only a grand-total row — add rowsBy[{{\"id\": \"...\"}}]')
             for field in ('rowsBy', 'columnsBy'):
                 arr = el.get(field, [])
                 if arr and isinstance(arr[0], str):
-                    errors.append(f'{name}: pivot-table {field} must be object array [{{"id": "col-id"}}], not string array')
+                    errors.append(f'{name}: pivot-table {field} must be object array [{{\"id\": \"col-id\"}}], not string array')
             values = el.get('values', [])
             if values and isinstance(values[0], dict):
-                errors.append(f'{name}: pivot-table values must be string array ["col-id"], not object array')
+                errors.append(f'{name}: pivot-table values must be string array [\"col-id\"], not object array')
 
 for e in errors: print('ERROR:', e)
 sys.exit(len(errors))
@@ -404,6 +440,8 @@ Charts and KPIs on content pages source the master table element and use ITS
 `name` as prefix. **Cross-page element references are fully supported** — it is
 correct and recommended to place the master table on a single "Data" page and
 reference it from every other page's elements via `"elementId": "master"`.
+
+> **Master-table column scope determines what controls and future charts can see.** Every column that the data model element exposes does NOT have to be on the master — and pruning the master to "only what current charts need" produces a leaner spec. But the moment a user wants a new control (e.g. "filter by Ship Method"), or a follow-up chart needs a different dimension, you have to amend the master and re-PUT. Default: pull every column you've already denormalized in the data model into the master with `[Element/Col]` passthrough formulas — the master is cheap and amending it later requires a workbook spec edit even though no chart breaks.
 
 > **KPI kind is `kpi-chart`, not `kpi`.** Using `"kind": "kpi"` produces
 > `"Invalid kind: 'kpi'"`. All KPI elements must use `"kind": "kpi-chart"`.
@@ -530,6 +568,10 @@ mcp__sigma-mcp-v2__query  type="workbook"  workbookId="<wbId>"
 ```
 
 Run the queries in parallel — they're independent reads, no session contention.
+
+> **A chart element's SQL view exposes only that chart's own columns** — not the master table's. A `WHERE "m-order-date-key" BETWEEN ...` against `el-rev-by-region` fails with `Unresolved column: m-order-date-key` because that column doesn't exist on the chart's aggregated projection. Two ways to handle this:
+> - **Query the master table directly** (`FROM "workbook"."master"`) when you need to filter on a column the chart doesn't expose — then aggregate in SQL to compare to the chart's rendered values.
+> - **Skip the filter and compare what the chart shows.** Workbook control filters are applied at view time, not at API-query time, so a `type="workbook"` SQL query against a chart element always returns the full unfiltered dataset. If the Tableau CSV is from a filtered dashboard view, you'll need to apply the same predicate against the master table to match.
 
 ### 6b. Compare to Tableau CSVs
 
