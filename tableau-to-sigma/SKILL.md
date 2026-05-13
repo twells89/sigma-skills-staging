@@ -118,7 +118,7 @@ Use the images to understand:
 
 **Also extract from each view CSV the distinct values of every dimension column and the min/max of every date column** — write them down. Phase 2.5 compares these against the warehouse to detect view-level filters that the Tableau MCP doesn't expose explicitly. A view that emits only `{Q1, Q2}` for a Quarter column when the warehouse contains all four quarters is a filter, not a coincidence.
 
-Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`, `kpi-chart`, `pie-chart`, `donut-chart`, `table`, `pivot-table`, `control`, `text`, `image`, `container`.
+Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`, `kpi-chart`, `pie-chart`, `donut-chart`, `region-map`, `point-map`, `table`, `pivot-table`, `control`, `text`, `image`, `container`.
 
 > **Common kind mistakes — all three are rejected by the API:**
 > - `"kpi"` → must be `"kpi-chart"`
@@ -129,8 +129,9 @@ Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `sc
 > follow it. If uncertain about a kind, GET an existing workbook spec (`GET /v2/workbooks/<id>/spec`)
 > and read the `kind` fields directly.
 
-Does **not** support via the spec API: maps, bullet, gantt.
-Approximate with: bar charts (for maps).
+Does **not** support via the spec API: bullet chart, gantt.
+
+**Maps are fully spec-supported.** Use `region-map` for choropleths (US state / county / ZIP / CBSA / country fills) and `point-map` for lat/long bubble or symbol maps. See `refs/workbook-layout.md` "Map elements" for the field shape, the exact set of valid `regionType` values (e.g., `us-zipcode`, not `us-zip`; `us-cbsa`, not `us-msa`), and the color-channel rules.
 
 **Trellis (small multiples) is supported in Sigma but configured UI-only.** Bar / line / area / scatter / pie / donut / combo charts can be trellised via the chart editor's **Trellis** panel (Trellis row / Trellis column / Trellis by series). The trellis configuration is **not** exposed in the workbook spec — POST/PUT silently drop fields like `trellisRow`, `trellisColumn`, `trellisRows`, `trellisColumns`, `trellisBy`, and `format.trellis`, and a trellis applied via the UI does not appear in the GET spec either. Build the chart with the right dimensions via spec, then trellis it manually post-publish.
 

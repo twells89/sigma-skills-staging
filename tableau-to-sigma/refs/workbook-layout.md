@@ -306,9 +306,80 @@ Uses `"kind": "scatter-chart"`. `xAxis` takes a single column ID; `yAxis` is an 
 
 Single-measure yAxis (`"yAxis": [{"id": "s-profit"}]`) is also valid — same array shape, one entry.
 
-### Map → bar chart
+### Map elements
 
-Sigma spec does not support geographic maps. Approximate "Sales by State" as a bar chart sorted descending:
+Sigma supports two map kinds via spec: **`region-map`** (choropleth — fills named geographic regions) and **`point-map`** (lat/long bubbles or symbols).
+
+> **Disregard older guidance that said "Sigma spec does not support maps."** Both kinds are real spec elements, persist on round-trip, and render correctly when published. Verified May 2026 against `cb2f5180-...` (`region-map`/`us-state` and `us-zipcode`) with live data parity confirmed via `mcp__sigma-mcp-v2__query`.
+
+#### region-map (choropleth)
+
+```json
+{
+  "kind": "region-map",
+  "name": "Employees by State",
+  "source": {"kind": "table", "elementId": "master"},
+  "columns": [
+    {"id": "rm-state", "formula": "[Master/State]",              "name": "State"},
+    {"id": "rm-count", "formula": "Count([Master/Employee ID])", "name": "Employees"}
+  ],
+  "region": {"id": "rm-state", "regionType": "us-state"},
+  "label":  [{"id": "rm-count"}]
+}
+```
+
+| Field | Required | Shape | Notes |
+|---|---|---|---|
+| `region` | yes | `{id, regionType}` | `id` is the column ID holding the region key |
+| `label` | optional | array `[{id}, ...]` | Values rendered on each region; usually the measure |
+| `tooltip` | optional | array `[{id}, ...]` | Extra columns shown on hover (e.g., active count, avg salary) |
+| `color` | optional | `{by: "category", column: <colId>}` | Categorical fill — column must be a **different** column from `region.id` (the API rejects reuse with "Column X is referenced from both 'region' and 'color'"). `by: "value"` is rejected — the default value-based heat coloring is automatic when `color` is omitted. |
+| `size` | — | silently dropped | Choropleths don't size; the API accepts and drops it |
+
+**Valid `regionType` values (verified May 2026 — POST round-trips them):**
+
+- `us-state` — 50 US states (+ DC)
+- `us-county` — US counties
+- `us-zipcode` — US ZIP codes (note: **not** `us-zip` — that's rejected)
+- `us-cbsa` — US Core-Based Statistical Areas (note: **not** `us-msa` — that's rejected)
+- `country` — country names / ISO codes
+
+**Rejected `regionType` values:** `us-zip`, `us-msa`, `us-congressional-district`, `world-country`, `state`, `province`, `continent`. All return `pages[N].elements[N].region.regionType: Invalid value: string`.
+
+#### point-map (lat/long bubbles)
+
+```json
+{
+  "kind": "point-map",
+  "name": "Stores by location",
+  "source": {"kind": "table", "elementId": "master"},
+  "columns": [
+    {"id": "p-lat",  "formula": "[Master/Lat]",            "name": "Lat"},
+    {"id": "p-lng",  "formula": "[Master/Long]",           "name": "Long"},
+    {"id": "p-sz",   "formula": "Sum([Master/Revenue])",   "name": "Revenue"},
+    {"id": "p-cat",  "formula": "[Master/Region]",         "name": "Region"}
+  ],
+  "latitude":  {"id": "p-lat"},
+  "longitude": {"id": "p-lng"},
+  "size":      {"id": "p-sz"},
+  "color":     {"by": "category", "column": "p-cat"},
+  "label":     [{"id": "p-sz"}]
+}
+```
+
+| Field | Required | Shape |
+|---|---|---|
+| `latitude` | yes | `{id}` — object, not array |
+| `longitude` | yes | `{id}` |
+| `size` | optional | `{id}` — bubble size encodes a measure |
+| `color` | optional | `{by: "category", column: <colId>}` — same shape as bar/line color (`by: "value"` is **rejected** on `point-map`; only category coloring is wired up via spec) |
+| `label` | optional | array `[{id}, ...]` |
+
+> **Invalid map kinds.** The API rejects `bubble-map`, `geo-map`, `heat-map`, `choropleth-map`, `us-map`, and `map` with `Invalid kind`. Use `region-map` or `point-map` only.
+
+#### When to fall back to a bar chart
+
+If your geo dimension doesn't fit one of the five `regionType` values above (e.g., "Sales by City" with no lat/long), use a bar chart sorted descending instead:
 
 ```json
 {
@@ -357,11 +428,13 @@ Check GET round-trip before relying on this — when GET starts returning `color
 | `kpi-chart` | Big number / scorecard |
 | `line-chart` | Line chart, small multiples (trellis applied via UI; or multi-series approximation) |
 | `area-chart` | Area chart (filled line) |
-| `bar-chart` | Bar chart, horizontal bar, histogram, map (approximated) |
+| `bar-chart` | Bar chart, horizontal bar, histogram |
 | `combo-chart` | Dual-axis / combination chart (bar + line) |
 | `scatter-chart` | Scatter / bubble chart |
 | `pie-chart` | Pie chart |
 | `donut-chart` | Donut / ring chart |
+| `region-map` | Filled / choropleth map (Tableau filled map, symbol-by-region) |
+| `point-map` | Lat/long bubble or symbol map (Tableau symbol map with generated or stored coords) |
 | `table` | Crosstab, text table |
 | `pivot-table` | Pivot / crosstab |
 | `control` | Dashboard filter, parameter (all types — see Control elements below) |
@@ -371,7 +444,7 @@ Check GET round-trip before relying on this — when GET starts returning `color
 
 > **`pie-chart` not `pie`, `donut-chart` not `donut`.** The API rejects `"kind": "pie"` and `"kind": "donut"` with `Invalid kind`. Always use the `-chart` suffix for these two. The official example library shows the wrong values — do not follow it.
 
-Not supported via spec API: map, bullet chart, gantt.
+Not supported via spec API: bullet chart, gantt. Invalid map-like kinds (rejected with `Invalid kind`): `bubble-map`, `geo-map`, `heat-map`, `choropleth-map`, `us-map`, `map`. Use `region-map` or `point-map`.
 
 Trellis (small multiples / panel charts) is supported in Sigma but **UI-only** — see the "Small multiples / trellis" section above for the workflow.
 
