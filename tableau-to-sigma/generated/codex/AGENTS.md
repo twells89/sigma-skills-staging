@@ -1,12 +1,9 @@
----
-name: tableau-to-sigma
-description: >-
-  Convert a Tableau datasource or workbook into a Sigma data model and matching
-  dashboard. Use when the user has a Tableau datasource, TDS file, or Tableau
-  workbook and wants to recreate it in Sigma. Covers column discovery, data
-  model creation via REST API, and dashboard layout generation using Ruby.
-user-invocable: true
----
+<!--
+Auto-generated from SKILL.md by ~/sigma-skills/scripts/sync-targets.rb.
+Do not edit by hand — edit SKILL.md and re-run the script.
+-->
+
+> Convert a Tableau datasource or workbook into a Sigma data model and matching dashboard. Use when the user has a Tableau datasource, TDS file, or Tableau workbook and wants to recreate it in Sigma. Covers column discovery, data model creation via REST API, and dashboard layout generation using Ruby.
 
 # Tableau → Sigma Conversion
 
@@ -33,16 +30,11 @@ ruby scripts/setup.rb
 ```
 
 It writes credentials to a config file your agent loads automatically.
-<!-- agents:claude-only -->
-For Claude Code that's `~/.claude/settings.json` — open a new Claude Code
-session (or run `! source ~/.claude/settings.json`) so the env vars are live.
-<!-- /agents:claude-only -->
-<!-- agents:non-claude
+
 Source the resulting env file in your shell before running anything that
 needs the Sigma API — e.g. `source ~/.claude/settings.json` if you let the
 script write there by default, or whatever path you configured. Then start
 a new agent session so the env vars are live.
-agents:end -->
 
 Every script validates the env vars exist and aborts with a clear message if
 they are missing.

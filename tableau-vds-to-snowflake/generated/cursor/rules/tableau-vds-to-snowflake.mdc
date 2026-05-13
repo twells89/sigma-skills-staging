@@ -1,13 +1,14 @@
 ---
-name: tableau-vds-to-snowflake
-description: >-
-  Extract data from a published Tableau datasource via the VizQL Data Service
-  (VDS) API and land it in a Snowflake table using a stored procedure + External
-  Access Integration. Use when the user wants to pull a Tableau-managed dataset
-  into Snowflake (one-shot or scheduled refresh) without exporting CSV by hand.
-  Optionally schedule for ongoing refresh with a Snowflake Task.
-user-invocable: true
+description: "Extract data from a published Tableau datasource via the VizQL Data Service (VDS) API and land it in a Snowflake table using a stored procedure + External Access Integration. Use when the user wants to pull a Tableau-managed dataset into Snowflake (one-shot or scheduled refresh) without exporting CSV by hand. Optionally schedule for ongoing refresh with a Snowflake Task."
+alwaysApply: false
 ---
+
+<!--
+Auto-generated from SKILL.md by ~/sigma-skills/scripts/sync-targets.rb.
+Do not edit by hand — edit SKILL.md and re-run the script.
+-->
+
+> Extract data from a published Tableau datasource via the VizQL Data Service (VDS) API and land it in a Snowflake table using a stored procedure + External Access Integration. Use when the user wants to pull a Tableau-managed dataset into Snowflake (one-shot or scheduled refresh) without exporting CSV by hand. Optionally schedule for ongoing refresh with a Snowflake Task.
 
 # Tableau VDS → Snowflake
 
@@ -36,7 +37,7 @@ Snowflake Table  ──▶  Sigma Workbook
 ```
 
 The stored procedure runs inside Snowflake via External Access Integration (EAI).
-No data touches Claude or the local machine — Snowflake fetches directly from Tableau.
+No data touches the AI agent or the local machine — Snowflake fetches directly from Tableau.
 
 ---
 

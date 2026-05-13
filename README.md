@@ -1,6 +1,8 @@
-# Sigma Claude Code Skills — Staging
+# Sigma AI Coding-Agent Skills — Staging
 
 Private staging counterpart to [`twells89/sigma-skills`](https://github.com/twells89/sigma-skills). Skills and research living here are **not yet ready to graduate** to the main repo. Expect rough edges, missing docs, and breaking changes between commits.
+
+Like the graduated repo, the staging skills support multiple AI coding agents: Claude Code & Cortex Code read `SKILL.md` directly; Codex / Cursor / Cline / Continue.dev get pre-built files in each skill's `generated/` directory. See the graduated repo's [README](https://github.com/twells89/sigma-skills/blob/main/README.md#installation) for the install helper.
 
 When a skill stabilizes and proves itself across multiple real conversions, it moves to `sigma-skills` (history preserved via `git filter-repo`).
 
@@ -20,25 +22,25 @@ If a staging skill needs a building block, install **both** repos locally — st
 
 ## Installation
 
-Same pattern as the graduated repo. Two ways:
-
-### Option A — Symlink the skills you want active
+### Claude Code & Cortex Code
 
 ```bash
 git clone https://github.com/twells89/sigma-skills-staging.git ~/sigma-skills-staging
 mkdir -p ~/.claude/skills
-ln -sf ~/sigma-skills-staging/tableau-to-sigma ~/.claude/skills/tableau-to-sigma
-# Add others as they stabilize.
-```
-
-### Option B — Symlink everything
-
-```bash
 for d in ~/sigma-skills-staging/*/; do
   name=$(basename "$d")
   [ "$name" = "research" ] && continue   # research isn't a skill
   ln -sf "$d" ~/.claude/skills/"$name"
 done
+```
+
+### Codex / Cursor / Cline / Continue
+
+Use the helper from the graduated repo — it resolves staging skills automatically:
+
+```bash
+~/sigma-skills/scripts/install-into-project.sh tableau-to-sigma codex ~/work/myproject
+~/sigma-skills/scripts/install-into-project.sh tableau-to-sigma all  ~/work/myproject
 ```
 
 ## Auth
