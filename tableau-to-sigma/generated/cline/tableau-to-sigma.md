@@ -3,7 +3,7 @@ Auto-generated from SKILL.md by ~/sigma-skills/scripts/sync-targets.rb.
 Do not edit by hand — edit SKILL.md and re-run the script.
 -->
 
-> Convert a Tableau datasource or workbook into a Sigma data model and matching dashboard. Use when the user has a Tableau datasource, TDS file, or Tableau workbook and wants to recreate it in Sigma. Covers column discovery, data model creation via REST API, and dashboard layout generation using Ruby.
+> Convert a Tableau datasource or workbook into a Sigma data model and matching dashboard. Use when the user has a Tableau datasource, TDS file, or Tableau workbook and wants to recreate it in Sigma. Discovery, calc-field translation, data model + workbook creation via REST API, layout generation, and parity verification — driven by `scripts/*.rb`.
 
 # Tableau → Sigma Conversion
 
@@ -16,6 +16,28 @@ that mirrors the Tableau dashboard layout as closely as possible.
 - `refs/workbook-layout.md` — Ruby layout generation (mandatory), multi-series chart patterns
 
 **For canonical workbook spec shape** (element kinds, source kinds, controls, formulas, formatting), defer to the sibling **`sigma-workbooks`** skill at `~/sigma-skills/sigma-workbooks/`. This skill restates only the Tableau-conversion-specific patterns; everything else (KPI fields, color channel, pivot-table shape, manual sources, container styling, YAML default, etc.) lives there. Read `sigma-workbooks/reference/specification/` whenever you need the current spec surface.
+
+---
+
+## Scripts
+
+The conversion is driven by `scripts/*.rb`. Each script encapsulates one mechanical
+phase. You compose them; the agent's role is judgment (which DM/workbook shape,
+which calc translation, which layout) — not orchestration.
+
+| Script | Purpose |
+|---|---|
+| `scripts/setup.rb` | One-time Sigma credential setup |
+| `scripts/get-token.sh` | Exchange `SIGMA_CLIENT_ID`/`SIGMA_CLIENT_SECRET` for `SIGMA_API_TOKEN` (~1h TTL) |
+| `scripts/estimate-cost.rb` | Predict input/output token cost from workbook + datasource metadata |
+| `scripts/fetch-view-data.rb` | Parse pre-fetched view CSVs into a signals manifest (distinct values, date min/max, agg hints) |
+| `scripts/discover-warehouse-columns.rb` | Parallel-fetch Sigma column metadata for N table inodeIds |
+| `scripts/extract-calc-fields.rb` | Pull every Tableau CALCULATION field (with formula) + translation notes |
+| `scripts/validate-spec.rb` | DM or workbook spec validator. Accepts `--type` and `--dm-context` |
+| `scripts/post-and-readback.rb` | POST a DM or workbook spec, parse YAML response, GET back the spec, emit element ID map |
+| `scripts/put-layout.rb` | Apply a layout XML to an existing workbook (strips read-only fields) |
+| `scripts/verify-parity.rb` | Diff expected (Tableau) vs actual (Sigma) per chart; PASS/DIVERGE report |
+| `scripts/lib/layout.rb` | Layout-XML helpers (`gc`, `le`, `page_xml`, `assemble`) — `require`'d by per-workbook layout configs |
 
 ---
 
@@ -36,19 +58,50 @@ needs the Sigma API — e.g. `source ~/.claude/settings.json` if you let the
 script write there by default, or whatever path you configured. Then start
 a new agent session so the env vars are live.
 
-Every script validates the env vars exist and aborts with a clear message if
-they are missing.
-
 Required env vars:
 - `SIGMA_BASE_URL` — e.g. `https://aws-api.sigmacomputing.com`
 - `SIGMA_CLIENT_ID`
 - `SIGMA_CLIENT_SECRET`
+
+Fetch a token at the start of each phase that needs one:
+
+```bash
+eval "$(scripts/get-token.sh)"
+```
+
+> Tokens live ~1 hour. Re-run when a curl returns 401. Never use
+> `TOKEN=$(eval "$(scripts/get-token.sh)")` — `$()` creates a subshell where
+> the exported var dies immediately. Keep eval + curl in the same `bash -c '...'`
+> invocation.
 
 ### Tableau access
 
 The Tableau MCP tools (`mcp__tableau__*`) are used for metadata retrieval and
 must already be authenticated in the session. Direct Tableau PAT auth via curl
 frequently returns 401 — always prefer MCP.
+
+---
+
+## Phase 0 — Estimate cost up front
+
+Before committing to the conversion, predict the agent token cost. Useful for
+quoting and for bucketing workbooks (small/medium/large/very-large) in a
+multi-workbook migration.
+
+```bash
+# Pre-fetch workbook + datasource metadata
+mcp__tableau__get-workbook  workbookId="<luid>"            > /tmp/<name>/get-workbook.json
+mcp__tableau__get-datasource-metadata  datasourceLuid="..." > /tmp/<name>/ds-metadata.json
+
+ruby scripts/estimate-cost.rb \
+  --workbook /tmp/<name>/get-workbook.json \
+  --datasource /tmp/<name>/ds-metadata.json
+```
+
+The estimator emits a JSON record with `features` (dashboards, sheets, calc
+fields, custom SQL bytes) and `estimate` (complexity bucket, input/output
+token counts, USD cost). Coefficients are heuristic and should be calibrated
+against ~10 measured conversions before use in customer quotes.
 
 ---
 
@@ -72,12 +125,6 @@ mcp__tableau__search-content   terms="<datasource name>"   filter.contentTypes=[
 > of the warehouse — not its current state. Sigma always reads the live warehouse, so the
 > absolute counts in Tableau views will diverge from Sigma values, even when the chart
 > *structure* (dimensions, aggregations, breakdowns) is identical.
->
-> When this happens: the Phase 6 row-count comparison will fail dramatically (one view I
-> converted showed 70 orders in Tableau while Sigma reported 526), but the relative
-> proportions and bucket structures still match. Tell the user up front that absolute
-> totals may differ, and verify shape parity (does each weekday × year combination have a
-> value? are the status categories the same?) instead of value-by-value parity.
 
 ### 1c. Get workbook views
 
@@ -87,38 +134,48 @@ mcp__tableau__get-workbook   workbookId="<luid>"
 
 Returns the list of views (sheets) with their `id` and `name`. Record all view IDs.
 
-### 1d. Retrieve view images
+### 1d. Retrieve view data and images
 
-`get-view-image` requires a warm VizQL session. The root cause of most 401s is
-**session contention**: firing many requests simultaneously causes them to compete
-for the same VizQL session, and most fail — regardless of whether the cache is warm
-or whether the view has been visited in a browser. Browser visits are not required.
+Two different fetches with very different cost profiles. **Don't conflate them.**
 
-**The reliable pattern — warm solo, then image solo, one view at a time:**
+- **`get-view-data` (CSVs)** — cheap, no VizQL session contention. **Fire all view CSVs in parallel** in a single batch.
+- **`get-view-image` (PNGs)** — expensive, hits VizQL session contention. Most 401s come from firing multiple image requests simultaneously (or alongside other view calls).
 
-Step 1 — warm the view:
+**What to actually fetch:**
+
+| Need | Source | How |
+|---|---|---|
+| Dashboard layout (grid, chart positions, title, filter shelf) | The dashboard view's PNG | 1 `get-view-image` call |
+| Each chart's dimensions, measures, aggregation | Each sheet's CSV | All sheets in parallel via `get-view-data` |
+| Distinct values + date min/max for Phase 2.5 filter detection | Each sheet's CSV | Same parallel batch |
+| What an individual sheet looks like in isolation | Sheet PNG | **Skip by default** — fetch one only if you need to disambiguate a tile whose dashboard title is misleading or truncated |
+
+Save each fetched CSV to `/tmp/<name>/views/<viewId>.csv` and parse them with:
+
+```bash
+ruby scripts/fetch-view-data.rb /tmp/<name>/views /tmp/<name>/signals.json
 ```
-mcp__tableau__get-view-data   viewId="<id1>"
-```
-Step 2 — immediately fetch the image for that same view before starting the next:
-```
-mcp__tableau__get-view-image   viewId="<id1>"   format="PNG"   width=1400   height=900
-```
-Step 3 — repeat for each remaining view.
 
-If `get-view-data` returns 401, skip that view entirely — the image will also fail.
+The output (`signals.json`) contains, per view, a `columns` map with `kind`
+(dimension / numeric / date), `distinct_count`, sampled `distinct` values,
+numeric ranges, and `aggregation_hints` parsed from CSV headers like
+"Sum of Gross Revenue" or "Distinct count of Order Id".
 
-> **Do not fire all views in a parallel batch.** Even if `get-view-data` succeeds in
-> a parallel batch, a concurrent `get-view-image` in the same batch will still 401
-> due to session contention. Process views one at a time.
+**The reliable fetch pattern:**
 
-Use the images to understand:
+1. Fire all `get-view-data` calls (every sheet + the dashboard view) **in a single parallel batch**. CSVs don't have session contention.
+2. Fetch **only the dashboard view's PNG** with `get-view-image`. Solo — no other view calls in flight.
+3. If a specific tile's dashboard title looks wrong or truncated, fetch that one sheet's PNG solo to disambiguate.
+
+If `get-view-data` returns 401 for a view, retry that view solo; if it 401s again, skip it.
+
+> **Do not parallel-fire `get-view-image` calls.** Even if the CSVs succeeded in parallel, concurrent image requests still 401 due to VizQL session contention. Images are always solo.
+
+Use the dashboard image to understand:
 - How many KPIs are in the header row and what they measure
 - Which chart types are used (bar, line, scatter, map, small multiples)
 - The rough grid layout of each page (columns × rows)
 - **Page titles, section headers, and any free-text annotations on the dashboard surface** — these are real content (not metadata) and need to be recreated as `text` elements in the Sigma spec. The page tab name (`page['name']`) is *not* a substitute; it only appears in the tab bar, not on the canvas. If the Tableau dashboard shows a heading like "Orders Dashboard" at the top of the page, add a `text` element with `body: "# Orders Dashboard"` and reserve a row for it in the layout.
-
-**Also extract from each view CSV the distinct values of every dimension column and the min/max of every date column** — write them down. Phase 2.5 compares these against the warehouse to detect view-level filters that the Tableau MCP doesn't expose explicitly. A view that emits only `{Q1, Q2}` for a Quarter column when the warehouse contains all four quarters is a filter, not a coincidence.
 
 Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`, `kpi-chart`, `pie-chart`, `donut-chart`, `region-map`, `point-map`, `table`, `pivot-table`, `control`, `text`, `image`, `container`.
 
@@ -127,18 +184,35 @@ Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `sc
 > - `"pie"` → must be `"pie-chart"`
 > - `"donut"` → must be `"donut-chart"`
 >
-> The official Sigma example library shows `kpi`, `pie`, and `donut` — all three are wrong. Do not
-> follow it. If uncertain about a kind, GET an existing workbook spec (`GET /v2/workbooks/<id>/spec`)
-> and read the `kind` fields directly.
+> The official Sigma example library shows `kpi`, `pie`, and `donut` — all three are wrong. The validator (`scripts/validate-spec.rb`) flags them, but do not rely on it: write the correct kind from the start.
 
 Does **not** support via the spec API: bullet chart, gantt.
 
-**Maps are fully spec-supported.** Use `region-map` for choropleths (US state / county / ZIP / CBSA / country fills) and `point-map` for lat/long bubble or symbol maps. See `refs/workbook-layout.md` "Map elements" for the field shape, the exact set of valid `regionType` values (e.g., `us-zipcode`, not `us-zip`; `us-cbsa`, not `us-msa`), and the color-channel rules.
+**Maps are fully spec-supported.** Use `region-map` for choropleths (US state / county / ZIP / CBSA / country fills) and `point-map` for lat/long bubble or symbol maps. See `refs/workbook-layout.md` "Map elements" for the field shape, the exact set of valid `regionType` values, and the color-channel rules.
 
-**Trellis (small multiples) is supported in Sigma but configured UI-only.** Bar / line / area / scatter / pie / donut / combo charts can be trellised via the chart editor's **Trellis** panel (Trellis row / Trellis column / Trellis by series). The trellis configuration is **not** exposed in the workbook spec — POST/PUT silently drop fields like `trellisRow`, `trellisColumn`, `trellisRows`, `trellisColumns`, `trellisBy`, and `format.trellis`, and a trellis applied via the UI does not appear in the GET spec either. Build the chart with the right dimensions via spec, then trellis it manually post-publish.
+**Trellis (small multiples) is supported in Sigma but configured UI-only.** Build the chart with the right dimensions via spec, then trellis it manually post-publish.
 
 Control types supported: `list`, `date-range`, `text`, `text-area`, `segmented`, `number`, `number-range`, `slider`, `range-slider`, `top-n`.
 See `refs/workbook-layout.md` for full control element spec patterns.
+
+### 1e. Extract Tableau calc fields
+
+```bash
+ruby scripts/extract-calc-fields.rb /tmp/<name>/ds-metadata.json /tmp/<name>/calc-fields.json
+```
+
+Each calc record carries `name`, `formula`, `default_agg`, and a
+`translation_notes` array flagging the common Tableau→Sigma gotchas:
+- `IIF` → `If`
+- `COUNTD` → `CountDistinct`
+- LOD expressions (`{FIXED ...}`) — Sigma equivalent depends on grain
+- IF/ELSEIF chains ending in literal — **wrap nullable inputs in `Coalesce` to match Tableau ELSE-catches-null semantics** (Tableau collapses NULL into the ELSE branch; Sigma `If(NULL >= ..., ...)` returns NULL)
+
+Translate the calc fields into the DM (Phase 3) using the original Tableau
+formula as the source of truth, NOT the warehouse column the calc happens
+to reference. Example: a Tableau "Customer Value Tier" calc that buckets
+`Lifetime Revenue` must be re-derived in Sigma from `LIFETIME_REVENUE`, not
+pulled from a same-named `LOYALTY_TIER` warehouse column.
 
 ---
 
@@ -150,51 +224,24 @@ Tableau display names ("Sub-Category", "Country/Region") are NOT the same as
 Snowflake warehouse column names ("SUB_CATEGORY", "COUNTRY_REGION"). Using the
 wrong names produces "dependency not found" errors at publish time.
 
-Fetch a token once now — it's valid for ~1 hour and covers all curl calls in Phases 2–5:
-
 ```bash
-eval "$(scripts/get-token.sh)"
+eval "$(scripts/get-token.sh)" && \
+ruby scripts/discover-warehouse-columns.rb /tmp/<name>/columns \
+  <inodeId1> <inodeId2> ...
 ```
 
-> **Token persistence in multi-command blocks:** `eval` sets env vars in the current
-> shell. If you need to combine eval and curl in a single `bash -c '...'` block, keep
-> them in the same invocation. Never use `TOKEN=$(eval "$(scripts/get-token.sh)")` —
-> the `$()` creates a subshell where the exported var dies immediately.
+The script:
+- runs all column-fetches in parallel,
+- handles the "response key is `entries`, not `columns`" gotcha,
+- writes one `<inodeId>.json` per table into the output dir.
 
-### 2a. Find the connection
+The friendly names returned are the **exact** values to use in DM element formulas: `[TABLE_NAME/Column Name]`.
 
-```bash
-curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  "$SIGMA_BASE_URL/v2/connections" | jq '[.entries[] | {name, connectionId}]'
-```
-
-### 2b. Find the table inode/urlId
-
-Search by name, or use the Sigma MCP tool:
+Find table inodeIds via Sigma search:
 
 ```
-mcp__sigma-mcp-v2__search   query="<table name>"
+mcp__sigma-mcp-v2__search   query="<table name>"   entityTypes=["table"]
 ```
-
-The search result includes a `urlId` or `inodeId` for the table.
-
-### 2c. Fetch actual column names
-
-Run all tables in parallel — one curl per table, all at the same time:
-
-```bash
-curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  "$SIGMA_BASE_URL/v2/connections/tables/<urlId1>/columns"
-
-curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  "$SIGMA_BASE_URL/v2/connections/tables/<urlId2>/columns"
-```
-
-> **Response key is `entries`, not `columns`.** Parse with `.get('entries', [])`, not `.get('columns', [])`.
-> Using `columns` returns an empty list silently — no error, just missing data.
-
-These are the **exact** column names to use in data model element formulas:
-`[TABLE_NAME/Column Name]`.
 
 ---
 
@@ -202,19 +249,16 @@ These are the **exact** column names to use in data model element formulas:
 
 > **The Tableau view CSV is the source of truth for what the dashboard *renders* — not what's in the warehouse.** Tableau MCP does not expose worksheet/dashboard filters directly, so you have to **infer them from the data the view emits**. A view that omits part of a dimension's values isn't a coincidence; it's a filter, and you must translate it into Sigma. Skipping this step ships a workbook that "renders fine" but disagrees with the source on totals, axis ticks, or visible categories.
 
-### How to detect
-
 For every dimension column on every view, compare:
 
 | Source                         | Query                                              |
 |--------------------------------|----------------------------------------------------|
-| **View CSV** (Phase 1d)        | Distinct values in the column; min/max for dates   |
+| **View CSV signals** (Phase 1d) | Read `signals.json` — `columns.<col>.distinct`, `numeric_range`, `kind` |
 | **Warehouse** (after Phase 2)  | `SELECT DISTINCT <col>` / `SELECT MIN, MAX <date>` via `mcp__sigma-mcp-v2__query` (`type: "connection"` with the table inodeId) |
 
 Any value present in the warehouse but missing from the CSV implies a filter on that column.
 
 ```sql
--- Warehouse range check
 SELECT MIN("DATE") AS min_date, MAX("DATE") AS max_date,
        COUNT(DISTINCT DATE_TRUNC('quarter', "DATE")) AS qtr_count
 FROM "connection"."<table-inodeId>"
@@ -222,18 +266,17 @@ FROM "connection"."<table-inodeId>"
 
 ### Common patterns
 
-| View CSV symptom                                    | Likely Tableau filter            | Sigma translation |
-|-----------------------------------------------------|----------------------------------|-------------------|
-| Only some values of a categorical column appear     | "Keep only" / dimension filter   | `list` control with `mode: "include"`, or element-level filter |
-| Date min/max is narrower than warehouse             | Date / relative-date filter      | `date-range` control — `mode: "current"` + `unit: "year"\|"quarter"\|...` for relative; `mode: "between"` with explicit `startDate`/`endDate` for fixed |
-| Numeric column is bounded                           | Range filter                     | `number-range` or `range-slider` control, or element-level filter |
-| Only top N items by some measure                    | Top-N filter                     | `top-n` control or element-level `top-n` filter (see `refs/workbook-layout.md`) |
+| View CSV symptom | Likely Tableau filter | Sigma translation |
+|---|---|---|
+| Only some values of a categorical column appear | "Keep only" / dimension filter | `list` control with `mode: "include"`, or element-level filter |
+| Date min/max is narrower than warehouse | Date / relative-date filter | `date-range` control — `mode: "current"` + `unit: "year"\|"quarter"\|...` for relative; `mode: "between"` with explicit `startDate`/`endDate` for fixed |
+| Numeric column is bounded | Range filter | `number-range` or `range-slider` control, or element-level filter |
+| Only top N items by some measure | Top-N filter | `top-n` control or element-level `top-n` filter (see `refs/workbook-layout.md`) |
 
 ### Where to apply the filter
 
 Prefer a **workbook-level control filtering the master table** — every chart that sources from master inherits the filter, matching how a Tableau dashboard filter works. Use **element-level filters** only when the filter is fixed and shouldn't be user-adjustable (a hard-coded slice).
 
-Control filter target shape:
 ```json
 "filters": [{"source": {"kind": "table", "elementId": "master"}, "columnId": "<master-col-id>"}]
 ```
@@ -246,190 +289,76 @@ Control filter target shape:
 
 ## Phase 3 — Build the data model spec
 
-Write the spec to `/tmp/<name>-datamodel-spec.json`. Full schema is in
+Write the spec to `/tmp/<name>/dm-spec.json`. Full schema is in
 `refs/data-model-spec.md`.
 
 ### Critical rules
 
 1. **Endpoint**: `POST /v2/dataModels/spec` — NOT `/v2/workbooks/spec`.
-   These create completely different objects.
+2. **`folderId` is required.** Find it via `GET /v2/files?typeFilters=workbook` — `parentId` on any of your workbooks.
+3. **Column name special characters** — read `refs/column-gotchas.md`. Rename any column whose `name` contains `/` ("Country/Region" → `"Country"`, "State/Province" → `"State"`).
+4. **Element name = formula prefix**. The `name` field on a DM element (e.g. `"Orders"`) becomes the prefix in all workbook formulas that reference it: `[Orders/Sales]`. Choose clean, stable names.
+5. **Relationships go on the source element**, not the target. See `refs/data-model-spec.md`.
+6. **Column formulas use the warehouse table name as prefix**: path `["CSA", "Tableau Test", "ORDERS"]` → formula `"[ORDERS/Column Name]"`.
 
-2. **`folderId` is required.** The POST will fail with `"Expecting UUID at 0.folderId but instead got: undefined"`
-   if omitted. Find it by listing your documents: `GET /v2/files?typeFilters=workbook` — the `parentId`
-   on any of your workbooks is your My Documents folder ID.
+### Translate Tableau calc fields here
 
-3. **Column name special characters** — read `refs/column-gotchas.md` fully.
-   Key rule: rename any column whose `name` field contains `/` before saving
-   the spec. "Country/Region" → `"name": "Country"`, "State/Province" → `"name": "State"`.
-   Slashes in column names break formula references in every downstream workbook.
+Each calc from `calc-fields.json` (Phase 1e) becomes a DM calc column (or a workbook-level
+calc on the master table, depending on grain). For calc columns that wrap a NULLABLE source
+in an IF/ELSEIF chain, **wrap with `Coalesce` to match Tableau's null-fallthrough behavior**.
 
-4. **Element name = formula prefix**. The `name` field on a data model element
-   (e.g. `"name": "Orders"`) becomes the prefix in all workbook formulas that
-   reference it: `[Orders/Sales]`. Choose clean, stable names.
+Example — Tableau:
 
-5. **Relationships go on the source element**, not the target. See `refs/data-model-spec.md`
-   for the exact shape.
+```
+IF [Lifetime Revenue] >= 5000 THEN "Platinum" ELSEIF >= 2000 THEN "Gold" ELSEIF >= 500 THEN "Silver" ELSE "Bronze" END
+```
 
-6. **Column formulas use the warehouse table name as prefix**:
-   - Path `["CSA", "Tableau Test", "ORDERS"]` → prefix is `ORDERS`
-   - Formula: `"[ORDERS/Column Name]"`
+Sigma DM calc column on Order Fact (since the bucket depends on a joined dim):
+
+```
+If(Coalesce(Lookup([Customer Dim/Lifetime Revenue], [Customer Key], [Customer Dim/Customer Key]), -1) >= 5000, "Platinum",
+  If(Lookup([Customer Dim/Lifetime Revenue], [Customer Key], [Customer Dim/Customer Key]) >= 2000, "Gold",
+    If(Lookup([Customer Dim/Lifetime Revenue], [Customer Key], [Customer Dim/Customer Key]) >= 500, "Silver", "Bronze")))
+```
+
+Without `Coalesce(-1)` orphan-joined rows produce a NULL bucket instead of falling into "Bronze"
+the way Tableau's ELSE does — and parity will diverge.
 
 ### Validate before posting
 
 ```bash
-python3 -c "
-import json, re, sys
-spec = json.load(open('/tmp/<name>-datamodel-spec.json'))  # update filename to match your spec
-errors = []
-
-# First pass — index every element name across the spec for cross-element ref checks
-all_element_names = set()
-for page in spec.get('pages', []):
-    for el in page.get('elements', []):
-        if el.get('name'):
-            all_element_names.add(el['name'])
-
-# Spec-level scan — rgb(...) color strings anywhere in the spec get blocked by
-# Sigma's Cloudflare WAF with HTTP 403. Use hex (#RRGGBB) instead.
-if 'rgb(' in json.dumps(spec):
-    errors.append('spec contains rgb(...) color strings — Cloudflare WAF blocks these with HTTP 403. Replace every rgb(R,G,B) with hex #RRGGBB.')
-
-for page in spec.get('pages', []):
-    for el in page.get('elements', []):
-        kind = el.get('kind', '')
-        name = el.get('name', el.get('id', '?'))
-        cols = el.get('columns', []) + el.get('metrics', [])
-        el_col_names = {c['name'] for c in cols}
-
-        # Valid prefixes for [Prefix/Col] refs on THIS element's formulas:
-        #   1. Last segment of own source.path (for warehouse-table sources) — e.g. ORDER_FACT
-        #   2. \"Custom SQL\" literal — for source.kind == \"sql\" elements
-        #   3. Any OTHER element's name in this spec — for cross-element Lookup() refs
-        src = el.get('source', {})
-        own_prefixes = set()
-        if src.get('kind') == 'warehouse-table' and src.get('path'):
-            own_prefixes.add(src['path'][-1])
-        if src.get('kind') == 'sql':
-            own_prefixes.add('Custom SQL')
-        # Bare formula refs without a source prefix — must resolve to a column on the same element.
-        # Prefixed refs ([Prefix/Col]) — Prefix must be own source OR another element's name.
-        for col in cols:
-            formula = col.get('formula', '') or ''
-            for ref in re.findall(r'\[([^\]]+)\]', formula):
-                if '/' in ref:
-                    prefix = ref.split('/', 1)[0]
-                    if prefix not in own_prefixes and prefix not in all_element_names:
-                        errors.append(f'{name}.{col.get(\"name\")}: ref [{ref}] — prefix \"{prefix}\" is not the element source nor a known element name in this spec')
-                else:
-                    if ref not in el_col_names:
-                        errors.append(f'{name}: bare ref [{ref}] has no match on the same element')
-
-            # Nested-If categorization on a date function with no outer IsNull guard.
-            # null Weekday/Month/etc. falls through every comparison and lands in the
-            # else string, silently misbucketing null rows.
-            if re.search(r'\b(Weekday|Month|Year|Quarter|Day|Hour|Minute)\s*\(', formula, re.IGNORECASE):
-                if 'If(' in formula and 'IsNull(' not in formula and 'Coalesce(' not in formula:
-                    errors.append(f'{name}.{col.get(\"name\")}: nested-If on a date function without IsNull/Coalesce — null source values silently fall through to the else branch. Wrap with If(IsNull([source]), Null, ...).')
-
-        # Common kind mistakes — API rejects all three
-        if kind == 'kpi':
-            errors.append(f'{name}: invalid kind \"kpi\" — must be \"kpi-chart\"')
-        if kind == 'pie':
-            errors.append(f'{name}: invalid kind \"pie\" — must be \"pie-chart\"')
-        if kind == 'donut':
-            errors.append(f'{name}: invalid kind \"donut\" — must be \"donut-chart\"')
-
-        # kpi-chart must have value field
-        if kind == 'kpi-chart' and 'value' not in el:
-            errors.append(f'{name}: kpi-chart missing value field')
-
-        # pie-chart and donut-chart must have color + value
-        if kind in ('pie-chart', 'donut-chart'):
-            if 'color' not in el:
-                errors.append(f'{name}: {kind} missing color field')
-            if 'value' not in el:
-                errors.append(f'{name}: {kind} missing value field')
-
-        # donut-chart holeValue is optional, but if present:
-        #   - must be an object {\"id\": \"col-id\"} (literal floats are rejected)
-        #   - id must NOT equal value.id (matching IDs silently drops the entire element)
-        if kind == 'donut-chart' and 'holeValue' in el:
-            hv = el['holeValue']
-            if not isinstance(hv, dict) or 'id' not in hv:
-                errors.append(f'{name}: donut-chart holeValue must be {{\"id\": \"<col-id>\"}} — literal floats are rejected with \"Invalid object: number\"')
-            else:
-                vid = el.get('value', {}).get('id')
-                if hv.get('id') == vid:
-                    errors.append(f'{name}: donut-chart holeValue.id ({hv[\"id\"]}) equals value.id — element is silently dropped on POST. Add a second column with a distinct id (same formula is fine).')
-
-        # chart types that must use yAxis, not measures
-        if kind in ('bar-chart', 'line-chart', 'area-chart', 'combo-chart', 'scatter-chart'):
-            if 'measures' in el:
-                errors.append(f'{name}: use yAxis not measures for {kind}')
-            if 'yAxis' not in el:
-                errors.append(f'{name}: {kind} missing yAxis')
-
-        # pivot-table needs rowsBy (+ optionally columnsBy). Without them, the element
-        # round-trips as a single grand-total row — silent rendering failure.
-        if kind == 'pivot-table':
-            if 'rows' in el or 'columnGroups' in el:
-                errors.append(f'{name}: pivot-table must use rowsBy/columnsBy, not rows/columnGroups')
-            if not el.get('rowsBy'):
-                errors.append(f'{name}: pivot-table without rowsBy renders only a grand-total row — add rowsBy[{{\"id\": \"...\"}}]')
-            for field in ('rowsBy', 'columnsBy'):
-                arr = el.get(field, [])
-                if arr and isinstance(arr[0], str):
-                    errors.append(f'{name}: pivot-table {field} must be object array [{{\"id\": \"col-id\"}}], not string array')
-            values = el.get('values', [])
-            if values and isinstance(values[0], dict):
-                errors.append(f'{name}: pivot-table values must be string array [\"col-id\"], not object array')
-
-for e in errors: print('ERROR:', e)
-sys.exit(len(errors))
-"
+ruby scripts/validate-spec.rb --type datamodel /tmp/<name>/dm-spec.json
 ```
+
+Catches: formula prefix mismatches, bare refs not matching a sibling, `kpi`/`pie`/`donut` kind
+mistakes, `rgb(...)` color strings (Cloudflare WAF blocks), missing yAxis on
+bar/line/area/combo/scatter, missing color+value on pie/donut, donut `holeValue.id` matching
+`value.id` (silent element drop), pivot-table missing rowsBy (single grand-total row), and
+nested-If on date functions without IsNull guard.
+
+Exit 0 = clean, exit 1 = errors printed to stdout.
 
 ---
 
 ## Phase 4 — POST the data model
 
 ```bash
-curl -s -X POST \
-  -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @/tmp/<name>-datamodel-spec.json \
-  "$SIGMA_BASE_URL/v2/dataModels/spec"
+eval "$(scripts/get-token.sh)" && \
+ruby scripts/post-and-readback.rb --type datamodel \
+  --spec /tmp/<name>/dm-spec.json \
+  --out /tmp/<name>/dm-ids.json
 ```
 
-> **Response format is YAML, not JSON.** Do NOT pipe to `jq`. Parse with Ruby:
->
-> ```bash
-> ruby -r yaml -r json -e \
->   "puts JSON.pretty_generate(YAML.safe_load(STDIN.read, permitted_classes:[Date,Time]))"
-> ```
+The script:
+- POSTs the spec,
+- parses the YAML response (the spec endpoints return YAML by default),
+- immediately GETs the spec back to retrieve server-assigned element IDs,
+- writes a clean JSON map: `{dataModelId, pages: [{id, name, elements: [{id, kind, name}]}]}`.
 
-> **POST response only contains `dataModelId` — no element IDs.** After a successful POST,
-> immediately GET the data model spec to retrieve server-assigned element IDs:
->
-> ```bash
-> curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
->   "$SIGMA_BASE_URL/v2/dataModels/<dataModelId>/spec" \
->   -o /tmp/dm-get.yaml
->
-> ruby -r yaml -r date - <<'EOF'
-> require 'date'
-> d = YAML.safe_load(File.read('/tmp/dm-get.yaml'), permitted_classes: [Date, Time])
-> puts "dataModelId: #{d['dataModelId']}"
-> d['pages'].each do |pg|
->   puts "page: #{pg['id']} #{pg['name']}"
->   (pg['elements'] || []).each { |e| puts "  elementId: #{e['id']}  name: #{e['name']}" }
-> end
-> EOF
-> ```
+Record the `dataModelId` and element IDs. The `dm-ids.json` is used by the
+workbook validator (Phase 5) to accept `[Order Fact/...]` cross-source refs.
 
-Record the `dataModelId` and element IDs — you need both for workbook source references.
-
-On error: read `refs/column-gotchas.md` → fix the offending column formula → retry.
+On error: read the message → fix the offending column formula → re-validate → re-POST.
 
 ---
 
@@ -437,11 +366,10 @@ On error: read `refs/column-gotchas.md` → fix the offending column formula →
 
 ### 5a. Write the workbook spec
 
-> **`folderId` is required here too.** Omitting it causes `"Expecting UUID at 0.folderId"`.
-> Use the same folder ID from Phase 3 (your My Documents folder ID).
+> **`folderId` is required here too.**
 
-Source elements in the workbook from the data model. **Always set `visibleAsSource: false` on
-the master table** — it is a source for charts, not a table users should browse directly:
+Source the master table from the data model. **Always set `visibleAsSource: false` on
+the master table** — it is a source for charts, not a table users browse directly.
 
 ```json
 {
@@ -452,7 +380,7 @@ the master table** — it is a source for charts, not a table users should brows
   "source": {
     "kind": "data-model",
     "dataModelId": "<dataModelId>",
-    "elementId": "<elementId from data model>"
+    "elementId": "<elementId from dm-ids.json>"
   },
   "columns": [
     { "id": "c-sales", "formula": "[Orders/Sales]", "name": "Sales" }
@@ -461,18 +389,18 @@ the master table** — it is a source for charts, not a table users should brows
 }
 ```
 
-Column formulas in the master table use the data model element's `name` as prefix
-(`[Orders/Sales]`, not the element ID).
+Master-table column formulas use the DM element's `name` as prefix (`[Orders/Sales]`, not the element ID).
 
-Charts and KPIs on content pages source the master table element and use ITS
-`name` as prefix. **Cross-page element references are fully supported** — it is
-correct and recommended to place the master table on a single "Data" page and
-reference it from every other page's elements via `"elementId": "master"`.
+Charts and KPIs on content pages source the master table and use ITS `name` as prefix.
+Cross-page element references are fully supported — place the master on a hidden "Data"
+page and reference it from every other page's elements via `"elementId": "master"`.
 
-> **Master-table column scope determines what controls and future charts can see.** Every column that the data model element exposes does NOT have to be on the master — and pruning the master to "only what current charts need" produces a leaner spec. But the moment a user wants a new control (e.g. "filter by Ship Method"), or a follow-up chart needs a different dimension, you have to amend the master and re-PUT. Default: pull every column you've already denormalized in the data model into the master with `[Element/Col]` passthrough formulas — the master is cheap and amending it later requires a workbook spec edit even though no chart breaks.
+> **Master-table column scope.** Default: pull every column you've already denormalized
+> in the DM into the master with passthrough formulas. The master is cheap; amending it
+> later for a new control requires a workbook spec edit even though no chart breaks.
 
-> **KPI kind is `kpi-chart`, not `kpi`.** Using `"kind": "kpi"` produces
-> `"Invalid kind: 'kpi'"`. All KPI elements must use `"kind": "kpi-chart"`.
+> **KPI kind is `kpi-chart`, not `kpi`. Pie is `pie-chart`. Donut is `donut-chart`.**
+> The validator catches this; don't rely on it.
 
 ```json
 {
@@ -486,129 +414,140 @@ reference it from every other page's elements via `"elementId": "master"`.
 }
 ```
 
-For multi-series line charts (approximating Tableau small multiples):
-```json
-{ "formula": "Sum(If([Master/Segment] = \"Consumer\", [Master/Sales], Null))", "name": "Consumer" }
-```
+See `refs/workbook-layout.md` for chart patterns, multi-series formulas, and map shapes.
 
-See `refs/workbook-layout.md` for full chart patterns.
-
-### 5b. POST the workbook spec
+### 5b. Validate the workbook spec
 
 ```bash
-curl -s -X POST \
-  -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @/tmp/workbook-spec.json \
-  "$SIGMA_BASE_URL/v2/workbooks/spec" -o /tmp/wb-response.yaml
-
-# Parse the YAML response — never pipe directly to jq
-ruby -r yaml -r json -r date -e \
-  "d=YAML.safe_load(File.read('/tmp/wb-response.yaml'),permitted_classes:[Date,Time]); \
-   puts 'workbookId: ' + d['workbookId'].to_s"
+ruby scripts/validate-spec.rb --type workbook \
+  --dm-context /tmp/<name>/dm-ids.json \
+  /tmp/<name>/wb-spec.json
 ```
 
-> **Always GET the spec back before building layout XML.** Workbook-spec POST often
-> preserves readable string element IDs (e.g. `master`, `el-rev-by-region`) verbatim,
-> but this is not contractual — it has been observed to vary. Data-model-spec POST
-> *always* reassigns element IDs regardless of what you supplied. Either way, GET
-> the spec immediately after POST and use whatever IDs come back when wiring the
-> layout XML; never assume your spec IDs survived.
+`--dm-context` lets the validator accept `[Order Fact/...]` cross-source refs (where
+"Order Fact" is a DM element name from Phase 4). Without it, every cross-source ref is
+flagged as unknown.
 
-### 5c. GET the spec back and extract real IDs
+### 5c. POST the workbook + readback
 
 ```bash
-curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  "$SIGMA_BASE_URL/v2/workbooks/<workbookId>/spec" \
-  > /tmp/current-spec.yaml
-
-# Extract page/element ID map with Ruby
-ruby -r yaml -r date - <<'EOF'
-require 'date'
-spec = YAML.safe_load(File.read('/tmp/current-spec.yaml'), permitted_classes: [Date, Time])
-spec['pages'].each do |page|
-  puts "\n#{page['id']} : #{page['name']}"
-  page['elements'].each { |e| printf "  %-24s %-14s %s\n", e['id'], e['kind'], e['name'] }
-end
-EOF
+ruby scripts/post-and-readback.rb --type workbook \
+  --spec /tmp/<name>/wb-spec.json \
+  --out /tmp/<name>/wb-ids.json
 ```
 
-### 5d. Build layout XML with Ruby — MANDATORY
+> **Element IDs may or may not survive POST.** Workbook-spec POST often preserves readable
+> string element IDs verbatim, but this is not contractual. Data-model-spec POST always
+> reassigns IDs. Either way, the readback is the source of truth — use IDs from `wb-ids.json`
+> when wiring layout XML.
 
-**Never hand-write layout XML.** Write a fresh Ruby script for each workbook using the
-helpers and patterns in `refs/workbook-layout.md`. The script in `scripts/build-layout.rb`
-contains generic stubs but uses hardcoded element names — **do not call it directly**.
-Instead follow the full pattern from `refs/workbook-layout.md` using the real element IDs
-from step 5c.
+### 5d. Build layout XML
 
-The script must:
-1. Load `/tmp/current-spec.yaml` and build an element name→ID map per page
-2. Build page XML using `gc()` / `le()` / `page_xml()` helpers
-3. Strip all read-only fields (`workbookId`, `url`, `ownerId`, `createdBy`, `updatedBy`, `createdAt`, `updatedAt`, `latestDocumentVersion`) and per-page `layout` keys
-4. Set `spec['layout']` at the top level (never on individual page objects)
-5. Write JSON to `/tmp/workbook-with-layout.json`
-6. Verify no `elementId=""` before returning
-
-### 5e. PUT the spec with layout
-
-Build the PUT body from the GET YAML spec — strip read-only fields before writing:
+Write a per-workbook layout config that `require`s the helper library. Never hand-write
+layout XML.
 
 ```ruby
-spec = YAML.safe_load(File.read('/tmp/current-spec.yaml'), permitted_classes: [Date, Time])
-spec['pages'].each { |p| p.delete('layout') }
-spec['layout'] = layout_xml_string
-%w[workbookId url ownerId createdBy updatedBy createdAt updatedAt latestDocumentVersion].each { |k| spec.delete(k) }
-# Keep: name, documentVersion, folderId, schemaVersion, pages, layout
-File.write('/tmp/workbook-with-layout.json', JSON.pretty_generate(spec))
+# /tmp/<name>/build-layout.rb
+require 'json'
+$LOAD_PATH.unshift File.expand_path('scripts/lib', __dir__)  # or absolute path
+require 'layout'
+include SigmaLayout
+
+# Element IDs from Phase 5c
+ids = JSON.parse(File.read('/tmp/<name>/wb-ids.json'))
+e = ids['pages'][0]['elements'].each_with_object({}) { |x, h| h[x['id']] = x['id'] }
+
+xml = assemble(
+  page_xml('page-dashboard',
+    le(e['title-text'],     1, 25,  1,  3),
+    le(e['el-kpi-1'],       1,  7,  3,  9),
+    le(e['el-kpi-2'],       7, 13,  3,  9),
+    le(e['el-chart-1'],     1, 13,  9, 21),
+    le(e['el-chart-2'],    13, 25,  9, 21)
+  ),
+  page_xml('page-data', le('master', 1, 25, 1, 21))
+)
+
+File.write('/tmp/<name>/layout.xml', xml)
 ```
 
-Then PUT:
+Layout helpers (in `scripts/lib/layout.rb`): `gc(eid, c0, c1, r0, r1, inner)` for
+`<GridContainer>`, `le(eid, c0, c1, r0, r1)` for `<LayoutElement>`, `page_xml(page_id, *children)`
+to wrap a page, `assemble(*pages)` to add the XML prologue.
+
+See `refs/workbook-layout.md` for typical page layouts (4 KPIs + line chart + 2 bars,
+multi-row containers, etc.) and rules (`<GridContainer>` for nesting, KPI inner `gridRow`
+must match container outer span).
+
+### 5e. PUT the layout
 
 ```bash
-curl -s -X PUT \
-  -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @/tmp/workbook-with-layout.json \
-  "$SIGMA_BASE_URL/v2/workbooks/<workbookId>/spec"
+ruby scripts/put-layout.rb \
+  --workbook <workbookId> \
+  --layout /tmp/<name>/layout.xml
 ```
 
-PUT preserves existing element IDs. Only newly added elements get new IDs.
+The script:
+- GETs the current workbook spec,
+- replaces per-page `layout` with a single top-level `layout` (per-page layouts are silently dropped),
+- strips read-only fields (`workbookId`, `url`, `ownerId`, `createdBy`, `updatedBy`, `createdAt`, `updatedAt`, `latestDocumentVersion`),
+- aborts if any `elementId=""` appears in the XML,
+- PUTs the full payload back.
+
+PUT preserves existing element IDs. Only newly-added elements get new IDs.
 
 ---
 
 ## Phase 6 — Verify chart data matches Tableau
 
 > **This step is mandatory. PUT returning `success: true` only proves the spec parsed —
-> it tells you nothing about whether each chart shows the right numbers.** A bad column
-> formula can resolve to type `error` and silently render an empty chart; a wrong
-> dimension or aggregation can ship "successful" but display the wrong story.
+> it tells you nothing about whether each chart shows the right numbers.**
 
-For every content chart, query the workbook element via Sigma MCP and compare row-by-row
-to the `mcp__tableau__get-view-data` CSV captured in Phase 1.
+### 6a. Query each chart and compare to Tableau
 
-### 6a. Query each chart element
+Build a parity plan in JSON with one entry per chart, then run the verifier:
 
-Use the spec column IDs you wrote (preserved on PUT) and the workbook ID returned by POST:
+```json
+[
+  { "chart": "Revenue by Region",
+    "expected": [["West", 7684.36], ["South", 6817.40], ...],
+    "actual":   {"rows": [["West", 7684.36], ...]} }
+]
+```
+
+Each entry's `expected` is the Tableau CSV rows (parsed and rounded as needed).
+Each entry's `actual` is the Sigma query result — either pre-fetched via MCP and
+pasted in, OR (in environments where the script's REST query path works) computed
+by the script itself.
+
+```bash
+ruby scripts/verify-parity.rb --plan /tmp/<name>/parity-plan.json
+```
+
+Output: per-chart `PASS` or `DIVERGE` with set-difference of the dim/measure pairs.
+Exit 0 on full pass, 1 on any divergence.
+
+To fetch Sigma actuals:
 
 ```
 mcp__sigma-mcp-v2__query  type="workbook"  workbookId="<wbId>"
   sql='SELECT "<dim-col-id>", ROUND("<measure-col-id>"::numeric, 2) FROM "workbook"."<element-id>" ORDER BY 1'
 ```
 
-Run the queries in parallel — they're independent reads, no session contention.
+> **A chart element's SQL view exposes only that chart's own columns.** A `WHERE "m-order-date-key" BETWEEN ...` against `el-rev-by-region` fails with `Unresolved column`. Two ways to handle:
+> - Query the master table directly (`FROM "workbook"."master"`) and aggregate in SQL.
+> - Skip the filter and compare what the chart shows. Workbook control filters are not applied at API-query time, so a `type="workbook"` SQL query against a chart element returns the full unfiltered dataset.
 
-> **A chart element's SQL view exposes only that chart's own columns** — not the master table's. A `WHERE "m-order-date-key" BETWEEN ...` against `el-rev-by-region` fails with `Unresolved column: m-order-date-key` because that column doesn't exist on the chart's aggregated projection. Two ways to handle this:
-> - **Query the master table directly** (`FROM "workbook"."master"`) when you need to filter on a column the chart doesn't expose — then aggregate in SQL to compare to the chart's rendered values.
-> - **Skip the filter and compare what the chart shows.** Workbook control filters are applied at view time, not at API-query time, so a `type="workbook"` SQL query against a chart element always returns the full unfiltered dataset. If the Tableau CSV is from a filtered dashboard view, you'll need to apply the same predicate against the master table to match.
+### 6b. Triage divergences
 
-### 6b. Compare to Tableau CSVs
-
-Every row from the Sigma query must match a row in the corresponding Tableau view CSV
-(modulo float-precision rounding). If anything diverges:
-- **Numbers wrong by a constant factor** → check aggregation (Sum vs Avg vs CountDistinct).
-- **Wrong dimension values** → check the `[Master/...]` formula references the right column.
-- **Date axis has 24 buckets where Tableau shows 12** → see `refs/column-gotchas.md` "Cross-year month rollup".
-- **Empty result / column resolves as `error`** → run `mcp__sigma-mcp-v2__describe` on the element; column type `error` means the formula failed to compile (often `IsIn`, an unsupported window function, or a missing-column ref).
+| Symptom | Likely cause |
+|---|---|
+| Numbers wrong by a constant factor | Aggregation mismatch (Sum vs Avg vs CountDistinct) |
+| Wrong dimension values | `[Master/...]` formula references the wrong column |
+| Date axis has 24 buckets where Tableau shows 12 | Cross-year month rollup — see `refs/column-gotchas.md` |
+| Sigma chart shows extra dim values Tableau never displays | Missed Phase 2.5 filter — apply the filter as `date-range`/`list`/`top-n` |
+| Bucket values differ but ratios match | Wrong source column — see Phase 3 "Translate Tableau calc fields here". A `Customer Value Tier` Tableau calc-derived from `Lifetime Revenue` must NOT be replaced by a warehouse `LOYALTY_TIER` column |
+| Empty result / column resolves as `error` | `mcp__sigma-mcp-v2__describe` on the element; type `error` means the formula failed to compile (often `IsIn`, unsupported window function, or missing-column ref) |
 
 ### 6c. Trust the CSV, not the dashboard caption
 
@@ -618,47 +557,44 @@ title, the caption lies. **The view's `get-view-data` CSV is the source of truth
 build the Sigma chart against the CSV's actual columns and pick a truthful Sigma name,
 even if it disagrees with what's printed above the bars in Tableau.
 
-### 6d. Phantom `--metric-["..."]` columns in workbook query results
+### 6d. Phantom `--metric-["..."]` columns
 
-`mcp__sigma-mcp-v2__query` with `type="workbook"` appends synthetic columns to every
-result row of the form `--metric-["<colId>"]` whose values look like
-`Column "X.--metric-[...]" does not exist.`. These are harmless artifacts of the
-metric-projection layer — your explicitly-SELECTed columns return correct values
-alongside them. Don't mistake the noise for a real query failure.
+`mcp__sigma-mcp-v2__query` with `type="workbook"` appends synthetic columns of the form
+`--metric-["<colId>"]` whose values look like `Column "X.--metric-[...]" does not exist.`.
+Harmless — your explicitly-SELECTed columns return correct values alongside the noise.
 
 ---
 
 ## Troubleshooting
 
-| Error | Cause | Fix |
+| Error / symptom | Cause | Fix |
 |---|---|---|
-| `Expecting UUID at 0.folderId but instead got: undefined` | `folderId` missing from data model or workbook spec | Find your folder ID with `GET /v2/files?typeFilters=workbook` — use the `parentId` of any existing workbook |
-| `Invalid kind: 'kpi'` | Used `"kind": "kpi"` — the correct kind is `"kpi-chart"` | Replace all `"kind": "kpi"` with `"kind": "kpi-chart"` in the spec |
-| `Invalid kind: 'pie'` | Used `"kind": "pie"` — the official example library shows this but it's wrong | Replace with `"kind": "pie-chart"` |
-| `Invalid kind: 'donut'` | Used `"kind": "donut"` — the official example library shows this but it's wrong | Replace with `"kind": "donut-chart"` |
-| Element kind rejected, not sure what's valid | Unknown/guessed element kind | `GET /v2/workbooks/<existing-id>/spec` and read the `kind` fields of real elements — never guess |
-| `dependency not found: formula reference 'orders/country region'` | Column named "Country/Region" has slash — unresolvable in formulas | Rename column to "Country" in the data model spec; re-POST |
-| `dependency not found: formula reference 'orders/state province'` | Same slash issue with "State/Province" | Rename to "State" |
-| All columns on a table fail together | One bad formula poisons the whole element | Find the specific failing ref in the error message; fix only that column |
-| `jq: parse error: Invalid numeric literal` | Sigma spec endpoints return YAML, not JSON | Parse with `ruby -r yaml -r json` instead |
-| `401` on `get-view-image` after solo `get-view-data` succeeded | Rare transient failure | Retry `get-view-image` solo immediately — no concurrent requests |
-| `401` on `get-view-image` despite `get-view-data` succeeding in same parallel batch | Session contention — concurrent requests compete for the same VizQL session | Retry the image solo with no other concurrent view requests |
-| `401` on both `get-view-data` and `get-view-image` | View uses a data connection the API token can't reach | Skip this view; it's inaccessible via MCP regardless of technique |
-| Batch `get-view-data` returns mostly 401s | Session contention from parallel requests — not a cache issue | Switch to solo warm → solo image, one view at a time |
-| `429` on Tableau view image | Rate limited | Wait and retry the specific view |
-| Column fetch returns empty list | Response key is `entries`, not `columns` | Use `.get('entries', [])` when parsing column API responses |
-| PUT returns `invalid_request` with no field named | Read-only metadata fields included in PUT body | Strip `workbookId`, `url`, `ownerId`, `createdBy`, `updatedBy`, `createdAt`, `updatedAt`, `latestDocumentVersion` from the PUT body |
-| PUT returns `Invalid 1: schemaVersion, got undefined` | `schemaVersion` was stripped from PUT body | Keep `schemaVersion` in the PUT body — it is required |
-| Layout PUT rejected, some elements not visible | `elementId=""` in layout XML from nil Ruby variable | Guard fallback element lookups: use `(le(id, ...) if id)` and `.compact` |
-| Layout has elements stacked vertically | No layout XML provided, or layout uses wrong IDs | GET spec after POST to get real IDs; rebuild layout with Ruby |
-| KPI names invisible or truncated inside container | Inner `gridRow` too small — `gridTemplateRows="auto"` does NOT expand to fill container height | Set inner KPI `gridRow` end value = container outer end value (e.g., container `1 / 9` → KPIs `1 / 9`) |
-| Empty containers visible on page | Container elements in spec but not referenced as `<GridContainer>` in layout XML | Add them to layout as `<GridContainer>` wrapping their child KPIs |
-| Wrong endpoint — workbook created instead of data model | Called `/v2/workbooks` instead of `/v2/dataModels/spec` | Delete the workbook; re-POST to the correct endpoint |
-| Bar chart renders vertical but Tableau shows horizontal bars | Bar chart orientation is UI-only — `"orientation": "horizontal"` is silently accepted and dropped | Set it manually post-publish: chart editor → Properties → Chart type → Horizontal icon |
-| Sigma chart shows dimension values that Tableau's view never displays (e.g. extra quarters, extra regions, dates outside Tableau's range) | Tableau view has a worksheet/dashboard filter you didn't translate — the MCP does not expose filters explicitly, so they're invisible unless you compare CSV ranges to warehouse ranges | Phase 2.5 — diff distinct values / date min-max from view CSV vs the warehouse; add the missing filter as a `date-range`/`list`/`top-n` control or element-level filter |
-| Axis label rotation not applied | Axis rotation is UI-only — not stored in or returned by spec API | Set it manually post-publish: chart editor → Format → X-axis → Label rotation |
-| Dashboard title appears left-aligned despite Tableau showing it centered | Text element alignment is UI-only — `text` element spec only persists `id`/`kind`/`body` | Set in element editor → Format → Alignment after publish |
-| `mcp__sigma-mcp-v2__query` with `type: "workbook"` returns "Table X not found" | Workbook queries don't resolve element names (e.g., `"Master"`) as table refs | Use `type: "connection"` with the raw table inodeId for data validation queries |
-| Workbook query result rows include `--metric-["..."]` columns whose values say `Column "X.--metric-[...]" does not exist.` | Synthetic metric-projection columns appended by the query engine on `type="workbook"` queries — harmless | Ignore them; your explicitly-SELECTed columns return correct values alongside the noise |
-| Integer date key column renders as number axis on line chart | `ORDER_DATE_KEY` is stored as an integer (YYYYMMDD); Sigma treats it as a number | Cast in the workbook column: `Date(Left(Text([Master/ORDER_DATE_KEY]), 4) & "-" & Mid(Text([Master/ORDER_DATE_KEY]), 5, 2) & "-" & Right(Text([Master/ORDER_DATE_KEY]), 2))` — `DateParse()` and `ToText()` do not exist in Sigma |
-| Sigma line chart shows 24 month-year buckets where Tableau shows 12 month names | Tableau MONTH part collapses across years; Sigma `DateTrunc("month", ...)` preserves year | See `refs/column-gotchas.md` "Cross-year month rollup" — synthesize a single-year date in the formula |
+| `Expecting UUID at 0.folderId but instead got: undefined` | `folderId` missing from spec | Find with `GET /v2/files?typeFilters=workbook` → `parentId` |
+| `Invalid kind: 'kpi' \| 'pie' \| 'donut'` | Used Sigma example library naming | Replace with `kpi-chart` / `pie-chart` / `donut-chart`; the validator catches this |
+| Element kind rejected, unknown | Guessed an unsupported kind | `GET /v2/workbooks/<existing-id>/spec` and read `kind` fields of real elements |
+| `dependency not found: formula reference 'orders/country region'` | Slash in column `name` field | Rename the column to "Country" before saving the DM spec |
+| All columns on a table fail together | One bad formula poisons the element | Find the specific bad ref in the error message; fix only that column |
+| `jq: parse error: Invalid numeric literal` | Sigma spec endpoints return YAML | Use `post-and-readback.rb` (it parses YAML); never pipe spec responses to `jq` |
+| Validator flags `[X/col]` as unknown prefix on a workbook spec | `--dm-context` not passed | Re-run with `--dm-context /tmp/<name>/dm-ids.json` |
+| `401` on `get-view-data` in parallel batch | VizQL session contention | Retry that view solo; if still 401, skip — view is inaccessible |
+| `401` on `get-view-image` | Always solo, never parallel with other view calls | Retry the image solo, no concurrent requests |
+| `429` on Tableau view image | Rate limited | Wait and retry |
+| Column fetch returns empty list | Response key is `entries`, not `columns` | Use `discover-warehouse-columns.rb` (handles this) |
+| PUT returns `invalid_request` with no field named | Read-only metadata fields included in PUT body | Use `put-layout.rb` (strips them) |
+| PUT returns `Invalid 1: schemaVersion, got undefined` | `schemaVersion` stripped from PUT body | Keep `schemaVersion`; the script preserves it |
+| Layout PUT rejected, some elements not visible | `elementId=""` in layout XML | Script aborts on this; check the per-workbook layout config for nil IDs and guard with `.compact` |
+| Layout has elements stacked vertically | No layout XML provided, or wrong IDs | Read IDs from `wb-ids.json` (Phase 5c readback), not your spec |
+| KPI names invisible / truncated inside container | Inner `gridRow` smaller than container's outer span — `gridTemplateRows="auto"` does NOT expand | Set inner KPI `gridRow` end = container outer end |
+| Empty containers visible on page | Container elements in spec but layout XML uses `<LayoutElement>` not `<GridContainer>` for them | Use `gc(...)` helper, not `le(...)`, for elements that wrap children |
+| Wrong endpoint — workbook created instead of data model | Used `--type workbook` instead of `--type datamodel` | Delete the workbook; re-POST with the right `--type` |
+| Bar chart renders vertical but Tableau shows horizontal | Orientation is UI-only — `"orientation": "horizontal"` silently dropped | Set post-publish: chart editor → Properties → Chart type → Horizontal |
+| Sigma chart shows dim values Tableau's view never had | Missed Phase 2.5 filter | Diff CSV signals vs warehouse; add the filter as control/element-level |
+| Axis label rotation / dashboard title alignment | UI-only fields | Set in element editor post-publish |
+| `mcp__sigma-mcp-v2__query` returns "Table X not found" | Workbook queries don't resolve element names as table refs | Use `type: "connection"` with raw inodeId for unfiltered warehouse queries |
+| `Unresolved column: <name>` on workbook/datamodel query | These surfaces expose **column IDs**, not display names | `describe` the element first; use the quoted IDs from the DDL |
+| `Duplicate id: 'ctl-xxx'` on workbook POST | A control element's `id` matches its `controlId` (same namespace) | Use distinct values: `id: "el-ctl-region"`, `controlId: "ctl-region"` |
+| Integer date key column renders as number axis | `ORDER_DATE_KEY` stored as YYYYMMDD integer | Cast in workbook column: `Date(Left(Text([Master/ORDER_DATE_KEY]), 4) & "-" & Mid(..., 5, 2) & "-" & Right(..., 2))`. `DateParse()` and `ToText()` do not exist in Sigma. |
+| Sigma line chart shows 24 month-year buckets where Tableau shows 12 month names | Tableau MONTH part collapses across years; Sigma `DateTrunc("month", ...)` preserves year | See `refs/column-gotchas.md` "Cross-year month rollup" |
+| Parity DIVERGE: bucket values differ but ratios match | Wrong source column for a Tableau calc | Calc-derived buckets must be re-derived from the same source the Tableau calc used (see `calc-fields.json` from Phase 1e), not from a same-named warehouse column |
+| Calc-extracted formula uses `IIF`/`COUNTD`/LOD | Tableau syntax that's not 1:1 with Sigma | `IIF(c,t,e)` → `If(c,t,e)`; `COUNTD(x)` → `CountDistinct(x)`; LOD expressions need a per-case Sigma equivalent (window, Lookup, or pre-aggregation) |
+| Ruby heredoc inside `bash -c '...'` fails with backslash errors | Bash's single-quoted block reaches into the heredoc | Write Ruby to a file with the `Write` tool and run `ruby /tmp/script.rb` |

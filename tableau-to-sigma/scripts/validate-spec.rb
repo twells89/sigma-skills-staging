@@ -1,0 +1,116 @@
+#!/usr/bin/env ruby
+# Validate a DM or workbook spec before POST/PUT.
+# Encapsulates the embedded Python validator from SKILL.md (in Ruby), and adds
+# cross-source ref support for workbook specs that reference DM elements.
+#
+# Usage:
+#   ruby validate-spec.rb --type datamodel <spec.json>
+#   ruby validate-spec.rb --type workbook  --dm-context <dm-id-map.json> <spec.json>
+#
+#   <dm-id-map.json> is the output of post-and-readback.rb for the DM:
+#     { dataModelId: "...", pages: [{ id, name, elements: [{id, name}] }] }
+
+require 'json'
+require 'optparse'
+
+opts = { type: nil, dm_context: nil }
+op = OptionParser.new do |p|
+  p.on('--type T', %w[datamodel workbook]) { |v| opts[:type] = v }
+  p.on('--dm-context PATH')                { |v| opts[:dm_context] = v }
+end
+op.parse!
+abort('--type required (datamodel|workbook)') unless opts[:type]
+abort('usage: validate-spec.rb --type T [--dm-context P] <spec.json>') if ARGV.empty?
+
+spec = JSON.parse(File.read(ARGV[0]))
+
+# Known prefixes the validator considers valid for cross-element refs
+external_names = []  # element names that are sources OUTSIDE this spec (e.g., DM elements when validating a workbook)
+if opts[:type] == 'workbook' && opts[:dm_context]
+  ctx = JSON.parse(File.read(opts[:dm_context]))
+  external_names.concat(ctx.fetch('pages', []).flat_map { |p| p.fetch('elements', []).map { |e| e['name'] } }.compact)
+end
+
+errors = []
+all_element_names = []
+spec.fetch('pages', []).each do |page|
+  page.fetch('elements', []).each { |el| all_element_names << el['name'] if el['name'] }
+end
+all_known_prefixes = (all_element_names + external_names).to_set rescue (all_element_names + external_names)
+require 'set' rescue nil
+all_known_set = all_known_prefixes.is_a?(Set) ? all_known_prefixes : Set.new(all_known_prefixes)
+
+errors << 'spec contains rgb(...) color strings (Cloudflare WAF blocks)' if JSON.generate(spec).include?('rgb(')
+
+spec.fetch('pages', []).each do |page|
+  page.fetch('elements', []).each do |el|
+    kind = el['kind'] || ''
+    name = el['name'] || el['id'] || '?'
+    cols = (el['columns'] || []) + (el['metrics'] || [])
+    sibling_names = Set.new(cols.map { |c| c['name'] }.compact)
+
+    src = el['source'] || {}
+    own_prefixes = Set.new
+    if src['kind'] == 'warehouse-table' && src['path']
+      own_prefixes << src['path'].last
+    end
+    own_prefixes << 'Custom SQL' if src['kind'] == 'sql'
+
+    cols.each do |col|
+      f = (col['formula'] || '').to_s
+      f.scan(/\[([^\]]+)\]/).flatten.each do |ref|
+        if ref.include?('/')
+          prefix = ref.split('/', 1)[0] # bug-fix: split with limit 2
+          prefix = ref.split('/', 2)[0]
+          unless own_prefixes.include?(prefix) || all_known_set.include?(prefix)
+            errors << "#{name}.#{col['name']}: ref [#{ref}] — prefix \"#{prefix}\" unknown " \
+                      "(known: #{(own_prefixes + all_known_set).to_a.sort.join(', ')})"
+          end
+        else
+          unless sibling_names.include?(ref)
+            errors << "#{name}.#{col['name']}: bare ref [#{ref}] not a sibling column"
+          end
+        end
+      end
+
+      if f =~ /\b(Weekday|Month|Year|Quarter|Day|Hour|Minute)\s*\(/i
+        if f.include?('If(') && !f.include?('IsNull(') && !f.include?('Coalesce(')
+          errors << "#{name}.#{col['name']}: nested-If on date function without IsNull/Coalesce guard"
+        end
+      end
+    end
+
+    errors << "#{name}: invalid kind \"kpi\" — must be \"kpi-chart\"" if kind == 'kpi'
+    errors << "#{name}: invalid kind \"pie\" — must be \"pie-chart\"" if kind == 'pie'
+    errors << "#{name}: invalid kind \"donut\" — must be \"donut-chart\"" if kind == 'donut'
+    errors << "#{name}: kpi-chart missing value" if kind == 'kpi-chart' && !el['value']
+
+    if %w[pie-chart donut-chart].include?(kind)
+      errors << "#{name}: #{kind} missing color" unless el['color']
+      errors << "#{name}: #{kind} missing value" unless el['value']
+    end
+
+    if kind == 'donut-chart' && el['holeValue']
+      hv = el['holeValue']
+      if !hv.is_a?(Hash) || !hv['id']
+        errors << "#{name}: donut-chart holeValue must be {\"id\":...}"
+      elsif hv['id'] == el.dig('value', 'id')
+        errors << "#{name}: donut-chart holeValue.id equals value.id — element silently dropped"
+      end
+    end
+
+    if %w[bar-chart line-chart area-chart combo-chart scatter-chart].include?(kind)
+      errors << "#{name}: use yAxis not measures for #{kind}" if el['measures']
+      errors << "#{name}: #{kind} missing yAxis" unless el['yAxis']
+    end
+
+    if kind == 'pivot-table'
+      errors << "#{name}: pivot-table must use rowsBy/columnsBy" if el['rows'] || el['columnGroups']
+      errors << "#{name}: pivot-table without rowsBy renders only a grand-total row" if (el['rowsBy'] || []).empty?
+    end
+  end
+end
+
+errors.each { |e| puts "ERROR: #{e}" }
+puts "--- #{errors.size} errors"
+exit(errors.empty? ? 0 : 1)
