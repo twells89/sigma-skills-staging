@@ -170,6 +170,8 @@ Use this pattern whenever the workbook needs to slice the fact by a dim attribut
 
 **Null-tolerance for Tableau-style ELSE catches:** Tableau's `IF x >= 5000 THEN "Platinum" … ELSE "Bronze"` collapses NULL `x` into the ELSE branch (`NULL >= 5000` is NULL → falls through). Sigma's `If(NULL >= ..., ...)` returns NULL, not the false-arm — so orphan-joined rows where the lookup returns NULL produce a NULL bucket instead of joining the default category. To match Tableau, wrap the lookup: `Coalesce(Lookup([Customer Dim/Customer Value Tier], ...), "Bronze")`. Equivalent fix: `If(Coalesce([Lifetime Revenue], -1) >= 5000, ...)` if computing the bucket directly from the looked-up base column.
 
+> **Apply the Coalesce wrap at the workbook master, not the DM, when possible.** Editing the DM after the workbook is built reassigns all element IDs and breaks the workbook's `source.elementId`. Wrapping the column on the master table (`Coalesce([Order Fact/Customer Value Tier], "Bronze")`) gets the same null-collapse result with one workbook PUT and no DM churn. Use the DM-level wrap only when the DM is being built fresh OR when multiple workbooks need the fix and you'd rather centralize. Validated 2026-05-18 on Orders Conversion Test (REST v2): workbook-master-level Coalesce took chart from `DIVERGE [null tier 0.66]` to strict-mode PASS without touching the DM.
+
 ## Format objects
 
 ```json
