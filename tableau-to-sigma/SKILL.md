@@ -37,6 +37,7 @@ which calc translation, which layout) — not orchestration.
 | `scripts/get-tableau-token.sh` | One-shot signin → exports `TABLEAU_AUTH_TOKEN` + `TABLEAU_SITE_ID` |
 | `scripts/tableau-discover.rb` | PAT-mode Phase 1 discovery in one CLI: workbook + views + VDS metadata + GraphQL + .twb content |
 | `scripts/parse-twb-layout.rb` | Parse a `.twb` XML file into a per-dashboard zone list. Per chart zone surfaces: position (`x/y/w/h%`), `chart_kind`, `mark_class`, `geo_role`, `sort`, `filters`, `aggregations` (per-column derivation: Sum/Avg/CountD/Month-Trunc/etc.), `channels` (color/size/detail/label encoding). Use as a deterministic Phase 5 layout + chart-config scaffold. |
+| `scripts/build-charts-from-signals.rb` | Generate Sigma chart-element specs from parse-twb-layout output + view CSVs + a master-column map. Honors `sort` (no sort emitted when Tableau had none), `aggregations` (right aggregator per measure: Sum/Avg/Min/Max/Median/CountDistinct), date-truncation (`Month-Trunc` → `DateTrunc("month", …)`), and emits warnings for action filters and color-channel multi-series cases. |
 | `scripts/extract-custom-sql.rb` | Phase 1f: pull Custom SQL blocks behind a workbook via Metadata GraphQL + .twb XML fallback. Output → `/tmp/<name>/custom-sql.json`. |
 | `scripts/lib/tableau_rest.rb` | Ruby wrapper for the Tableau REST endpoints the skill uses |
 | `scripts/estimate-cost.rb` | Predict input/output token cost from workbook + datasource metadata |
