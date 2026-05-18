@@ -98,6 +98,88 @@ def page_xml(page_id, *children)
 end
 ```
 
+## Reading the .twb dashboard layout
+
+Run `scripts/parse-twb-layout.rb` on `workbook-content.twb` (from PAT-mode Phase 1)
+to get a per-zone JSON with caption, percent coordinates, AND the chart kind
+extracted from each worksheet's `<mark>` element. This is more reliable than
+inferring chart type from the view CSV.
+
+### Zone `kind` values (zone-level type-v2)
+
+| Zone `kind` | Tableau type-v2 | Map to Sigma element |
+|---|---|---|
+| `chart` | (no type-v2, has worksheet name) | A chart element — use `chart_kind` field for kind |
+| `title` | `title` | `text` element with `body: "## <Dashboard name>"` |
+| `text` | `text` | `text` element (free annotation) |
+| `filter` | `filter` | `control` element on the master table (list / date-range / etc.) |
+| `parameter` | `paramctrl` | `control` of `controlType: "segmented"` or `number` / `slider` |
+| `legend` | `color` | Usually automatic in Sigma — drop unless explicitly free-floating |
+| `spacer` | `empty` | Leave the grid range empty (no Sigma element) |
+| `container` | `layout-basic` / `layout-flow` | Pure layout — only affects grid spans, no Sigma element |
+| `dashboard-object` | `dashboard-object` | Generic — usually an `image` element |
+
+### `chart_kind` values (chart-tile level, from `<mark class="...">`)
+
+| `chart_kind` | Tableau mark | Sigma element `kind` |
+|---|---|---|
+| `bar` | `Bar` | `bar-chart` |
+| `line` | `Line` | `line-chart` |
+| `area` | `Area` | `area-chart` |
+| `pie` | `Pie` | `pie-chart` |
+| `scatter` | `Circle` / `Shape` | `scatter-chart` |
+| `table-or-text` | `Square` / `Text` | `pivot-table` (heatmap-style) or `table` |
+| `map-region` | `Multipolygon` / `Polygon` / `Filled` / `Map` / has `<geometry>` | `region-map` |
+| `map-point` | (has `Latitude` + `Longitude` columns) | `point-map` |
+| `automatic` | `Automatic` | **Verify visually** — Tableau picks the default for the encodings; usually bar but not deterministic |
+| `other` | unknown / unhandled | Open the dashboard PNG and decide manually |
+
+> **`automatic` is not a Sigma kind.** When the parser emits `chart_kind: automatic`, fetch the dashboard view image, look at the tile, and pick the right Sigma kind. Tableau's "Automatic" mark adapts to whatever the worksheet's encodings imply — there's no deterministic mapping.
+
+### Percent (Tableau .twb) → Sigma 24-col grid
+
+The parser emits `x_pct`, `y_pct`, `w_pct`, `h_pct` in percent of dashboard.
+Convert to Sigma grid spans:
+
+| Tableau % range | Sigma cols (24-col grid) |
+|---|---|
+| 0 – 25% | `1 / 7` |
+| 25 – 50% | `7 / 13` |
+| 50 – 75% | `13 / 19` |
+| 75 – 100% | `19 / 25` |
+| 0 – 33% (thirds) | `1 / 9` |
+| 33 – 67% | `9 / 17` |
+| 67 – 100% | `17 / 25` |
+| 0 – 50% (halves) | `1 / 13` |
+| 50 – 100% | `13 / 25` |
+| 0 – 100% (full) | `1 / 25` |
+
+For arbitrary percents, the conversion is `c0 = round(x_pct/100 * 24) + 1`,
+`c1 = round((x_pct + w_pct)/100 * 24) + 1`. Snap to the table values above when
+within ~3% to keep the layout aligned to common grid breakpoints.
+
+Rows: Sigma rows are relative — use the row-sizing guide later in this file
+(KPI 8–9 rows, bar chart 12–13 rows, hero line/area 13+ rows). A Tableau
+dashboard at 100% height with two stacked rows of charts maps to ~12 Sigma
+rows per chart row.
+
+### Tableau dashboard object → Sigma element
+
+| Tableau dashboard object | Sigma equivalent |
+|---|---|
+| Horizontal / Vertical Container | Use grid spans directly — no Sigma object |
+| Blank (spacer) | Leave the grid range empty |
+| Image | `image` element with `url` |
+| Web Page | `image` with screenshot URL — no live-embed spec equivalent |
+| Text annotation | `text` element (markdown `body`) |
+| Filter shelf (single filter) | `control` element (`list` / `date-range` / `number-range` etc.) on the master table |
+| Parameter control | `control` of `controlType: "segmented"` (radio buttons) or `number` / `slider` |
+| Color legend (chart-internal) | Automatic in Sigma — don't recreate |
+| Color legend (free-floating) | Optional `text` element + `color` channel on the chart |
+| Dashboard title | `text` element with `body: "## <Title>"` |
+
+---
+
 ## Typical page layout: 4 KPIs + line chart + 2 bar charts
 
 ```ruby
@@ -132,6 +214,76 @@ overview_layout = "<Page>\n" \
   "#{le(bar1_id,  1, 13, 22, 34)}\n" \
   "#{le(bar2_id, 13, 25, 22, 34)}\n" \
   "</Page>"
+```
+
+## Other canonical page layouts
+
+### Title + filter shelf + 2×3 chart grid
+
+The most common Tableau-derived layout: dashboard title at the top, a row of
+filter controls beneath it, and 6 charts in a 2-row × 3-column grid.
+
+```ruby
+overview_layout = page_xml(
+  'page-overview',
+  le('title-text',         1, 25,  1,  3),     # title bar (full width)
+
+  le('el-ctl-date',        1,  9,  3,  6),     # 3 controls horizontal
+  le('el-ctl-region',      9, 17,  3,  6),
+  le('el-ctl-state',      17, 25,  3,  6),
+
+  le('el-chart-1',         1,  9,  6, 18),     # row 1 of charts
+  le('el-chart-2',         9, 17,  6, 18),
+  le('el-chart-3',        17, 25,  6, 18),
+
+  le('el-chart-4',         1,  9, 18, 30),     # row 2 of charts
+  le('el-chart-5',         9, 17, 18, 30),
+  le('el-chart-6',        17, 25, 18, 30)
+)
+```
+
+### Title + filter sidebar (left) + content
+
+Alternative when the Tableau dashboard has filters stacked vertically on the
+left. The sidebar takes ~6 cols; the content grid takes the remaining 18.
+
+```ruby
+overview_layout = page_xml(
+  'page-overview',
+  le('title-text',     1, 25,  1,  3),
+
+  le('el-ctl-date',    1,  7,  3,  9),         # sidebar — 3 controls stacked
+  le('el-ctl-region',  1,  7,  9, 15),
+  le('el-ctl-state',   1,  7, 15, 21),
+
+  le('el-chart-1',     7, 25,  3, 15),         # content area: 2 cols × 2 rows
+  le('el-chart-2',     7, 16, 15, 27),
+  le('el-chart-3',    16, 25, 15, 27)
+)
+```
+
+### Title + 4 KPIs + hero + 2×2 grid
+
+Useful when the source dashboard has a KPI strip up top (executive overview pattern):
+
+```ruby
+kpi_inner = [
+  le('kpi-1',  1,  7, 1, 9),
+  le('kpi-2',  7, 13, 1, 9),
+  le('kpi-3', 13, 19, 1, 9),
+  le('kpi-4', 19, 25, 1, 9)
+].join("\n")
+
+overview_layout = page_xml(
+  'page-overview',
+  le('title-text',         1, 25,  1,  3),
+  gc('kpi-row',            1, 25,  3, 11, kpi_inner),
+  le('el-hero',            1, 25, 11, 24),     # full-width hero chart
+  le('el-chart-1',         1, 13, 24, 36),     # 2×2 grid
+  le('el-chart-2',        13, 25, 24, 36),
+  le('el-chart-3',         1, 13, 36, 48),
+  le('el-chart-4',        13, 25, 36, 48)
+)
 ```
 
 ## Row sizing guide
@@ -345,6 +497,26 @@ Sigma supports two map kinds via spec: **`region-map`** (choropleth — fills na
 - `country` — country names / ISO codes
 
 **Rejected `regionType` values:** `us-zip`, `us-msa`, `us-congressional-district`, `world-country`, `state`, `province`, `continent`. All return `pages[N].elements[N].region.regionType: Invalid value: string`.
+
+#### Tableau geographic role → Sigma `regionType`
+
+`parse-twb-layout.rb` surfaces the worksheet's `semantic-role` attribute when one
+is set. Translate to a Sigma `regionType` like this:
+
+| Tableau `semantic-role` | Sigma `regionType` | Notes |
+|---|---|---|
+| `[Country].[ISO3166_2]` | `country` | Country names or ISO codes; Sigma's only non-US region type |
+| `[Country].[Country]` | `country` | Same — alternate role naming |
+| `[State].[Name]` | `us-state` | Only valid if the data is US states. Non-US states → no spec equivalent, fall back to bar chart |
+| `[State/Province].[Name]` | `us-state` | Same restriction — US only |
+| `[County].[Country].[Name]` | `us-county` | US counties; non-US → bar-chart fallback |
+| `[Zip Code].[Country].[Zip]` | `us-zipcode` | US ZIP only; note: **`us-zipcode`**, not `us-zip` |
+| `[Area Code].[Country].[Area]` | `us-cbsa` | Closest match for metro-area-ish encodings; verify the data is CBSA-shaped first |
+| `[City].[Country].[Name]` | (no spec) | Fall back to bar chart or to `point-map` if lat/long are also present |
+
+> **Non-US dataset with state / county / ZIP encoding:** Sigma's region-map types are US-only except for `country`. Drop to a sorted descending bar chart or, if you have lat/long, a `point-map`. Document the fallback in the Sigma chart's name so the user knows why it's not a map.
+
+> **Both `latitude` and `longitude` columns present:** prefer `point-map` over `region-map`. Lat/long is more precise than a region rollup, and Sigma's point-map renders directly without needing a region-type match.
 
 #### point-map (lat/long bubbles)
 

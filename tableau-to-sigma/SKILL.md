@@ -232,7 +232,11 @@ Use the dashboard image to understand:
 ruby scripts/parse-twb-layout.rb /tmp/<name>/workbook-content.twb /tmp/<name>/dashboard-layout.json
 ```
 
-It emits a per-dashboard zone list with `caption`, `view_ref`, and `x/y/w/h` in percent — a deterministic scaffold for your Sigma layout XML and a checklist of every tile you must reproduce. Compare it side-by-side with the dashboard PNG; the union of the two is what your workbook spec must cover.
+It emits a per-dashboard zone list with `caption`, `view_ref`, `x/y/w/h` in percent, **and `chart_kind` extracted from each worksheet's `<mark>` element** (`bar` / `line` / `pie` / `scatter` / `map-region` / `map-point` / `table-or-text` / `automatic` / `other`). This is more reliable than inferring chart type from the view CSV — the CSV headers can't distinguish bar-vs-pie or bar-vs-map. Map every zone in the output to a Sigma element using the tables in `refs/workbook-layout.md` (`Reading the .twb dashboard layout` section).
+
+> **Maps:** if `parse-twb-layout.rb` emits `chart_kind: map-region` or `chart_kind: map-point` for any zone, do NOT build a bar chart. Use Sigma's `region-map` / `point-map` element kinds. The Tableau geographic role (`semantic-role` on the column) translates to Sigma's `regionType` via the table in `refs/workbook-layout.md`. Sigma's region types are US-only except for `country` — non-US state/county/ZIP data falls back to a sorted bar chart or, if lat/long is available, a `point-map`.
+
+> **`chart_kind: automatic`:** Tableau's "Automatic" mark picks a default for the encodings. It usually renders as a bar but is not deterministic. When you see `automatic`, fetch the dashboard PNG and look at that specific tile to decide the Sigma kind.
 
 Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`, `kpi-chart`, `pie-chart`, `donut-chart`, `region-map`, `point-map`, `table`, `pivot-table`, `control`, `text`, `image`, `container`.
 
