@@ -35,21 +35,44 @@ end
 meta = JSON.parse(File.read(INP))
 
 calcs = []
-(meta['fieldGroups'] || []).each do |grp|
-  table_id = grp['logicalTableId']
-  (grp['fields'] || []).each do |f|
+
+# Two input shapes:
+#   1. MCP get-datasource-metadata → { fieldGroups: [{logicalTableId, fields:[...]}], ... }
+#   2. REST VDS read-metadata      → { data: [{...field..., logicalTableId?:...}], ... }
+# Detect which and normalize.
+if meta['fieldGroups']
+  (meta['fieldGroups'] || []).each do |grp|
+    table_id = grp['logicalTableId']
+    (grp['fields'] || []).each do |f|
+      next unless f['columnClass'] == 'CALCULATION'
+      calcs << {
+        name:       f['name'] || f['fieldCaption'],
+        logical_table: table_id,
+        data_type:  f['dataType'],
+        role:       f['role'] || f['fieldRole'],
+        data_category: f['dataCategory'],
+        default_agg: f['defaultAggregation'],
+        formula:    f['formula'],
+        translation_notes: gotchas(f['formula'].to_s)
+      }
+    end
+  end
+elsif meta['data']
+  (meta['data'] || []).each do |f|
     next unless f['columnClass'] == 'CALCULATION'
     calcs << {
-      name:       f['name'],
-      logical_table: table_id, # nil = workbook-level calc, not tied to a table
+      name:       f['fieldCaption'] || f['fieldName'],
+      logical_table: f['logicalTableId'], # nil = workbook-level calc, not tied to a table
       data_type:  f['dataType'],
-      role:       f['role'],
+      role:       f['fieldRole'],
       data_category: f['dataCategory'],
       default_agg: f['defaultAggregation'],
       formula:    f['formula'],
       translation_notes: gotchas(f['formula'].to_s)
     }
   end
+else
+  abort "unrecognized metadata shape — expected 'fieldGroups' (MCP) or 'data' (VDS REST)"
 end
 
 File.write(OUT, JSON.pretty_generate(calcs))

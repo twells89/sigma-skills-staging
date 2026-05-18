@@ -54,14 +54,18 @@ datasource_count  = 0
 if opts[:ds]
   meta = JSON.parse(File.read(opts[:ds]))
   datasource_count = 1
-  (meta['fieldGroups'] || []).each do |grp|
-    (grp['fields'] || []).each do |f|
-      next unless f['columnClass'] == 'CALCULATION'
-      if (f['formula'] || '').match?(/\{\s*(FIXED|INCLUDE|EXCLUDE)|\bIF\b[\s\S]+\bELSEIF\b[\s\S]+\bELSEIF\b/i)
-        calc_count_complex += 1
-      else
-        calc_count_simple += 1
-      end
+  # Accept either MCP shape (fieldGroups[].fields[]) or REST VDS shape (data[])
+  fields = if meta['fieldGroups']
+             meta['fieldGroups'].flat_map { |g| g['fields'] || [] }
+           else
+             meta['data'] || []
+           end
+  fields.each do |f|
+    next unless f['columnClass'] == 'CALCULATION'
+    if (f['formula'] || '').match?(/\{\s*(FIXED|INCLUDE|EXCLUDE)|\bIF\b[\s\S]+\bELSEIF\b[\s\S]+\bELSEIF\b/i)
+      calc_count_complex += 1
+    else
+      calc_count_simple += 1
     end
   end
   # Custom SQL is reported in the metadata for textOfRawSql sources; not always present

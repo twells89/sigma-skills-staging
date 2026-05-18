@@ -33,6 +33,11 @@ which calc translation, which layout) — not orchestration.
 |---|---|
 | `scripts/setup.rb` | One-time Sigma credential setup |
 | `scripts/get-token.sh` | Exchange `SIGMA_CLIENT_ID`/`SIGMA_CLIENT_SECRET` for `SIGMA_API_TOKEN` (~1h TTL) |
+| `scripts/setup-tableau.rb` | One-time Tableau PAT setup (only needed for PAT mode — see `refs/tableau-rest.md`) |
+| `scripts/get-tableau-token.sh` | One-shot signin → exports `TABLEAU_AUTH_TOKEN` + `TABLEAU_SITE_ID` |
+| `scripts/tableau-discover.rb` | PAT-mode Phase 1 discovery in one CLI: workbook + views + VDS metadata + GraphQL + .twb content |
+| `scripts/parse-twb-layout.rb` | Parse a `.twb` XML file into a per-dashboard zone list (caption + view ref + x/y/w/h%). Use as a deterministic Phase 5 layout scaffold instead of eyeballing the PNG. |
+| `scripts/lib/tableau_rest.rb` | Ruby wrapper for the Tableau REST endpoints the skill uses |
 | `scripts/estimate-cost.rb` | Predict input/output token cost from workbook + datasource metadata |
 | `scripts/fetch-view-data.rb` | Parse pre-fetched view CSVs into a signals manifest (distinct values, date min/max, agg hints) |
 | `scripts/discover-warehouse-columns.rb` | Parallel-fetch Sigma column metadata for N table inodeIds |
@@ -83,11 +88,36 @@ eval "$(scripts/get-token.sh)"
 > the exported var dies immediately. Keep eval + curl in the same `bash -c '...'`
 > invocation.
 
-### Tableau access
+### Tableau access — two modes
 
-The Tableau MCP tools (`mcp__tableau__*`) are used for metadata retrieval and
-must already be authenticated in the session. Direct Tableau PAT auth via curl
-frequently returns 401 — always prefer MCP.
+The skill supports two transports for Tableau-side discovery. **Prefer MCP** when
+it's available; the PAT path is a fallback.
+
+| Mode | When to use | Setup |
+|---|---|---|
+| **MCP** | `mcp__tableau__*` tools are loaded in the session | None — host handles auth |
+| **PAT (REST)** | MCP tools not available, OR you need `.twb` content (layout-hint extraction, embedded datasources) | `ruby scripts/setup-tableau.rb` once, then `eval "$(scripts/get-tableau-token.sh)"` per session |
+
+**Detection at session start:** try `mcp__tableau__list-workbooks`. If the tool is
+loaded and responds, you're in MCP mode. If it errors with "tool not found", fall
+back to PAT mode.
+
+**PAT mode in one command:**
+
+```bash
+eval "$(scripts/get-tableau-token.sh)"
+ruby scripts/tableau-discover.rb \
+  --workbook-name "<name>" \
+  --datasource-name "<name>" \
+  --out /tmp/<name>
+```
+
+Produces the same artifacts as MCP-driven Phase 1 (`get-workbook.json`, `ds-metadata.json`,
+`views/*.csv`, dashboard PNG, plus `workbook-content.twb`). Downstream scripts in Phases 2–6
+are unchanged. Full endpoint inventory and gotchas in `refs/tableau-rest.md`.
+
+> **One signin attempt only.** Tableau Cloud invalidates a PAT after 4 consecutive failed
+> signins. `get-tableau-token.sh` runs exactly once; never wrap it in a retry loop.
 
 ---
 
@@ -180,11 +210,29 @@ If `get-view-data` returns 401 for a view, retry that view solo; if it 401s agai
 
 > **Do not parallel-fire `get-view-image` calls.** Even if the CSVs succeeded in parallel, concurrent image requests still 401 due to VizQL session contention. Images are always solo.
 
+> **Reading the dashboard image is MANDATORY before writing the workbook spec in Phase 5.** The CSV headers tell you a chart's dimensions and measures; they do NOT tell you (a) the chart's *kind* (a `Category, Count` CSV could back a bar OR a pie OR a donut), (b) any text annotations (titles, section headers, footnotes), or (c) the filter shelf. Skipping the image read is the most common Phase 5 mistake — you ship a workbook that has the right numbers but is missing tiles the source dashboard actually rendered.
+
+**Phase 1d checklist — confirm before moving on:**
+
+- [ ] Opened the dashboard PNG and listed every tile, including non-chart tiles (text, filter shelves, legends, image placeholders)
+- [ ] Decided the chart kind of each tile from the image, not just the CSV header (bar / line / pie / donut / kpi / map / table)
+- [ ] Noted every text element on the dashboard surface (page title, section headers, free-text annotations)
+- [ ] Noted every dashboard-level filter or parameter control (date range, list, segmented buttons)
+
 Use the dashboard image to understand:
 - How many KPIs are in the header row and what they measure
-- Which chart types are used (bar, line, scatter, map, small multiples)
-- The rough grid layout of each page (columns × rows)
-- **Page titles, section headers, and any free-text annotations on the dashboard surface** — these are real content (not metadata) and need to be recreated as `text` elements in the Sigma spec. The page tab name (`page['name']`) is *not* a substitute; it only appears in the tab bar, not on the canvas. If the Tableau dashboard shows a heading like "Orders Dashboard" at the top of the page, add a `text` element with `body: "# Orders Dashboard"` and reserve a row for it in the layout.
+- Which chart types are used (bar, line, scatter, map, small multiples, **pie / donut**)
+- The rough grid layout of each page (columns × rows) — count the rows; this is what your layout XML needs to match
+- **Page titles, section headers, and any free-text annotations on the dashboard surface** — these are real content (not metadata) and need to be recreated as `text` elements in the Sigma spec. The page tab name (`page['name']`) is *not* a substitute; it only appears in the tab bar, not on the canvas. If the Tableau dashboard shows a heading like "Orders Dashboard" at the top of the page, add a `text` element with `body: "## Orders Dashboard"` and reserve a row for it in the layout.
+- **The filter shelf.** Tableau dashboards usually have visible filter controls (a date range slider, a region list, a state list). These appear as `control` elements in the Sigma workbook — never just as Phase 2.5 element-level filters, because that strips the user-facing control surface.
+
+**Alternative / supplement: parse the `.twb` zone tree.** If you have `workbook-content.twb` from PAT-mode Phase 1, run:
+
+```bash
+ruby scripts/parse-twb-layout.rb /tmp/<name>/workbook-content.twb /tmp/<name>/dashboard-layout.json
+```
+
+It emits a per-dashboard zone list with `caption`, `view_ref`, and `x/y/w/h` in percent — a deterministic scaffold for your Sigma layout XML and a checklist of every tile you must reproduce. Compare it side-by-side with the dashboard PNG; the union of the two is what your workbook spec must cover.
 
 Sigma spec supports: `bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`, `kpi-chart`, `pie-chart`, `donut-chart`, `region-map`, `point-map`, `table`, `pivot-table`, `control`, `text`, `image`, `container`.
 
