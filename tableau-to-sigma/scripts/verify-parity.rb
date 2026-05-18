@@ -42,7 +42,8 @@ end.parse!
 abort('--plan required') unless opts[:plan]
 
 def round_row(row)
-  row.map { |v| v.is_a?(Numeric) ? v.round(2) : v }
+  # Convert all numerics to Float-rounded so Integer 11 and Float 11.0 compare equal in the set.
+  row.map { |v| v.is_a?(Numeric) ? v.to_f.round(2) : v }
 end
 
 def strict_compare(exp, act)
