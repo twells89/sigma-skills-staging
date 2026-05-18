@@ -55,6 +55,70 @@ The prefix in a column formula is the **last segment of the `path` array**, exac
 - `path: ["CSA", "Tableau Test", "ORDERS"]` → prefix is `ORDERS`
 - Formula: `"[ORDERS/SALES]"`
 
+## Element shape (Custom SQL)
+
+Use a Custom SQL element whenever the source data is a SQL query — including any Tableau workbook that uses Custom SQL **and** any DM that needs window aggregates (`SUM() OVER`, `RANK()`, `RUNNING_SUM`, etc.) which Sigma's calc-column functions cannot express.
+
+```json
+{
+  "id": "el-orders-sql",
+  "kind": "table",
+  "name": "Orders SQL",
+  "source": {
+    "connectionId": "<connection-id>",
+    "kind": "sql",
+    "sql": "SELECT o.ORDER_ID, o.REGION, o.SALES,\n  SUM(o.SALES) OVER (PARTITION BY o.REGION) AS REGION_TOTAL_SALES,\n  RANK() OVER (PARTITION BY o.REGION ORDER BY o.SALES DESC) AS SALES_RANK_IN_REGION\nFROM ANALYTICS.PUBLIC.ORDERS o\nLEFT JOIN ANALYTICS.PUBLIC.CUSTOMERS c ON o.CUSTOMER_ID = c.CUSTOMER_ID"
+  },
+  "columns": [
+    {"id": "c-order-id",      "name": "Order Id",             "formula": "[Custom SQL/ORDER_ID]"},
+    {"id": "c-region",        "name": "Region",               "formula": "[Custom SQL/REGION]"},
+    {"id": "c-sales",         "name": "Sales",                "formula": "[Custom SQL/SALES]"},
+    {"id": "c-region-total",  "name": "Region Total Sales",   "formula": "[Custom SQL/REGION_TOTAL_SALES]"},
+    {"id": "c-sales-rank",    "name": "Sales Rank in Region", "formula": "[Custom SQL/SALES_RANK_IN_REGION]"}
+  ],
+  "order": ["c-order-id","c-region","c-sales","c-region-total","c-sales-rank"]
+}
+```
+
+### Custom SQL element rules
+
+1. `source.kind` is `"sql"`. `path` is absent.
+2. `source.sql` is the raw SQL text in the warehouse's native dialect (Snowflake, BigQuery, etc.). Newlines in the JSON string are fine; the API parses them.
+3. **Column formula prefix is the literal string `Custom SQL`** — not the table name, not a path segment, not the element's `name`. Every column on the element uses `"[Custom SQL/<SELECT_ALIAS>]"`.
+4. `<SELECT_ALIAS>` is whatever you wrote as the column alias in the SELECT (`SELECT x AS NAME`). **Use UPPERCASE aliases** — Snowflake's default identifier casing is uppercase, and Sigma's column lookup is case-sensitive against the SQL result set. `[Custom SQL/region_total_sales]` will fail if the SELECT wrote `AS REGION_TOTAL_SALES`.
+5. Every column you want to expose in the DM needs both a SELECT-list entry AND a `columns[]` entry with the matching prefix.
+6. Metrics work the same as on a warehouse-table element: bare refs to sibling column names (`Sum([Sales])`).
+7. Relationships work the same — point at another element by `targetElementId` and match column IDs.
+
+### When to use a Custom SQL element vs a warehouse-table element
+
+Use a Custom SQL element when:
+- The Tableau source workbook uses Custom SQL (detected by `extract-custom-sql.rb` in Phase 1f).
+- The DM needs **window aggregates** (`SUM() OVER`, `RANK()`, `ROW_NUMBER()`, `LAG/LEAD`, etc.). Sigma's calc-column window functions (`SumOver`, `RankOver`, `CumulativeSum`, etc.) silently produce `error` type columns and the chart that references them renders blank. The validator hard-fails on these — see `scripts/validate-spec.rb`.
+- The DM needs **LOD-equivalent pre-aggregation**. Tableau `{FIXED [Dim] : SUM([X])}` becomes `SUM(X) OVER (PARTITION BY Dim)` in the Custom SQL or a pre-aggregated subquery joined back.
+- The customer's data model is already SQL-shaped in Tableau (CTEs, joins, derived columns) and breaking it apart into raw warehouse tables would lose semantics.
+
+Use a `warehouse-table` element when the source is a single physical table and all derived columns can be expressed as Sigma calc columns (scalar `If`/`Case`/`Lookup`/etc. — no window aggregates).
+
+You can mix both kinds of elements in the same DM. A common pattern: warehouse-table elements for the dimension tables (Customer Dim, Product Dim, Date Dim), Custom SQL element for the fact table when it needs window aggregates.
+
+### Tableau Custom SQL → Sigma SQL — common rewrites
+
+| Tableau | Sigma SQL (inside `source.sql`) |
+|---|---|
+| `RUNNING_SUM(SUM([X]))` | `SUM(X) OVER (ORDER BY <time> ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` |
+| `WINDOW_SUM(SUM([X]))` | `SUM(X) OVER (<partition / order>)` |
+| `RANK(SUM([X]))` | `RANK() OVER (PARTITION BY <p> ORDER BY <X> DESC)` |
+| `RANK_DENSE(SUM([X]))` | `DENSE_RANK() OVER (...)` |
+| `INDEX()` | `ROW_NUMBER() OVER (PARTITION BY <p> ORDER BY <expr>)` |
+| `LOOKUP(SUM([X]), -1)` | `LAG(X) OVER (ORDER BY <time>)` |
+| `LOOKUP(SUM([X]), +1)` | `LEAD(X) OVER (ORDER BY <time>)` |
+| `{FIXED [Dim] : SUM([X])}` | `SUM(X) OVER (PARTITION BY Dim)` — or pre-aggregated subquery joined back |
+| `{INCLUDE [Dim] : SUM([X])}` | Subquery pre-aggregated at view-grain + Dim, joined to the view |
+| `{EXCLUDE [Dim] : SUM([X])}` | `SUM(X) OVER (PARTITION BY <view-dims-minus-excluded>)` |
+| `TOTAL(SUM([X]))` | `SUM(X) OVER (PARTITION BY <view-dims>)` |
+| `SIZE()` | `COUNT(*) OVER (PARTITION BY <p>)` |
+
 ### Metric formula rule
 
 Metrics reference column `name` values (not IDs) without a table prefix:

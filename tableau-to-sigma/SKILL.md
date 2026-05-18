@@ -36,7 +36,8 @@ which calc translation, which layout) — not orchestration.
 | `scripts/setup-tableau.rb` | One-time Tableau PAT setup (only needed for PAT mode — see `refs/tableau-rest.md`) |
 | `scripts/get-tableau-token.sh` | One-shot signin → exports `TABLEAU_AUTH_TOKEN` + `TABLEAU_SITE_ID` |
 | `scripts/tableau-discover.rb` | PAT-mode Phase 1 discovery in one CLI: workbook + views + VDS metadata + GraphQL + .twb content |
-| `scripts/parse-twb-layout.rb` | Parse a `.twb` XML file into a per-dashboard zone list (caption + view ref + x/y/w/h%). Use as a deterministic Phase 5 layout scaffold instead of eyeballing the PNG. |
+| `scripts/parse-twb-layout.rb` | Parse a `.twb` XML file into a per-dashboard zone list (caption + view ref + x/y/w/h% + chart_kind). Use as a deterministic Phase 5 layout scaffold instead of eyeballing the PNG. |
+| `scripts/extract-custom-sql.rb` | Phase 1f: pull Custom SQL blocks behind a workbook via Metadata GraphQL + .twb XML fallback. Output → `/tmp/<name>/custom-sql.json`. |
 | `scripts/lib/tableau_rest.rb` | Ruby wrapper for the Tableau REST endpoints the skill uses |
 | `scripts/estimate-cost.rb` | Predict input/output token cost from workbook + datasource metadata |
 | `scripts/fetch-view-data.rb` | Parse pre-fetched view CSVs into a signals manifest (distinct values, date min/max, agg hints) |
@@ -262,18 +263,38 @@ See `refs/workbook-layout.md` for full control element spec patterns.
 ruby scripts/extract-calc-fields.rb /tmp/<name>/ds-metadata.json /tmp/<name>/calc-fields.json
 ```
 
-Each calc record carries `name`, `formula`, `default_agg`, and a
-`translation_notes` array flagging the common Tableau→Sigma gotchas:
+Each calc record carries `name`, `formula`, `default_agg`, `requires_custom_sql`,
+and a `translation_notes` array flagging the common Tableau→Sigma gotchas:
 - `IIF` → `If`
 - `COUNTD` → `CountDistinct`
-- LOD expressions (`{FIXED ...}`) — Sigma equivalent depends on grain
 - IF/ELSEIF chains ending in literal — **wrap nullable inputs in `Coalesce` to match Tableau ELSE-catches-null semantics** (Tableau collapses NULL into the ELSE branch; Sigma `If(NULL >= ..., ...)` returns NULL)
+- **`requires_custom_sql: true`** for Tableau table calcs (`WINDOW_*`, `RUNNING_*`, `RANK*`, `INDEX`, `FIRST`, `LAST`, `SIZE`, `TOTAL`, `LOOKUP`, `PREVIOUS_VALUE`) and LODs (`{FIXED/INCLUDE/EXCLUDE}`). These CANNOT be Sigma DM calc columns — Sigma's `CountOver` / `SumOver` / `RankOver` / `CumulativeSum` etc. **silently produce `error` type columns** when used in a DM calc column or grouping-table master calc. They MUST be implemented as a Sigma Custom SQL data-model element (`kind: "sql"`). See Phase 3 below for the spec shape.
 
 Translate the calc fields into the DM (Phase 3) using the original Tableau
 formula as the source of truth, NOT the warehouse column the calc happens
 to reference. Example: a Tableau "Customer Value Tier" calc that buckets
 `Lifetime Revenue` must be re-derived in Sigma from `LIFETIME_REVENUE`, not
 pulled from a same-named `LOYALTY_TIER` warehouse column.
+
+### 1f. Extract Custom SQL (PAT mode)
+
+If the source workbook uses Custom SQL — either as the entire datasource or
+mixed alongside warehouse tables — run:
+
+```bash
+ruby scripts/extract-custom-sql.rb \
+  --workbook-luid <wb-luid> \
+  --twb /tmp/<name>/workbook-content.twb \
+  --out /tmp/<name>/custom-sql.json
+```
+
+The script tries two paths:
+1. **Metadata GraphQL API** for `CustomSQLTable` nodes downstream of the workbook (works for both published-datasource Custom SQL and embedded Custom SQL).
+2. **`.twb` XML fallback** for embedded `<relation type='text'>` blocks (covers cases the Metadata API hasn't crawled yet).
+
+Output is a JSON array, one entry per Custom SQL block, with `query` (the raw SQL text), `connectionType`, and downstream workbook/datasource pointers. If the array is non-empty, build the DM in Phase 3 with **Custom SQL elements** (`kind: "sql"`) sourcing the actual SQL — not warehouse-table references.
+
+> **MCP-mode caveat.** This script needs PAT-mode env vars (`TABLEAU_AUTH_TOKEN`, etc.). If you only have MCP available, you cannot pull custom SQL — that's a real gap; switch to PAT mode for any workbook the customer says uses custom SQL.
 
 ---
 
@@ -361,6 +382,49 @@ Write the spec to `/tmp/<name>/dm-spec.json`. Full schema is in
 4. **Element name = formula prefix**. The `name` field on a DM element (e.g. `"Orders"`) becomes the prefix in all workbook formulas that reference it: `[Orders/Sales]`. Choose clean, stable names.
 5. **Relationships go on the source element**, not the target. See `refs/data-model-spec.md`.
 6. **Column formulas use the warehouse table name as prefix**: path `["CSA", "Tableau Test", "ORDERS"]` → formula `"[ORDERS/Column Name]"`.
+
+### When to use a Custom SQL element instead of a calc column
+
+> **Sigma window functions silently fail in DM calc columns and in workbook master (grouping-table) calc columns.** `CountOver`, `SumOver`, `RankOver`, `RowNumberOver`, `MaxOver`, `MinOver`, `AvgOver`, `FirstOver`, `LastOver`, `MedianOver`, `StdDevOver`, `CumulativeSum`, `CumulativeAvg`, etc. all POST/PUT successfully and return `success: true`, but the column resolves as `error` on GET and the chart that references it renders blank. The validator now hard-fails on these (see `scripts/validate-spec.rb`), but the right fix at design time is to NOT write them as calc columns in the first place.
+
+Any Tableau calc whose `requires_custom_sql: true` (from Phase 1e) — that is, any `WINDOW_*` / `RUNNING_*` / `RANK*` / `INDEX` / `FIRST` / `LAST` / `SIZE` / `TOTAL` / `LOOKUP` / `PREVIOUS_VALUE` table calc, or any `{FIXED/INCLUDE/EXCLUDE}` LOD — must be implemented as a **Sigma Custom SQL data-model element**:
+
+```json
+{
+  "id": "el-orders-windowed",
+  "kind": "table",
+  "name": "Orders With Window Calcs",
+  "source": {
+    "connectionId": "<connection-id>",
+    "kind": "sql",
+    "sql": "SELECT o.ORDER_ID, o.REGION, o.SALES,\n  SUM(o.SALES) OVER (PARTITION BY o.REGION) AS REGION_TOTAL_SALES,\n  RANK() OVER (PARTITION BY o.REGION ORDER BY o.SALES DESC) AS SALES_RANK_IN_REGION,\n  SUM(o.SALES) OVER (ORDER BY o.ORDER_DATE ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUNNING_SALES\nFROM ANALYTICS.PUBLIC.ORDERS o"
+  },
+  "columns": [
+    { "id": "c-order-id",      "name": "Order Id",            "formula": "[Custom SQL/ORDER_ID]" },
+    { "id": "c-region",        "name": "Region",              "formula": "[Custom SQL/REGION]" },
+    { "id": "c-sales",         "name": "Sales",               "formula": "[Custom SQL/SALES]" },
+    { "id": "c-region-total",  "name": "Region Total Sales",  "formula": "[Custom SQL/REGION_TOTAL_SALES]" },
+    { "id": "c-sales-rank",    "name": "Sales Rank in Region","formula": "[Custom SQL/SALES_RANK_IN_REGION]" },
+    { "id": "c-running-sales", "name": "Running Sales",       "formula": "[Custom SQL/RUNNING_SALES]" }
+  ]
+}
+```
+
+Key points:
+- `source.kind` is `"sql"` (not `"warehouse-table"`).
+- `source.sql` is the raw SQL text. Use the warehouse dialect for the underlying connection (Snowflake, BigQuery, etc.).
+- Column formula prefix is `[Custom SQL/<ALIAS_FROM_SELECT_LIST>]`. The alias is whatever you wrote in the `SELECT ... AS NAME` clause. **Use UPPERCASE aliases** (matches Snowflake's default identifier casing); Sigma's column lookup is case-sensitive against the SQL output.
+- Every column you want to expose in the DM needs both a SELECT-list entry in the SQL AND a corresponding `columns[]` entry on the DM element.
+- Translation hints from `extract-calc-fields.rb`:
+  - `RUNNING_SUM(SUM([X]))` → `SUM(X) OVER (ORDER BY <time> ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
+  - `WINDOW_SUM(SUM([X]))` → `SUM(X) OVER (<partition / order>)`
+  - `RANK(SUM([X]))` → `RANK() OVER (PARTITION BY <p> ORDER BY <X> DESC)`
+  - `{FIXED [Dim] : SUM([X])}` → `SUM(X) OVER (PARTITION BY Dim)` or a pre-aggregated subquery joined back
+  - `LOOKUP(SUM([X]), -1)` → `LAG(X) OVER (ORDER BY <time>)`
+
+When a workbook mixes plain calcs with window calcs, you can have BOTH kinds of DM elements in the same data model: one `warehouse-table` element for everything plain, plus one or more `sql` elements for the window/LOD calcs, related by key. Charts source from whichever element has the columns they need.
+
+> **DM PUT reassigns element IDs.** Combining a `warehouse-table` element with a `sql` element in the same DM works fine, but every PUT of the DM spec churns IDs — so plan to capture IDs once with `post-and-readback.rb`, build the workbook from those IDs, and avoid editing the DM in flight.
 
 ### Translate Tableau calc fields here
 

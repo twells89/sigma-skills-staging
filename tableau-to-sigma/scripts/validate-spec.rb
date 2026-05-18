@@ -58,6 +58,24 @@ spec.fetch('pages', []).each do |page|
 
     cols.each do |col|
       f = (col['formula'] || '').to_s
+
+      # Window-aggregate functions silently produce `error` type columns when used in
+      # a DM calc column or a workbook master (grouping-table) calc column. Hard-fail
+      # at lint time so the agent rewrites this as a Custom SQL data-model element
+      # (kind: "sql") with ANSI SQL OVER(...) instead.
+      if opts[:type] == 'datamodel' && src['kind'] != 'sql'
+        bad = f.scan(/\b(CountOver|SumOver|RankOver|RowNumberOver|MaxOver|MinOver|AvgOver|FirstOver|LastOver|MedianOver|StdDevOver|VarianceOver|CumulativeSum|CumulativeAvg|CumulativeCount|CumulativeMax|CumulativeMin)\b/i).flatten
+        unless bad.empty?
+          errors << "#{name}.#{col['name']}: formula uses #{bad.uniq.join(', ')} — Sigma window functions silently fail in DM calc columns. Move this column to a Custom SQL element (kind: \"sql\") with the operation rewritten as ANSI SQL OVER(...)."
+        end
+      end
+      if opts[:type] == 'workbook' && src['kind'] == 'table'
+        bad = f.scan(/\b(CountOver|SumOver|RankOver|RowNumberOver|MaxOver|MinOver|AvgOver|FirstOver|LastOver|MedianOver|StdDevOver|VarianceOver|CumulativeSum|CumulativeAvg|CumulativeCount|CumulativeMax|CumulativeMin)\b/i).flatten
+        unless bad.empty?
+          errors << "#{name}.#{col['name']}: formula uses #{bad.uniq.join(', ')} — fails on grouping-table master calc columns. Either compute in a Custom SQL DM element upstream, or use Sigma's chart-level running-total UI."
+        end
+      end
+
       f.scan(/\[([^\]]+)\]/).flatten.each do |ref|
         if ref.include?('/')
           prefix = ref.split('/', 1)[0] # bug-fix: split with limit 2
