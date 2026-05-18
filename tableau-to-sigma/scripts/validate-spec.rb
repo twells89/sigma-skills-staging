@@ -12,6 +12,9 @@
 
 require 'json'
 require 'optparse'
+require 'set'
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_functions'
 
 opts = { type: nil, dm_context: nil }
 op = OptionParser.new do |p|
@@ -59,21 +62,26 @@ spec.fetch('pages', []).each do |page|
     cols.each do |col|
       f = (col['formula'] || '').to_s
 
-      # Window-aggregate functions silently produce `error` type columns when used in
-      # a DM calc column or a workbook master (grouping-table) calc column. Hard-fail
-      # at lint time so the agent rewrites this as a Custom SQL data-model element
-      # (kind: "sql") with ANSI SQL OVER(...) instead.
-      if opts[:type] == 'datamodel' && src['kind'] != 'sql'
-        bad = f.scan(/\b(CountOver|SumOver|RankOver|RowNumberOver|MaxOver|MinOver|AvgOver|FirstOver|LastOver|MedianOver|StdDevOver|VarianceOver|CumulativeSum|CumulativeAvg|CumulativeCount|CumulativeMax|CumulativeMin)\b/i).flatten
-        unless bad.empty?
-          errors << "#{name}.#{col['name']}: formula uses #{bad.uniq.join(', ')} — Sigma window functions silently fail in DM calc columns. Move this column to a Custom SQL element (kind: \"sql\") with the operation rewritten as ANSI SQL OVER(...)."
-        end
+      # ---- Whitelist enforcement: every function call name must be in the
+      # canonical Sigma function library. Anything else is a Tableau-syntax
+      # leak, an imagined helper (IsIn / ToText), or a typo. Rewrite using a
+      # documented function OR move the logic into a Custom SQL element.
+      unknown = SigmaFunctions.unknown_functions(f) - [name, col['name']].compact
+      # Tableau formula refs use lots of identifiers that look like fn calls
+      # but are bracket-delimited (e.g., `[ORDERS/Sales]`). The regex already
+      # only matches identifiers followed by `(`, so this is the cleanup set.
+      # Skip the IF chain on uppercase Tableau identifiers like `IF`, `THEN`,
+      # `END`, `WHEN`, which the agent may slip through inadvertently.
+      reserved_tableau = %w[IF THEN ELSE ELSEIF END WHEN CASE AND OR NOT]
+      unknown.reject! { |n| reserved_tableau.include?(n.upcase) }
+      unless unknown.empty?
+        errors << "#{name}.#{col['name']}: formula references function(s) not in Sigma's library: #{unknown.join(', ')}. Either rewrite using a documented function (see scripts/lib/sigma_functions.rb) OR move the logic into a Custom SQL data-model element (kind: \"sql\")."
       end
-      if opts[:type] == 'workbook' && src['kind'] == 'table'
-        bad = f.scan(/\b(CountOver|SumOver|RankOver|RowNumberOver|MaxOver|MinOver|AvgOver|FirstOver|LastOver|MedianOver|StdDevOver|VarianceOver|CumulativeSum|CumulativeAvg|CumulativeCount|CumulativeMax|CumulativeMin)\b/i).flatten
-        unless bad.empty?
-          errors << "#{name}.#{col['name']}: formula uses #{bad.uniq.join(', ')} — fails on grouping-table master calc columns. Either compute in a Custom SQL DM element upstream, or use Sigma's chart-level running-total UI."
-        end
+      # ---- Tableau-syntax leak detection. Catches IIF / COUNTD / WINDOW_* /
+      # RUNNING_* / RANK_* / LOD braces / IsIn / ToText / etc. with explicit
+      # translation hints.
+      SigmaFunctions.tableau_leaks(f).each do |hint|
+        errors << "#{name}.#{col['name']}: #{hint}"
       end
 
       f.scan(/\[([^\]]+)\]/).flatten.each do |ref|

@@ -58,6 +58,8 @@ OptionParser.new do |p|
   p.on('--layout PATH')             { |v| opts[:layout] = v }
   p.on('--master-map PATH')         { |v| opts[:mmap] = v }
   p.on('--master-element-id ID')    { |v| opts[:master_id] = v }
+  p.on('--controls PATH', 'JSON file: array of control specs to emit alongside the chart elements') { |v| opts[:controls] = v }
+  p.on('--title STR',     'Dashboard title text element to emit (e.g., "Orders Dashboard")')         { |v| opts[:title] = v }
   p.on('--out PATH')                { |v| opts[:out] = v }
 end.parse!
 %i[tab layout mmap out].each { |k| abort("missing --#{k.to_s.tr('_','-')}") unless opts[k] }
@@ -307,6 +309,79 @@ layout.each do |dash|
   end
 end
 
-File.write(opts[:out], JSON.pretty_generate(elements))
-warn "wrote #{opts[:out]}  (#{elements.size} chart elements)"
+# ---- Title text element ----
+# If --title given, emit a text element. If --title omitted AND the parser
+# found a title/text zone, infer the dashboard name from the parser output.
+auto_title = nil
+if opts[:title].nil?
+  layout.each do |dash|
+    next unless dash['zones'].any? { |z| %w[title text].include?(z['kind']) && (z['y_pct'] || 100) < 10 }
+    auto_title = dash['dashboard']
+    break
+  end
+end
+title_text = opts[:title] || auto_title
+
+extras = []
+if title_text
+  extras << {
+    'id'   => 'title-text',
+    'kind' => 'text',
+    'body' => "## #{title_text}"
+  }
+end
+
+# ---- Filter controls ----
+# Caller supplies the column targets explicitly via --controls. We don't try
+# to infer the column from filter zone metadata because the Tableau filter
+# shelf doesn't reliably tell us which dimension it filters in this XML.
+if opts[:controls]
+  controls = JSON.parse(File.read(opts[:controls]))
+  controls.each_with_index do |c, i|
+    spec = {
+      'id'          => "el-ctl-#{c['name'] ? c['name'].downcase.gsub(/\W+/, '-') : "f#{i}"}",
+      'kind'        => 'control',
+      'controlId'   => "ctl-#{c['name'] ? c['name'].downcase.gsub(/\W+/, '-') : "f#{i}"}",
+      'name'        => c['name'] || "Filter #{i + 1}",
+      'controlType' => c['type'] || 'list',
+      'includeNulls' => 'when-no-value-is-selected',
+      'filters' => [
+        {
+          'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+          'columnId' => c['column']
+        }
+      ]
+    }
+    case spec['controlType']
+    when 'list'
+      spec['mode'] = c['mode'] || 'include'
+      spec['selectionMode'] = c['selectionMode'] || 'multiple'
+      spec['values'] = c['values'] || []
+      spec['source'] = {
+        'kind'     => 'source',
+        'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+        'columnId' => c['column']
+      }
+    when 'date-range'
+      spec['mode'] = c['mode'] || 'between'
+      if c['default']
+        d = c['default']
+        spec['startDate'] = d['startDate'] if d['startDate']
+        spec['endDate']   = d['endDate']   if d['endDate']
+        spec['unit']      = d['unit']      if d['unit']
+        spec['mode']      = d['mode']      if d['mode']
+      end
+    when 'segmented'
+      spec['source'] = c['source'] || {
+        'kind' => 'manual', 'valueType' => 'text', 'values' => c['values'] || [], 'labels' => []
+      }
+      spec['value'] = c['value']
+    end
+    extras << spec
+  end
+end
+
+all_elements = extras + elements
+File.write(opts[:out], JSON.pretty_generate(all_elements))
+warn "wrote #{opts[:out]}  (#{all_elements.size} elements: #{extras.size} controls/text + #{elements.size} charts)"
 warnings.each { |w| warn "  WARN  #{w}" }
