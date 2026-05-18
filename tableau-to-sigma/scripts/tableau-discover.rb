@@ -111,13 +111,36 @@ when 'all'
   end
 end
 
-# 5. Workbook content (.twb XML or .twbx bytes)
+# 5. Workbook content (.twb XML or .twbx bytes — auto-extract the inner .twb if zipped)
 unless opts[:skip_content]
   bytes = Tableau.download_workbook_content(wb['id'])
-  ext = bytes.start_with?("PK\x03\x04") ? 'twbx' : 'twb'
-  out_path = File.join(opts[:out], "workbook-content.#{ext}")
-  File.binwrite(out_path, bytes)
-  warn "wrote workbook-content.#{ext}  (#{bytes.bytesize} bytes)"
+  if bytes.start_with?("PK\x03\x04")
+    twbx_path = File.join(opts[:out], 'workbook-content.twbx')
+    File.binwrite(twbx_path, bytes)
+    warn "wrote workbook-content.twbx  (#{bytes.bytesize} bytes)"
+
+    # Auto-unzip so downstream scripts (parse-twb-layout, extract-custom-sql) can
+    # always operate on workbook-content.twb without a manual unzip step.
+    require 'tmpdir'
+    Dir.mktmpdir do |tmp|
+      unless system('unzip', '-o', '-q', twbx_path, '-d', tmp)
+        warn '.twbx auto-unzip failed (unzip command not available?); leaving .twbx in place'
+      else
+        inner = Dir.glob(File.join(tmp, '**', '*.twb')).first
+        if inner
+          twb_path = File.join(opts[:out], 'workbook-content.twb')
+          FileUtils.cp(inner, twb_path)
+          warn "extracted workbook-content.twb  (#{File.size(twb_path)} bytes) from .twbx"
+        else
+          warn '.twbx contained no inner .twb — odd'
+        end
+      end
+    end
+  else
+    twb_path = File.join(opts[:out], 'workbook-content.twb')
+    File.binwrite(twb_path, bytes)
+    warn "wrote workbook-content.twb  (#{bytes.bytesize} bytes)"
+  end
 end
 
 warn 'done.'

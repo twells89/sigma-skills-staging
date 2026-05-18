@@ -67,7 +67,7 @@ Use a Custom SQL element whenever the source data is a SQL query — including a
   "source": {
     "connectionId": "<connection-id>",
     "kind": "sql",
-    "sql": "SELECT o.ORDER_ID, o.REGION, o.SALES,\n  SUM(o.SALES) OVER (PARTITION BY o.REGION) AS REGION_TOTAL_SALES,\n  RANK() OVER (PARTITION BY o.REGION ORDER BY o.SALES DESC) AS SALES_RANK_IN_REGION\nFROM ANALYTICS.PUBLIC.ORDERS o\nLEFT JOIN ANALYTICS.PUBLIC.CUSTOMERS c ON o.CUSTOMER_ID = c.CUSTOMER_ID"
+    "statement": "SELECT o.ORDER_ID, o.REGION, o.SALES,\n  SUM(o.SALES) OVER (PARTITION BY o.REGION) AS REGION_TOTAL_SALES,\n  RANK() OVER (PARTITION BY o.REGION ORDER BY o.SALES DESC) AS SALES_RANK_IN_REGION\nFROM ANALYTICS.PUBLIC.ORDERS o\nLEFT JOIN ANALYTICS.PUBLIC.CUSTOMERS c ON o.CUSTOMER_ID = c.CUSTOMER_ID"
   },
   "columns": [
     {"id": "c-order-id",      "name": "Order Id",             "formula": "[Custom SQL/ORDER_ID]"},
@@ -83,7 +83,7 @@ Use a Custom SQL element whenever the source data is a SQL query — including a
 ### Custom SQL element rules
 
 1. `source.kind` is `"sql"`. `path` is absent.
-2. `source.sql` is the raw SQL text in the warehouse's native dialect (Snowflake, BigQuery, etc.). Newlines in the JSON string are fine; the API parses them.
+2. `source.statement` is the raw SQL text in the warehouse's native dialect (Snowflake, BigQuery, etc.). Newlines in the JSON string are fine; the API parses them. **The field name is `statement`, not `sql`** — POSTing with `"sql": "…"` returns `"source.statement: Invalid string: undefined"` even though `kind: "sql"` is correct.
 3. **Column formula prefix is the literal string `Custom SQL`** — not the table name, not a path segment, not the element's `name`. Every column on the element uses `"[Custom SQL/<SELECT_ALIAS>]"`.
 4. `<SELECT_ALIAS>` is whatever you wrote as the column alias in the SELECT (`SELECT x AS NAME`). **Use UPPERCASE aliases** — Snowflake's default identifier casing is uppercase, and Sigma's column lookup is case-sensitive against the SQL result set. `[Custom SQL/region_total_sales]` will fail if the SELECT wrote `AS REGION_TOTAL_SALES`.
 5. Every column you want to expose in the DM needs both a SELECT-list entry AND a `columns[]` entry with the matching prefix.
@@ -104,7 +104,7 @@ You can mix both kinds of elements in the same DM. A common pattern: warehouse-t
 
 ### Tableau Custom SQL → Sigma SQL — common rewrites
 
-| Tableau | Sigma SQL (inside `source.sql`) |
+| Tableau | Sigma SQL (inside `source.statement`) |
 |---|---|
 | `RUNNING_SUM(SUM([X]))` | `SUM(X) OVER (ORDER BY <time> ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` |
 | `WINDOW_SUM(SUM([X]))` | `SUM(X) OVER (<partition / order>)` |
