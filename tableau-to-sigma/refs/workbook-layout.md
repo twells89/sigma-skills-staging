@@ -101,9 +101,21 @@ end
 ## Reading the .twb dashboard layout
 
 Run `scripts/parse-twb-layout.rb` on `workbook-content.twb` (from PAT-mode Phase 1)
-to get a per-zone JSON with caption, percent coordinates, AND the chart kind
-extracted from each worksheet's `<mark>` element. This is more reliable than
-inferring chart type from the view CSV.
+to get a per-zone JSON. Each chart zone surfaces:
+
+| Field | Source | Use for |
+|---|---|---|
+| `caption` | zone `name` attr | element name in the Sigma spec |
+| `x_pct` / `y_pct` / `w_pct` / `h_pct` | zone position | layout XML `gridColumn` / `gridRow` |
+| `chart_kind` | worksheet `<mark class="…">` | Sigma element `kind` (bar / line / pie / region-map / point-map / scatter / table-or-text / automatic) |
+| `sort` | worksheet `<sort>` element | bar/line `xAxis.sort` — **only set the Sigma sort when this is non-null**; if Tableau has no explicit sort, leave the xAxis unsorted so Sigma uses natural order (alphabetical / chronological) |
+| `filters` | worksheet `<filter>` elements | Phase 2.5 candidates. Note: `[Action (Foo)]` filters are dashboard cross-filter actions, not value filters — usually skip these |
+| `aggregations` | `<column-instance derivation="…">` per column | the agent's truth source for measure aggregation. `Sum` is default for measures; `Avg` / `Min` / `Max` / `Median` / `CountD` are explicit overrides → use the matching Sigma aggregator. `Month-Trunc` / `Year-Trunc` / `Day-Trunc` → wrap the column with `DateTrunc("month", …)` etc. in the chart formula |
+| `channels` | worksheet `<encodings>` block | color/size/detail/label channel assignments. A `color` channel with a categorical column = multi-series — use the `If([…] = "Foo", …, Null)` pattern per category. Without this, single-dim bar/line charts get built where Tableau actually had stacked or color-broken-out series |
+| `mark_class` | raw `<mark class="…">` | fallback context when `chart_kind: automatic` — agent reads the PNG to decide |
+| `geo_role` | column `semantic-role` attr | `regionType` mapping for `region-map` (see "Tableau geographic role → Sigma regionType" below) |
+
+This is more reliable than inferring chart type from the view CSV.
 
 ### Zone `kind` values (zone-level type-v2)
 

@@ -77,12 +77,63 @@ xml.elements.each('//worksheet') do |ws|
     has_long = true if nm =~ /longitude/i
   end
 
+  # Per-worksheet sort. <sort> element under the worksheet carries direction
+  # ("ascending"|"descending") and a `column` attribute referencing the sorted
+  # dimension. We emit the first sort we find (Tableau allows multiple but
+  # downstream tooling almost always wants the primary one).
+  sort_info = nil
+  if (s = ws.elements['.//sort'])
+    sort_info = {
+      direction: s.attributes['direction'],
+      column:    s.attributes['column']
+    }
+  end
+
+  # Per-worksheet view-level filters. Categorical/quantitative/relative-date.
+  # We just surface the filter metadata — translating into Sigma controls is
+  # Phase 2.5's job.
+  filters_info = []
+  ws.elements.each('.//filter') do |f|
+    filters_info << {
+      class:  f.attributes['class'],
+      column: f.attributes['column']
+    }
+  end
+
+  # Per-column aggregation override. <column-instance derivation="Sum|Avg|Min|
+  # Max|Median|CountD|None|User|Month-Trunc|Year-Trunc|..."> tells us what
+  # aggregation Tableau is using for that column in the pane. We expose all of
+  # them; the agent decides which are interesting (non-default).
+  aggregations = {}
+  ws.elements.each('.//column-instance') do |ci|
+    col = ci.attributes['column']
+    deriv = ci.attributes['derivation']
+    next if col.nil? || deriv.nil?
+    aggregations[col.to_s] = deriv.to_s
+  end
+
+  # Encoding channels (color / size / detail / shape / label / tooltip).
+  # Color is the key one for multi-series approximations (Sales by Segment etc).
+  channels = {}
+  ws.elements.each('.//encodings/encoding') do |e|
+    attr = e.attributes['attr']
+    next unless %w[color size shape detail label tooltip text].include?(attr.to_s)
+    channels[attr.to_s] = {
+      column: e.attributes['column'],
+      field:  e.attributes['field']
+    }
+  end
+
   worksheets[name] = {
     mark_class:    mark_class,
     geo_role:      geo_role,
     has_lat:       has_lat,
     has_long:      has_long,
-    has_geometry:  has_geometry
+    has_geometry:  has_geometry,
+    sort:          sort_info,
+    filters:       filters_info,
+    aggregations:  aggregations,
+    channels:      channels
   }
 end
 
@@ -162,17 +213,22 @@ xml.elements.each('//dashboard') do |d|
     chart_kind = kind == 'chart' ? chart_kind_for(ws_meta) : nil
 
     zones << {
-      'id'         => z.attributes['id'],
-      'kind'       => kind,
-      'caption'    => caption,
-      'view_ref'   => view_ref,
-      'x_pct'      => pct(z.attributes['x']),
-      'y_pct'      => pct(z.attributes['y']),
-      'w_pct'      => pct(z.attributes['w']),
-      'h_pct'      => pct(z.attributes['h']),
-      'chart_kind' => chart_kind,
-      'mark_class' => ws_meta&.dig(:mark_class),
-      'geo_role'   => ws_meta&.dig(:geo_role)
+      'id'           => z.attributes['id'],
+      'kind'         => kind,
+      'caption'      => caption,
+      'view_ref'     => view_ref,
+      'x_pct'        => pct(z.attributes['x']),
+      'y_pct'        => pct(z.attributes['y']),
+      'w_pct'        => pct(z.attributes['w']),
+      'h_pct'        => pct(z.attributes['h']),
+      'chart_kind'   => chart_kind,
+      'mark_class'   => ws_meta&.dig(:mark_class),
+      'geo_role'     => ws_meta&.dig(:geo_role),
+      # New per-worksheet signal fields (nil for non-chart zones)
+      'sort'         => (kind == 'chart' ? ws_meta&.dig(:sort)          : nil),
+      'filters'      => (kind == 'chart' ? ws_meta&.dig(:filters)       : nil),
+      'aggregations' => (kind == 'chart' ? ws_meta&.dig(:aggregations)  : nil),
+      'channels'     => (kind == 'chart' ? ws_meta&.dig(:channels)      : nil)
     }
   end
   dashboards << {

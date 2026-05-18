@@ -58,3 +58,47 @@ out = {
 }
 File.write(opts[:out], JSON.pretty_generate(out))
 puts JSON.pretty_generate(out)
+
+# Universal silent-error guard: scan every column's resolved type via the
+# `/columns` endpoint and fail loudly on any column with type `error`.
+#
+# A column ends up "error" when the formula compiles successfully against the
+# validator but fails at runtime. Typical causes:
+#   - Referenced column doesn't exist (typo)
+#   - Function doesn't exist in Sigma (e.g., IsIn — see memory feedback_sigma_formula_isin.md)
+#   - Window aggregate used in calc-column context (validate-spec catches the known
+#     function names; this catches anything else that produces an error type)
+#   - Cross-element ref without a Lookup wrapper (compiles, returns NULL forever — actually
+#     resolves as the column's declared type, not "error", so this guard misses it; that's
+#     why refs/data-model-spec.md has its own callout)
+#
+# Endpoint: GET /v2/{dataModels|workbooks}/<id>/columns — returns one entry per
+# column with `type.type` resolved. Scan for type == "error".
+
+columns_path = opts[:type] == 'datamodel' ?
+  "/v2/dataModels/#{oid}/columns" :
+  "/v2/workbooks/#{oid}/columns"
+
+res = http(:get, columns_path, accept_json: true)
+if res.is_a?(Net::HTTPSuccess)
+  cols_json = JSON.parse(res.body) rescue { 'entries' => [] }
+  error_columns = (cols_json['entries'] || []).select { |c| c.dig('type', 'type') == 'error' }
+  if error_columns.any?
+    warn "\n========================================"
+    warn "FAIL — #{error_columns.size} column(s) compiled to type \"error\":"
+    error_columns.each do |c|
+      warn "  [element=#{c['elementId']}] #{c['label']} (#{c['columnId']}):"
+      warn "    formula: #{c['formula']}"
+    end
+    warn 'Fix these formulas before continuing — Phase 6 parity would fail downstream.'
+    warn 'Common causes: typo in a column ref, IsIn() / non-existent function, window'
+    warn 'aggregate in a calc column (use a Custom SQL element instead — see Phase 3).'
+    warn '========================================'
+    exit(2)
+  else
+    total = (cols_json['entries'] || []).size
+    warn "column-type guard: #{total} columns clean (no `error` types)"
+  end
+else
+  warn "WARN: could not fetch /columns for type guard (got HTTP #{res.code}); skipping"
+end
