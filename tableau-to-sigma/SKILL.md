@@ -46,7 +46,8 @@ which calc translation, which layout) — not orchestration.
 | `scripts/validate-spec.rb` | DM or workbook spec validator. Accepts `--type` and `--dm-context` |
 | `scripts/post-and-readback.rb` | POST a DM or workbook spec, parse YAML response, GET back the spec, emit element ID map |
 | `scripts/put-layout.rb` | Apply a layout XML to an existing workbook (strips read-only fields) |
-| `scripts/verify-parity.rb` | Diff expected (Tableau) vs actual (Sigma) per chart; PASS/DIVERGE report |
+| `scripts/auto-parity-plan.rb` | Phase 6a: auto-build a parity plan by matching Sigma chart elements to Tableau view CSVs (with `--rename` for renamed tiles). Output → `/tmp/<name>/parity-plan.json` wrapped as `{ extract, charts: [...] }` |
+| `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
 | `scripts/lib/layout.rb` | Layout-XML helpers (`gc`, `le`, `page_xml`, `assemble`) — `require`'d by per-workbook layout configs |
 
 ---
@@ -623,45 +624,76 @@ PUT preserves existing element IDs. Only newly-added elements get new IDs.
 
 ---
 
-## Phase 6 — Verify chart data matches Tableau
+## Phase 6 — Verify chart data matches Tableau (MANDATORY)
 
-> **This step is mandatory. PUT returning `success: true` only proves the spec parsed —
-> it tells you nothing about whether each chart shows the right numbers.**
+> **A conversion is not complete until Phase 6 has run and either passed or been explicitly accepted with documented divergences.** PUT returning `success: true` only proves the spec parsed — it tells you nothing about whether each chart shows the right numbers. Two recent customer-visible bugs both reached the customer because Phase 6 was skipped: a window-function calc compiling silently as `error` and a pie chart wired to the wrong dimension.
 
-### 6a. Query each chart and compare to Tableau
+### 6a. Auto-build a parity plan
 
-Build a parity plan in JSON with one entry per chart, then run the verifier:
-
-```json
-[
-  { "chart": "Revenue by Region",
-    "expected": [["West", 7684.36], ["South", 6817.40], ...],
-    "actual":   {"rows": [["West", 7684.36], ...]} }
-]
-```
-
-Each entry's `expected` is the Tableau CSV rows (parsed and rounded as needed).
-Each entry's `actual` is the Sigma query result — either pre-fetched via MCP and
-pasted in, OR (in environments where the script's REST query path works) computed
-by the script itself.
+Don't hand-write the plan. Use the auto-builder, which matches Sigma chart-element names to Tableau view CSVs and emits a plan keyed by chart:
 
 ```bash
-ruby scripts/verify-parity.rb --plan /tmp/<name>/parity-plan.json
+ruby scripts/auto-parity-plan.rb \
+  --tableau /tmp/<name> \
+  --workbook-spec /tmp/<name>/wb-spec.json \
+  --workbook-id <sigma-workbook-id> \
+  --out /tmp/<name>/parity-plan.json
 ```
 
-Output: per-chart `PASS` or `DIVERGE` with set-difference of the dim/measure pairs.
-Exit 0 on full pass, 1 on any divergence.
+The output is wrapped as `{ "extract": <bool>, "charts": [...] }` — the `extract` flag is set automatically from `get-workbook.json`'s `hasExtracts` field when the workbook itself is extract-backed. If a Sigma chart was renamed from its Tableau title (e.g., the pie tile renamed from "Order Channel vs Ship Method" → "Orders by Category"), pass `--rename "Order Channel vs Ship Method=Orders by Category"` so the auto-matcher pairs them.
 
-To fetch Sigma actuals:
+> **Extract status is also visible on the workbook's datasource.** `auto-parity-plan.rb` only reads workbook-level `hasExtracts`. If the underlying datasource has an extract but the workbook attribute is `false`, you'll have to flip the `extract` field by hand OR pass `--extract-mode` to verify-parity.rb.
+
+### 6b. Fetch Sigma actuals
+
+For every chart in the plan that lacks an `actual` key, query Sigma and paste the result rows:
 
 ```
 mcp__sigma-mcp-v2__query  type="workbook"  workbookId="<wbId>"
   sql='SELECT "<dim-col-id>", ROUND("<measure-col-id>"::numeric, 2) FROM "workbook"."<element-id>" ORDER BY 1'
 ```
 
+The plan file pre-populates `sql_template` and `workbookId` on each chart — just run the SQL and paste the resulting rows under `"actual": { "rows": [...] }`.
+
 > **A chart element's SQL view exposes only that chart's own columns.** A `WHERE "m-order-date-key" BETWEEN ...` against `el-rev-by-region` fails with `Unresolved column`. Two ways to handle:
 > - Query the master table directly (`FROM "workbook"."master"`) and aggregate in SQL.
 > - Skip the filter and compare what the chart shows. Workbook control filters are not applied at API-query time, so a `type="workbook"` SQL query against a chart element returns the full unfiltered dataset.
+
+### 6c. Run the verifier
+
+```bash
+# Strict (default): exact value comparison
+ruby scripts/verify-parity.rb --plan /tmp/<name>/parity-plan.json
+
+# Extract mode: structural comparison only, tolerant of value drift
+ruby scripts/verify-parity.rb --plan /tmp/<name>/parity-plan.json --extract-mode
+ruby scripts/verify-parity.rb --plan /tmp/<name>/parity-plan.json --extract-mode --extract-tol 0.50
+```
+
+Output: per-chart `PASS` or `DIVERGE`. Exit 0 on full pass, 1 on any divergence.
+
+### 6d. Extract handling
+
+When the Tableau workbook (or its datasource) has `hasExtracts: true`, the view CSVs reflect a **frozen snapshot** of the warehouse from the last extract refresh. Sigma queries the warehouse live, so the absolute values WILL drift — that's expected, not a bug. `--extract-mode` shifts the check to:
+
+- ✓ same number of buckets (rows in the chart)
+- ✓ same set of dimension values
+- ✓ same sort order on the dimension
+- ⚠ measure values within `--extract-tol` (default 30%) — anything outside is flagged but does NOT fail the check; review case-by-case
+
+If the customer expects Tableau-extract numbers to match Sigma-live numbers exactly, the answer is to refresh the Tableau extract before exporting CSVs OR to point Sigma at the same snapshot via a saved query. Otherwise live-vs-extract divergence is structural, not a parity bug.
+
+### 6e. Triage divergences (strict mode)
+
+| Symptom | Likely cause |
+|---|---|
+| Numbers wrong by a constant factor | Aggregation mismatch (Sum vs Avg vs CountDistinct) |
+| Wrong dimension values | `[Master/...]` formula references the wrong column |
+| Date axis has 24 buckets where Tableau shows 12 | Cross-year month rollup — see `refs/column-gotchas.md` |
+| Sigma chart shows extra dim values Tableau never displays | Missed Phase 2.5 filter — apply the filter as `date-range`/`list`/`top-n` |
+| Bucket values differ but ratios match | Wrong source column — see Phase 3 "Translate Tableau calc fields here". A `Customer Value Tier` Tableau calc-derived from `Lifetime Revenue` must NOT be replaced by a warehouse `LOYALTY_TIER` column |
+| Empty result / column resolves as `error` | `mcp__sigma-mcp-v2__describe` on the element; type `error` means the formula failed to compile (often `IsIn`, unsupported window function, or missing-column ref) |
+| Numbers consistently within ±X% across all buckets | Extract drift — switch to `--extract-mode` if the source workbook has `hasExtracts: true` |
 
 ### 6b. Triage divergences
 
