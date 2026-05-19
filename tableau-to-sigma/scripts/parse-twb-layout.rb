@@ -430,6 +430,65 @@ xml.elements.each('//dashboard') do |d|
   }
 end
 
+## ---- Tableau parameters ---------------------------------------------------
+# Parameters live as <column param-domain-type='list|range'> inside any
+# datasource (Tableau's "Parameters" datasource for global ones, or inside a
+# real datasource for legacy local params). Each has:
+#   - caption        (display name)
+#   - datatype       (integer | real | string | date | datetime | boolean)
+#   - param_domain   ('list' | 'range' | 'any')
+#   - default_value  (value attribute, raw — may be quoted)
+#   - members        [{ value }] when param_domain='list'
+#   - min/max/step   when param_domain='range'
+# Sigma maps these to: segmented/list control (list), number/range-slider
+# control (range numeric), date-range control (range date).
+def unquote_value(s)
+  s = s.to_s.gsub('&quot;', '"')
+  s.sub(/^"/, '').sub(/"$/, '')
+end
+
+parameters = []
+xml.elements.each("//column[@param-domain-type]") do |col|
+  raw_name = col.attributes['name'].to_s
+  caption  = col.attributes['caption'] || raw_name.gsub(/^\[|\]$/, '')
+  members  = []
+  col.each_element('.//members/member') do |m|
+    members << unquote_value(m.attributes['value'])
+  end
+  rng = col.elements['range']
+  parameters << {
+    'name'          => raw_name,
+    'caption'       => caption,
+    'datatype'      => col.attributes['datatype'],
+    'param_domain'  => col.attributes['param-domain-type'],
+    'default_value' => unquote_value(col.attributes['value']),
+    'members'       => members,
+    'min'           => rng && rng.attributes['min'],
+    'max'           => rng && rng.attributes['max'],
+    'step'          => rng && rng.attributes['granularity']
+  }
+end
+
+# Detect which worksheet calcs reference a parameter so the build script knows
+# which calcs to translate via Switch(). A calc references a parameter when its
+# formula contains `[Parameters].[X]` OR a bare `[X]` whose caption matches a
+# known parameter caption.
+param_caption_set = parameters.map { |p| p['caption'] }.compact.to_set rescue parameters.map { |p| p['caption'] }
+worksheets.each do |_ws_name, w|
+  next unless w[:calculations]
+  w[:calculations].each do |c|
+    f = c['formula'].to_s
+    refs = []
+    # Explicit `[Parameters].[X]` references
+    f.scan(/\[Parameters?(?:\s*\([^)]*\))?\]\s*\.\s*\[([^\]]+)\]/i).flatten.each { |x| refs << x }
+    # Bare bracket-refs that match a parameter caption verbatim
+    f.scan(/\[([^\]\/]+)\]/).flatten.each do |x|
+      refs << x if param_caption_set.include?(x)
+    end
+    c['parameter_refs'] = refs.uniq unless refs.empty?
+  end
+end
+
 ## ---- Shared-view (workbook-level) filters ---------------------------------
 # Tableau emits dashboard / cross-sheet filters in <shared-view> blocks at the
 # workbook level. These apply to every worksheet that uses the same datasource.
@@ -448,6 +507,7 @@ end
 meta = {
   'worksheets'     => worksheets.transform_values { |v| v.transform_keys(&:to_s) },
   'shared_filters' => shared_filters,
+  'parameters'     => parameters,
   'columns_by_guid'=> COL_BY_GUID.transform_values { |v| { 'caption' => v[:caption], 'datatype' => v[:datatype] } }
 }
 META_OUT = OUT.sub(/\.json$/, '-meta.json')

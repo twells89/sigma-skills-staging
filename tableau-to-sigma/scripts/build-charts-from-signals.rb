@@ -182,6 +182,89 @@ def tableau_format_to_sigma(s)
   nil
 end
 
+# Sigma formulas reference controls by `controlId` in brackets, NOT by display
+# name. This helper computes the controlId the auto-controls block will emit
+# for a given parameter caption so the translated Switch/If formulas match.
+def param_control_ref(caption)
+  "[ctl-param-#{caption.downcase.gsub(/\W+/, '-').sub(/-$/, '')}]"
+end
+
+# ---- Parameter / CASE translator ------------------------------------------
+# Tableau CASE-on-parameter:
+#   CASE [Parameters].[Analysis Type]
+#     WHEN "Customer Type" THEN [CUSTOMER_TYPE]
+#     WHEN "Overall"       THEN "Overall"
+#     WHEN "Region"        THEN [REGION_NAME]
+#     ELSE "Country"
+#   END
+# Sigma:
+#   Switch([Analysis Type], "Customer Type", [Customer Type], "Overall",
+#          "Overall", "Region", [Region Name], "Country")
+#
+# We accept the slightly-loose form Tableau uses (`Case` token-case insensitive,
+# bracket refs for parameter and for dim columns, mixed quoted strings).
+def translate_case_on_param(formula, param_captions)
+  return nil unless formula =~ /\bCASE\b/i
+  # Strip newlines + collapse spaces
+  s = formula.gsub(/\s+/, ' ').strip
+  m = s.match(/\bCASE\b\s+(.*?)\s+(WHEN\b.*?)\s+\bEND\b/i)
+  return nil unless m
+  param_ref = m[1].strip   # the value being switched, e.g. [Parameters].[X] or [X]
+  body = m[2]
+  # Pull WHEN ... THEN ... pairs + optional ELSE
+  pairs = body.scan(/WHEN\s+(.+?)\s+THEN\s+(.+?)(?=\s+WHEN\b|\s+ELSE\b|\z)/i).map { |a, b| [a.strip, b.strip] }
+  else_match = body.match(/\bELSE\b\s+(.+)\z/i)
+  else_expr = else_match && else_match[1].strip
+  return nil if pairs.empty?
+  # Normalise parameter reference: prefer the human caption when we know it,
+  # otherwise strip [Parameters].[...] wrapping.
+  param_caption = nil
+  if (mm = param_ref.match(/\[Parameters?(?:\s*\([^)]*\))?\]\s*\.\s*\[([^\]]+)\]/i))
+    param_caption = mm[1]
+  elsif (mm = param_ref.match(/\[([^\]]+)\]/))
+    param_caption = mm[1] if param_captions.include?(mm[1])
+  end
+  return nil unless param_caption
+  parts = [param_control_ref(param_caption)]
+  pairs.each { |when_val, then_val| parts << when_val; parts << then_val }
+  parts << else_expr if else_expr
+  "Switch(#{parts.join(', ')})"
+end
+
+# Translate IF/ELSEIF chains on a parameter ref:
+#   IF [Param] = "A" THEN x ELSEIF [Param] = "B" THEN y ELSE z END
+# → Switch([Param], "A", x, "B", y, z)
+def translate_if_chain_on_param(formula, param_captions)
+  s = formula.gsub(/\s+/, ' ').strip
+  return nil unless s =~ /\bIF\b.*\bEND\b/i
+  return nil unless param_captions.any? { |cap| s.include?("[#{cap}]") }
+  m = s.match(/\bIF\b\s+(.+?)\s+\bEND\b/i)
+  return nil unless m
+  body = m[1]
+  # Pull `<cond> THEN <result>` segments delimited by ELSEIF
+  segs = body.scan(/(.+?)\s+THEN\s+(.+?)(?=\s+ELSEIF\b|\s+ELSE\b|\z)/i).map { |c, r| [c.strip, r.strip] }
+  else_match = body.match(/\bELSE\b\s+(.+)\z/i)
+  else_expr = else_match && else_match[1].strip
+  return nil if segs.empty?
+  # All conditions must be `[Param] = "..."` for the same parameter
+  param_caption = nil
+  cases = []
+  segs.each do |cond, result|
+    cm = cond.match(/\[([^\]]+)\]\s*=\s*("[^"]*"|'[^']*'|\S+)/)
+    return nil unless cm
+    p_cap = cm[1]
+    return nil unless param_captions.include?(p_cap)
+    param_caption ||= p_cap
+    return nil unless p_cap == param_caption
+    val = cm[2]
+    val = val.gsub("'", '"') if val.start_with?("'")
+    cases << val << result
+  end
+  parts = [param_control_ref(param_caption)] + cases
+  parts << else_expr if else_expr
+  "Switch(#{parts.join(', ')})"
+end
+
 # Pick the Tableau format for a given header against a worksheet's formats dict.
 # Match by best-effort: field ref contains a column GUID OR a friendly name
 # fragment that overlaps with the header.
@@ -406,16 +489,34 @@ layout.each do |dash|
     end
     element['filters'] = el_filters unless el_filters.empty?
 
-    # Surface Tableau-side calculated fields the worksheet uses, so the agent
-    # knows what to translate into Sigma. parse-twb-layout extracts these into
-    # zone.calculations; we just emit a hint per non-trivial calc.
+    # Surface Tableau-side calculated fields the worksheet uses, and auto-
+    # translate the ones we know how to handle (parameter-driven Switch).
+    # Otherwise emit a translation hint so the agent can wire it up by hand.
+    param_caps = (meta['parameters'] || []).map { |p| p['caption'] }.compact
     (z['calculations'] || []).each do |c|
       formula = c['formula'].to_s
       next if formula.empty?
-      # Heuristic: skip pure reference calcs (`[col]`), skip simple SUM/COUNT/
-      # MIN/MAX wrappers that the DM column-instance derivation already covers.
       next if formula =~ /\A\s*(SUM|COUNT|AVG|MIN|MAX)\(\[[^\]]+\]\)\s*\z/
       next if formula =~ /\A\s*\[[^\]]+\]\s*\z/
+
+      # Try parameter-driven translations first (CASE / IF chain on param).
+      translated = translate_case_on_param(formula, param_caps) ||
+                   translate_if_chain_on_param(formula, param_caps)
+      if translated
+        # Drop the calc onto the chart element as an inline calc column. The
+        # column id is derived from the calc name (strip brackets) so it's
+        # stable across re-runs.
+        calc_name = c['name'].to_s.gsub(/^\[|\]$/, '')
+        calc_id   = "calc-#{calc_name.downcase.gsub(/\W+/, '-')[0..40]}".sub(/-$/, '')
+        element['columns'] << {
+          'id'      => calc_id,
+          'name'    => calc_name,
+          'formula' => translated
+        }
+        warnings << "'#{cap}' parameter-driven calc #{c['name']} → translated to Switch: #{translated[0..120]}"
+        next
+      end
+
       hint = if formula =~ /\bIIF\(.*=.*0.*,\s*SUM.*\/\s*SUM/
                'ratio calc — translate as `Sum(num) / NullIf(Sum(den), 0)` on master OR via Custom SQL'
              elsif formula =~ /\bIF\b.*\bELSEIF\b.*\bEND\b/i
@@ -458,6 +559,48 @@ if title_text
     'kind' => 'text',
     'body' => "## #{title_text}"
   }
+end
+
+# ---- Auto-generated parameter controls (--auto-controls) ------------------
+# Tableau parameters become Sigma controls. The control's name matches the
+# parameter caption so any translated `Switch([Param Caption], ...)` formula
+# resolves to this control.
+param_controls = []
+if opts[:auto_controls]
+  (meta['parameters'] || []).each_with_index do |p, i|
+    cap = p['caption'].to_s.strip
+    next if cap.empty?
+    slug = cap.downcase.gsub(/\W+/, '-').sub(/-$/, '')
+    spec = {
+      'id'        => "el-param-#{slug}",
+      'kind'      => 'control',
+      'controlId' => "ctl-param-#{slug}",
+      'name'      => cap,
+      'includeNulls' => 'when-no-value-is-selected'
+    }
+    if p['param_domain'] == 'list'
+      spec['controlType']   = 'segmented'
+      spec['source'] = {
+        'kind' => 'manual', 'valueType' => 'text',
+        'values' => p['members'] || [], 'labels' => []
+      }
+      spec['value'] = p['default_value']
+    elsif p['param_domain'] == 'range' && %w[integer real].include?(p['datatype'])
+      # Numeric range parameters need a control shape that the workbook spec
+      # API currently doesn't accept under controlType=number. Emit a warning
+      # so the agent can add the control by hand; don't break the spec.
+      warnings << "parameter '#{cap}' is a numeric range (#{p['datatype']}) — skipped auto-control; agent should add a number/range control manually"
+      next
+    elsif p['param_domain'] == 'range' && %w[date datetime].include?(p['datatype'])
+      spec['controlType'] = 'date-range'
+      spec['mode'] = 'between'
+    else
+      # Generic fallback — text input
+      spec['controlType'] = 'text'
+      spec['value'] = p['default_value']
+    end
+    param_controls << spec
+  end
 end
 
 # ---- Auto-generated controls from shared-view filters (--auto-controls) ----
@@ -570,7 +713,7 @@ if opts[:controls]
   end
 end
 
-all_extras = extras + auto_controls
+all_extras = extras + param_controls + auto_controls
 
 # ---- Output mode ----
 #   Default       → flat array of elements (legacy behaviour). Extras first.
@@ -592,13 +735,15 @@ if opts[:pages_mode] == :worksheet
         'body' => "## #{ws_name}"
       }
     end
-    # Auto-controls duplicated per page (Sigma controls are page-scoped). Give
-    # each page its own control ids so they don't collide.
-    auto_controls.each do |c|
+    # Auto-controls duplicated per page (Sigma controls are page-scoped). Each
+    # page gets its own copy with a unique element `id` (workbook-globally
+    # unique); the `controlId` stays the same across pages because controls are
+    # page-scoped and formulas resolve against the current page's controls.
+    # Parameter controls go first so the rendered order is param → filters.
+    (param_controls + auto_controls).each do |c|
       dup = JSON.parse(c.to_json)
       ws_slug = ws_name.downcase.gsub(/\W+/, '-')[0..20]
-      dup['id']        = "#{dup['id']}-#{ws_slug}"
-      dup['controlId'] = "#{dup['controlId']}-#{ws_slug}"
+      dup['id'] = "#{dup['id']}-#{ws_slug}"
       page_extras << dup
     end
     pages << {
