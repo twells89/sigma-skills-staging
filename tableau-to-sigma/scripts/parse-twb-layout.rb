@@ -45,6 +45,101 @@ def pct(v)
   (v.to_f / 1_000.0).round(1)   # Tableau: 100000 == 100%
 end
 
+# ---- Column GUID → caption resolver ---------------------------------------
+# Tableau filters reference columns by GUID (e.g.,
+# `[federated.X].[none:c2ec6b07-...:qk]`). To translate a filter into a Sigma
+# control we need the human-readable caption ("Region") plus the data type
+# (categorical / date / numeric). Both live on <column> elements throughout the
+# .twb (datasource-dependencies blocks AND the top-level metadata-records).
+#
+# We build a single lookup: { "c2ec6b07-..." => { caption:, datatype: } }.
+COL_BY_GUID = {}
+xml.elements.each('//column') do |c|
+  raw = c.attributes['name'].to_s
+  cap = c.attributes['caption']
+  dt  = c.attributes['datatype']
+  next if raw.empty?
+  # Names look like `[guid]` or `[guid (foo)]` or `[Friendly Name]`. Strip
+  # surrounding brackets and lift out the GUID-looking head.
+  body = raw.sub(/^\[/, '').sub(/\]$/, '')
+  head = body.split(/\s/, 2).first
+  COL_BY_GUID[head] ||= { caption: cap, datatype: dt } if cap && !cap.empty?
+end
+
+# Filter columns use a column-instance level reference like
+#   `[federated.X].[none:c2ec6b07-...:qk]`
+# where `none` is the derivation and `qk`/`nk` is pivot/key qualifier. Strip
+# both and extract the GUID.
+def guid_from_param(param)
+  return nil if param.nil? || param.empty?
+  m = param.match(/\.\[(?:[a-z\-]+:)?([0-9a-f\-]{36})(?::[a-z]+)?\]$/i)
+  m && m[1]
+end
+
+# Strip Tableau's quoted-string member encoding (`&quot;CA&quot;` → `CA`).
+def unquote_member(s)
+  return nil if s.nil?
+  s = s.to_s.gsub('&quot;', '"').strip
+  return nil if s == '%null%'
+  s.sub(/^"/, '').sub(/"$/, '')
+end
+
+# Read a <filter> element and emit a normalized spec:
+#   { kind: "list" | "date-range" | "relative-date" | "number-range" | "action" | "unknown",
+#     column_guid: "...", column_caption: "...", datatype: "string|date|real|integer|...",
+#     members: ["CA","NY",...]  (for list)
+#     min/max: numbers           (for number-range)
+#     first_period/last_period/period_type/include_future/include_null  (relative-date)
+#     raw_param: ...,
+#     is_action: true|false }
+def normalize_filter(f)
+  cls   = f.attributes['class'].to_s
+  param = f.attributes['column'].to_s
+  is_action = param.include?('[Action ') || param.include?('[Action(')
+  guid  = guid_from_param(param)
+  info  = guid ? COL_BY_GUID[guid] : nil
+
+  out = {
+    'raw_class'      => cls,
+    'raw_param'      => param,
+    'column_guid'    => guid,
+    'column_caption' => info && info[:caption],
+    'datatype'       => info && info[:datatype],
+    'is_action'      => is_action
+  }
+
+  if is_action
+    out['kind'] = 'action'
+    return out
+  end
+
+  case cls
+  when 'categorical'
+    members = []
+    f.each_element('.//groupfilter') do |gf|
+      next unless gf.attributes['function'] == 'member'
+      m = unquote_member(gf.attributes['member'])
+      members << m if m
+    end
+    out['kind']    = 'list'
+    out['members'] = members
+  when 'relative-date'
+    out['kind']           = 'relative-date'
+    out['first_period']   = f.attributes['first-period']
+    out['last_period']    = f.attributes['last-period']
+    out['period_type']    = f.attributes['period-type-v2'] || f.attributes['period-type']
+    out['include_future'] = f.attributes['include-future']
+    out['include_null']   = f.attributes['include-null']
+  when 'quantitative'
+    out['kind'] = 'number-range'
+    out['min'] = f.attributes['min']
+    out['max'] = f.attributes['max']
+  else
+    out['kind'] = 'unknown'
+  end
+  out
+end
+
 # Build a lookup of worksheet name → metadata extracted from <worksheet> elements.
 # - mark_class: the <mark class="..."> value (Bar / Line / Pie / Filled / Circle / etc.)
 # - geo_role:   the first geographic semantic-role we find on any column (e.g. "geo:state")
@@ -89,15 +184,13 @@ xml.elements.each('//worksheet') do |ws|
     }
   end
 
-  # Per-worksheet view-level filters. Categorical/quantitative/relative-date.
-  # We just surface the filter metadata — translating into Sigma controls is
-  # Phase 2.5's job.
+  # Per-worksheet view-level filters. Each filter is normalized via
+  # normalize_filter (resolves GUID → caption + datatype, extracts member values
+  # for categorical, period spec for relative-date, min/max for quantitative,
+  # and flags action filters separately).
   filters_info = []
   ws.elements.each('.//filter') do |f|
-    filters_info << {
-      class:  f.attributes['class'],
-      column: f.attributes['column']
-    }
+    filters_info << normalize_filter(f)
   end
 
   # Per-column aggregation override. <column-instance derivation="Sum|Avg|Min|
@@ -112,6 +205,20 @@ xml.elements.each('//worksheet') do |ws|
     aggregations[col.to_s] = deriv.to_s
   end
 
+  # Per-column format strings. Tableau emits these via
+  #   <style-rule element='cell'>
+  #     <format attr='text-format' field='[federated.X].[col-ref]' value='p0.0%' />
+  # We capture the value verbatim keyed by the field reference. translate_format
+  # below converts to Sigma's d3-format string.
+  formats = {}
+  ws.elements.each('.//format') do |fmt|
+    next unless fmt.attributes['attr'] == 'text-format'
+    field = fmt.attributes['field']
+    val   = fmt.attributes['value']
+    next if field.nil? || val.nil?
+    formats[field.to_s] = val.to_s
+  end
+
   # Encoding channels (color / size / detail / shape / label / tooltip).
   # Color is the key one for multi-series approximations (Sales by Segment etc).
   channels = {}
@@ -124,6 +231,29 @@ xml.elements.each('//worksheet') do |ws|
     }
   end
 
+  # Per-worksheet calculated fields. Tableau emits these as
+  #   <column datatype='X' name='[Calc Name]' role='dimension|measure' type='...'>
+  #     <calculation class='tableau' formula='...' />
+  #   </column>
+  # We surface them so the build script can flag (or translate) calcs that are
+  # used by this worksheet's chart.
+  calcs = []
+  ws.elements.each('.//column') do |col|
+    calc = col.elements['calculation']
+    next unless calc
+    cls  = calc.attributes['class']
+    formula = calc.attributes['formula']
+    next if formula.nil? || formula.empty?
+    calcs << {
+      'name'    => col.attributes['name'],
+      'caption' => col.attributes['caption'],
+      'datatype'=> col.attributes['datatype'],
+      'role'    => col.attributes['role'],
+      'class'   => cls,
+      'formula' => formula
+    }
+  end
+
   worksheets[name] = {
     mark_class:    mark_class,
     geo_role:      geo_role,
@@ -133,8 +263,57 @@ xml.elements.each('//worksheet') do |ws|
     sort:          sort_info,
     filters:       filters_info,
     aggregations:  aggregations,
-    channels:      channels
+    channels:      channels,
+    formats:       formats,
+    calculations:  calcs
   }
+end
+
+# ---- Tableau format → Sigma format translator -----------------------------
+# Tableau format codes (subset we see in the wild):
+#   p0%      → ,.0%
+#   p0.0%    → ,.1%
+#   p0.00%   → ,.2%
+#   0        → ,.0f
+#   0.0      → ,.1f
+#   #,##0    → ,.0f
+#   $#,##0   → $,.0f (currency)
+#   $#,##0.00→ $,.2f
+#   yyyy-MM-dd → %Y-%m-%d
+#   MMM yyyy   → %b %Y
+#   yyyy       → %Y
+def translate_format(tableau_fmt)
+  s = tableau_fmt.to_s
+  return nil if s.empty?
+  # Percent — p<digits>[.<digits>]%
+  if (m = s.match(/^p\d*(?:\.(\d+))?%$/i))
+    decimals = (m[1] || '').length
+    return { 'kind' => 'number', 'formatString' => ",.#{decimals}%" }
+  end
+  # Tableau locale-currency code — C<locale>[.<digits>]% (e.g., C1033% = $#,##0)
+  if (m = s.match(/^C\d+(?:\.(\d+))?%?$/))
+    decimals = (m[1] || '').length
+    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+  end
+  # Currency
+  if s.start_with?('$')
+    decimals = (s.match(/\.(0+)/) || [])[1].to_s.length
+    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+  end
+  # Plain number — count decimals after the decimal point
+  if s =~ /^[#,0]+(?:\.(0+))?$/
+    decimals = ($1 || '').length
+    return { 'kind' => 'number', 'formatString' => ",.#{decimals}f" }
+  end
+  # Date formats — translate Tableau tokens to strftime
+  if s =~ /yyyy|MMM|MM|dd|HH/
+    f = s
+      .gsub('yyyy', '%Y').gsub('yy', '%y')
+      .gsub('MMMM','%B').gsub('MMM','%b').gsub('MM','%m')
+      .gsub('dd','%d').gsub('HH','%H').gsub('mm','%M').gsub('ss','%S')
+    return { 'kind' => 'datetime', 'formatString' => f }
+  end
+  nil
 end
 
 # Translate Tableau mark class + geo signals into a Sigma-relevant chart-kind label.
@@ -212,6 +391,15 @@ xml.elements.each('//dashboard') do |d|
     ws_meta    = caption ? worksheets[caption] : nil
     chart_kind = kind == 'chart' ? chart_kind_for(ws_meta) : nil
 
+    # Resolve filter-zone param GUID → column caption when this is a filter
+    # zone, so downstream tools don't need to re-walk the .twb.
+    if kind == 'filter' || kind == 'parameter'
+      g = guid_from_param(view_ref)
+      info = g ? COL_BY_GUID[g] : nil
+      filter_col_caption  = info && info[:caption]
+      filter_col_datatype = info && info[:datatype]
+    end
+
     zones << {
       'id'           => z.attributes['id'],
       'kind'         => kind,
@@ -228,7 +416,12 @@ xml.elements.each('//dashboard') do |d|
       'sort'         => (kind == 'chart' ? ws_meta&.dig(:sort)          : nil),
       'filters'      => (kind == 'chart' ? ws_meta&.dig(:filters)       : nil),
       'aggregations' => (kind == 'chart' ? ws_meta&.dig(:aggregations)  : nil),
-      'channels'     => (kind == 'chart' ? ws_meta&.dig(:channels)      : nil)
+      'channels'     => (kind == 'chart' ? ws_meta&.dig(:channels)      : nil),
+      'formats'      => (kind == 'chart' ? ws_meta&.dig(:formats)       : nil),
+      'calculations' => (kind == 'chart' ? ws_meta&.dig(:calculations)  : nil),
+      # Resolved filter target (filter/parameter zones only)
+      'filter_column_caption'  => (kind == 'filter' || kind == 'parameter' ? filter_col_caption  : nil),
+      'filter_column_datatype' => (kind == 'filter' || kind == 'parameter' ? filter_col_datatype : nil)
     }
   end
   dashboards << {
@@ -236,6 +429,30 @@ xml.elements.each('//dashboard') do |d|
     'zones'     => zones
   }
 end
+
+## ---- Shared-view (workbook-level) filters ---------------------------------
+# Tableau emits dashboard / cross-sheet filters in <shared-view> blocks at the
+# workbook level. These apply to every worksheet that uses the same datasource.
+# Parsing here means a page-per-worksheet builder can auto-emit Sigma controls
+# for them without the agent supplying any config.
+shared_filters = []
+xml.elements.each('//shared-view') do |sv|
+  sv_name = sv.attributes['name']
+  sv.elements.each('filter') do |f|
+    spec = normalize_filter(f)
+    spec['shared_view'] = sv_name
+    shared_filters << spec
+  end
+end
+
+meta = {
+  'worksheets'     => worksheets.transform_values { |v| v.transform_keys(&:to_s) },
+  'shared_filters' => shared_filters,
+  'columns_by_guid'=> COL_BY_GUID.transform_values { |v| { 'caption' => v[:caption], 'datatype' => v[:datatype] } }
+}
+META_OUT = OUT.sub(/\.json$/, '-meta.json')
+File.write(META_OUT, JSON.pretty_generate(meta))
+puts "wrote #{META_OUT} (#{meta['worksheets'].size} worksheets, #{shared_filters.size} shared filters)"
 
 File.write(OUT, JSON.pretty_generate(dashboards))
 puts "wrote #{OUT} (#{dashboards.size} dashboards, #{dashboards.sum { |d| d['zones'].size }} zones total)"

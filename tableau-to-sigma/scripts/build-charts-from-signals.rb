@@ -56,10 +56,13 @@ opts = { master_id: 'master' }
 OptionParser.new do |p|
   p.on('--tableau-dir DIR')         { |v| opts[:tab] = v }
   p.on('--layout PATH')             { |v| opts[:layout] = v }
+  p.on('--meta PATH', 'parse-twb-layout sister meta file (worksheets+shared_filters)') { |v| opts[:meta] = v }
   p.on('--master-map PATH')         { |v| opts[:mmap] = v }
   p.on('--master-element-id ID')    { |v| opts[:master_id] = v }
   p.on('--controls PATH', 'JSON file: array of control specs to emit alongside the chart elements') { |v| opts[:controls] = v }
   p.on('--title STR',     'Dashboard title text element to emit (e.g., "Orders Dashboard")')         { |v| opts[:title] = v }
+  p.on('--page-per-worksheet', 'Emit one Sigma page per Tableau worksheet (ignore dashboard layout)') { opts[:pages_mode] = :worksheet }
+  p.on('--auto-controls', 'Auto-emit Sigma controls from shared-view filters in --meta')              { opts[:auto_controls] = true }
   p.on('--out PATH')                { |v| opts[:out] = v }
 end.parse!
 %i[tab layout mmap out].each { |k| abort("missing --#{k.to_s.tr('_','-')}") unless opts[k] }
@@ -144,10 +147,61 @@ end
 # ---- Load inputs ----
 layout = JSON.parse(File.read(opts[:layout]))
 mmap   = JSON.parse(File.read(opts[:mmap]))
+meta   = opts[:meta] ? JSON.parse(File.read(opts[:meta])) : { 'worksheets' => {}, 'shared_filters' => [] }
 gw     = JSON.parse(File.read(File.join(opts[:tab], 'get-workbook.json')))
 views  = gw.dig('views', 'view') || []
 views  = [views] unless views.is_a?(Array)
 view_by_name = views.each_with_object({}) { |v, h| h[v['name']] = v }
+
+# Translate a Tableau format-value string (already parsed by the parser's
+# translate_format) into a Sigma format hash. Done here so we don't fork the
+# parser logic — we just call into it via a duplicated minimal translator.
+def tableau_format_to_sigma(s)
+  return nil if s.nil? || s.empty?
+  if (m = s.match(/^p\d*(?:\.(\d+))?%$/i))
+    decimals = (m[1] || '').length
+    return { 'kind' => 'number', 'formatString' => ",.#{decimals}%" }
+  end
+  if (m = s.match(/^C\d+(?:\.(\d+))?%?$/))
+    decimals = (m[1] || '').length
+    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+  end
+  if s.start_with?('$')
+    decimals = (s.match(/\.(0+)/) || [])[1].to_s.length
+    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+  end
+  if s =~ /^[#,0]+(?:\.(0+))?$/
+    decimals = ($1 || '').length
+    return { 'kind' => 'number', 'formatString' => ",.#{decimals}f" }
+  end
+  if s =~ /yyyy|MMM|MM|dd|HH/
+    f = s.gsub('yyyy','%Y').gsub('yy','%y').gsub('MMMM','%B').gsub('MMM','%b').gsub('MM','%m')
+         .gsub('dd','%d').gsub('HH','%H').gsub('mm','%M').gsub('ss','%S')
+    return { 'kind' => 'datetime', 'formatString' => f }
+  end
+  nil
+end
+
+# Pick the Tableau format for a given header against a worksheet's formats dict.
+# Match by best-effort: field ref contains a column GUID OR a friendly name
+# fragment that overlaps with the header.
+def pick_tableau_format(formats, header)
+  return nil if formats.nil? || formats.empty?
+  hkey = header.to_s.downcase.gsub(/\W+/, '')
+  formats.each do |field, val|
+    body = field.to_s.downcase
+    # Friendly-name match: format key looks like `[usr:Return Rate:qk]`. Pull
+    # the human chunk and compare to header.
+    inner = body.scan(/\[([^\]]+)\]/).flatten.last.to_s
+    parts = inner.split(':')
+    friendly = parts.length >= 3 ? parts[1].to_s.gsub(/\W+/, '') : ''
+    if !friendly.empty? && (friendly == hkey || hkey.include?(friendly) || friendly.include?(hkey))
+      sigma = tableau_format_to_sigma(val)
+      return sigma if sigma
+    end
+  end
+  nil
+end
 
 # A workbook may have multiple dashboards; iterate all and concatenate elements.
 # Drop the chart_kind=automatic warnings to stderr so the caller can act on them.
@@ -240,15 +294,24 @@ layout.each do |dash|
     dim_col_obj = { 'id' => "x-#{el_id}", 'name' => dim['name'], 'formula' => dim_formula }
     dim_col_obj['format'] = { 'kind' => 'datetime', 'formatString' => '%b %Y' } if dim_trunc
     meas_col_obj = { 'id' => "y-#{el_id}", 'name' => meas['name'], 'formula' => measure_formula }
-    # Format priority: explicit `format` on the map entry, else heuristic by name.
+    # Format priority:
+    #   1. explicit `format` on the master-map entry
+    #   2. Tableau's own format string for this measure (zone.formats — only set
+    #      when --meta was provided)
+    #   3. heuristic by header name
     meas_col_obj['format'] = meas['format'] if meas['format'].is_a?(Hash)
+    if meas_col_obj['format'].nil?
+      tab_fmt = pick_tableau_format(z['formats'], meas_hdr) ||
+                pick_tableau_format(z['formats'], meas['name'])
+      meas_col_obj['format'] = tab_fmt if tab_fmt
+    end
     if meas_col_obj['format'].nil?
       meas_col_obj['format'] =
         case meas['name'].downcase
         when /(revenue|profit|cost|sales|amount|spend)/
           { 'kind' => 'number', 'formatString' => '$,.0f', 'currencySymbol' => '$' }
         when /(rate|margin|pct|percent|ratio)/
-          { 'kind' => 'number', 'formatString' => ',.2%' }
+          { 'kind' => 'number', 'formatString' => ',.1%' }
         else
           { 'kind' => 'number', 'formatString' => ',.0f' }
         end
@@ -305,6 +368,72 @@ layout.each do |dash|
       warnings << "'#{cap}' has a color channel on #{z['channels']['color']['column']} — chart is single-series; agent should fan-out yAxis with one If() per category (see refs/workbook-layout.md \"Multi-series chart patterns\")"
     end
 
+    # Per-chart value filters (skip action filters — already warned above).
+    # Translate each non-action filter into a Sigma element-level filter spec
+    # using the parser's normalized fields (column_caption, kind, members,
+    # period_type, etc.). We map the caption → master column via the same
+    # regex map used for dim/measure.
+    value_filters = (z['filters'] || []).reject { |f| f['is_action'] }
+    el_filters = []
+    value_filters.each do |f|
+      fcap = f['column_caption'] || f['raw_param']
+      m = fcap ? map_column(fcap, mmap) : nil
+      if m.nil?
+        warnings << "value filter on '#{cap}' targets '#{fcap}' — no master column matched, skipping"
+        next
+      end
+      case f['kind']
+      when 'list'
+        el_filters << {
+          'columnId' => m['id'],
+          'kind' => 'list', 'mode' => 'include', 'selectionMode' => 'multiple',
+          'values' => (f['members'] || []), 'includeNulls' => false
+        }
+      when 'relative-date'
+        # Tableau first-period=0, last-period=0 + period-type=year means
+        # "this year". Translate to Sigma relative date-range.
+        el_filters << {
+          'columnId' => m['id'], 'kind' => 'date-range', 'mode' => 'relative',
+          'unit' => f['period_type'] || 'year', 'count' => 1,
+          'includeNulls' => f['include_null'].to_s == 'true'
+        }
+      when 'number-range'
+        el_filters << {
+          'columnId' => m['id'], 'kind' => 'number-range', 'mode' => 'between',
+          'min' => f['min'], 'max' => f['max']
+        }
+      end
+    end
+    element['filters'] = el_filters unless el_filters.empty?
+
+    # Surface Tableau-side calculated fields the worksheet uses, so the agent
+    # knows what to translate into Sigma. parse-twb-layout extracts these into
+    # zone.calculations; we just emit a hint per non-trivial calc.
+    (z['calculations'] || []).each do |c|
+      formula = c['formula'].to_s
+      next if formula.empty?
+      # Heuristic: skip pure reference calcs (`[col]`), skip simple SUM/COUNT/
+      # MIN/MAX wrappers that the DM column-instance derivation already covers.
+      next if formula =~ /\A\s*(SUM|COUNT|AVG|MIN|MAX)\(\[[^\]]+\]\)\s*\z/
+      next if formula =~ /\A\s*\[[^\]]+\]\s*\z/
+      hint = if formula =~ /\bIIF\(.*=.*0.*,\s*SUM.*\/\s*SUM/
+               'ratio calc — translate as `Sum(num) / NullIf(Sum(den), 0)` on master OR via Custom SQL'
+             elsif formula =~ /\bIF\b.*\bELSEIF\b.*\bEND\b/i
+               'IF/ELSEIF chain — translate to nested Sigma If(...) or Switch(...) on master'
+             elsif formula =~ /\bCASE\b/i
+               'CASE statement — translate to Sigma Switch(value, when1, then1, ...) on master'
+             elsif formula =~ /\bSUM\(.*\)\s*\/\s*COUNT\(/i
+               'ratio calc — translate as `Sum(...) / Count(...)` (or CountIf for NotNull) on master'
+             elsif formula =~ /\[Parameters?\]\.|\[Parameters?\s+\(/
+               'parameter-driven calc — translate to Sigma control + Switch()/If() formula'
+             else
+               'calc — translate to Sigma formula and add as a master column or workbook calc'
+             end
+      warnings << "'#{cap}' uses Tableau calc #{c['name']}: #{hint}. Formula: #{formula[0..120]}"
+    end
+
+    # Stamp with worksheet name so the page-per-worksheet emitter can group.
+    element['_worksheet'] = cap
     elements << element
   end
 end
@@ -329,6 +458,66 @@ if title_text
     'kind' => 'text',
     'body' => "## #{title_text}"
   }
+end
+
+# ---- Auto-generated controls from shared-view filters (--auto-controls) ----
+auto_controls = []
+if opts[:auto_controls]
+  (meta['shared_filters'] || []).each_with_index do |f, i|
+    next if f['is_action']
+    cap = f['column_caption']
+    if cap.nil?
+      warnings << "shared filter ##{i} has no resolvable column_caption (raw_param=#{f['raw_param']}) — skipping auto-control"
+      next
+    end
+    m = map_column(cap, mmap)
+    if m.nil?
+      warnings << "shared filter on '#{cap}' has no master-map entry — add a regex to master-columns.json"
+      next
+    end
+    slug = cap.downcase.gsub(/\W+/, '-').sub(/-$/, '')
+    spec = {
+      'id'           => "el-ctl-#{slug}",
+      'kind'         => 'control',
+      'controlId'    => "ctl-#{slug}",
+      'name'         => cap.strip,
+      'includeNulls' => 'when-no-value-is-selected'
+    }
+    case f['kind']
+    when 'list'
+      spec['controlType']   = 'list'
+      spec['mode']          = 'include'
+      spec['selectionMode'] = 'multiple'
+      spec['values']        = []  # default to all; user adjusts in UI
+      spec['source'] = {
+        'kind'     => 'source',
+        'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+        'columnId' => m['id']
+      }
+      spec['filters'] = [{
+        'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+        'columnId' => m['id']
+      }]
+    when 'relative-date'
+      # Tableau's relative-date with first-period=0/last-period=0 +
+      # period-type=year means "this year". Sigma's "current" mode + unit takes
+      # the same role; count=0 isn't valid so we omit it.
+      spec['controlType'] = 'date-range'
+      spec['mode']        = 'current'
+      spec['unit']        = f['period_type'] || 'year'
+      spec['filters'] = [{
+        'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+        'columnId' => m['id']
+      }]
+    when 'number-range'
+      spec['controlType'] = 'range-slider'
+      spec['filters'] = [{
+        'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+        'columnId' => m['id']
+      }]
+    end
+    auto_controls << spec
+  end
 end
 
 # ---- Filter controls ----
@@ -381,7 +570,48 @@ if opts[:controls]
   end
 end
 
-all_elements = extras + elements
-File.write(opts[:out], JSON.pretty_generate(all_elements))
-warn "wrote #{opts[:out]}  (#{all_elements.size} elements: #{extras.size} controls/text + #{elements.size} charts)"
+all_extras = extras + auto_controls
+
+# ---- Output mode ----
+#   Default       → flat array of elements (legacy behaviour). Extras first.
+#   --page-per-worksheet → emit { pages: [{name, elements:[]}] }. One page per
+#                          worksheet that has a chart, with the shared-filter
+#                          auto-controls AND a title text duplicated onto each
+#                          page so the customer sees the same filter set on
+#                          every page (Tableau dashboard-level filter semantics).
+if opts[:pages_mode] == :worksheet
+  pages = []
+  by_ws = elements.group_by { |e| e['_worksheet'] }
+  by_ws.each do |ws_name, els|
+    els.each { |e| e.delete('_worksheet') }
+    page_extras = []
+    if title_text
+      page_extras << {
+        'id'   => "title-text-#{ws_name.downcase.gsub(/\W+/,'-')[0..30]}".sub(/-$/, ''),
+        'kind' => 'text',
+        'body' => "## #{ws_name}"
+      }
+    end
+    # Auto-controls duplicated per page (Sigma controls are page-scoped). Give
+    # each page its own control ids so they don't collide.
+    auto_controls.each do |c|
+      dup = JSON.parse(c.to_json)
+      ws_slug = ws_name.downcase.gsub(/\W+/, '-')[0..20]
+      dup['id']        = "#{dup['id']}-#{ws_slug}"
+      dup['controlId'] = "#{dup['controlId']}-#{ws_slug}"
+      page_extras << dup
+    end
+    pages << {
+      'name'     => ws_name,
+      'elements' => page_extras + els
+    }
+  end
+  File.write(opts[:out], JSON.pretty_generate({ 'pages' => pages }))
+  warn "wrote #{opts[:out]} (page-per-worksheet: #{pages.size} pages, #{auto_controls.size} auto-controls per page)"
+else
+  elements.each { |e| e.delete('_worksheet') }
+  all_elements = all_extras + elements
+  File.write(opts[:out], JSON.pretty_generate(all_elements))
+  warn "wrote #{opts[:out]}  (#{all_elements.size} elements: #{all_extras.size} controls/text + #{elements.size} charts)"
+end
 warnings.each { |w| warn "  WARN  #{w}" }
