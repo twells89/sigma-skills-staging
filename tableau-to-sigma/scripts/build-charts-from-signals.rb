@@ -74,6 +74,7 @@ SIGMA_KIND = {
   'area'          => 'area-chart',
   'pie'           => 'pie-chart',
   'scatter'       => 'scatter-chart',
+  'combo'         => 'combo-chart',
   'map-region'    => 'region-map',
   'map-point'     => 'point-map',
   'table-or-text' => 'table',
@@ -158,21 +159,25 @@ view_by_name = views.each_with_object({}) { |v, h| h[v['name']] = v }
 # parser logic — we just call into it via a duplicated minimal translator.
 def tableau_format_to_sigma(s)
   return nil if s.nil? || s.empty?
-  if (m = s.match(/^p\d*(?:\.(\d+))?%$/i))
+  segments = s.split(';')
+  pos = segments[0] || s
+  neg = segments[1]
+  prefix = (neg && neg.include?('(') && neg.include?(')')) ? '(' : ''
+  if (m = pos.match(/^p\d*(?:\.(\d+))?%$/i))
     decimals = (m[1] || '').length
-    return { 'kind' => 'number', 'formatString' => ",.#{decimals}%" }
+    return { 'kind' => 'number', 'formatString' => "#{prefix},.#{decimals}%" }
   end
-  if (m = s.match(/^C\d+(?:\.(\d+))?%?$/))
+  if (m = pos.match(/^C\d+(?:\.(\d+))?%?$/))
     decimals = (m[1] || '').length
-    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+    return { 'kind' => 'number', 'formatString' => "#{prefix}$,.#{decimals}f", 'currencySymbol' => '$' }
   end
-  if s.start_with?('$')
-    decimals = (s.match(/\.(0+)/) || [])[1].to_s.length
-    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+  if pos =~ /^c?["\\]*\$/ || pos.start_with?('$')
+    decimals = (pos.match(/\.(0+)/) || [])[1].to_s.length
+    return { 'kind' => 'number', 'formatString' => "#{prefix}$,.#{decimals}f", 'currencySymbol' => '$' }
   end
-  if s =~ /^[#,0]+(?:\.(0+))?$/
+  if pos =~ /^[#,0]+(?:\.(0+))?$/
     decimals = ($1 || '').length
-    return { 'kind' => 'number', 'formatString' => ",.#{decimals}f" }
+    return { 'kind' => 'number', 'formatString' => "#{prefix},.#{decimals}f" }
   end
   if s =~ /yyyy|MMM|MM|dd|HH/
     f = s.gsub('yyyy','%Y').gsub('yy','%y').gsub('MMMM','%B').gsub('MMM','%b').gsub('MM','%m')
@@ -358,8 +363,17 @@ layout.each do |dash|
 
     el_id = "el-#{cap.downcase.gsub(/\W+/, '-')[0..40]}".sub(/-$/, '')
 
+    # If the dim column is aliased in Tableau (raw → display mapping), wrap the
+    # master ref in a Switch() so the chart displays the friendly labels.
+    aliases_for_dim = (meta['column_aliases'] || {})[dim['name']] ||
+                      (meta['column_aliases'] || {})[dim_hdr]
     dim_formula = if dim['formula']                     # explicit formula override
                     dim['formula']
+                  elsif aliases_for_dim && !aliases_for_dim.empty?
+                    parts = ["[Master/#{dim['name']}]"]
+                    aliases_for_dim.each { |a| parts << a['key'].inspect; parts << a['value'].inspect }
+                    parts << "[Master/#{dim['name']}]"  # default: pass through raw value
+                    "Switch(#{parts.join(', ')})"
                   elsif dim_trunc
                     %(DateTrunc("#{dim_trunc}", [Master/#{dim['name']}]))
                   else
@@ -410,6 +424,26 @@ layout.each do |dash|
       warnings << "'#{cap}' has chart_kind=automatic — defaulted to bar-chart; verify against PNG"
     end
 
+    # Dual-axis / combo detection: if Tableau marked this worksheet as
+    # synchronized-axes OR there are 2+ measures in the pane AND the view CSV
+    # has a second measure column, emit a combo-chart with two yAxis groups.
+    extra_meas_col = nil
+    if z['dual_axis'] && headers.length >= 3
+      meas2_hdr = headers[2]
+      meas2 = map_column(meas2_hdr, mmap) ||
+              { 'id' => "m-#{meas2_hdr.downcase.gsub(/\W+/,'-')}", 'name' => meas2_hdr }
+      meas2_formula = meas2['formula'] || render_agg(sigma_agg, "[Master/#{meas2['name']}]")
+      extra_meas_col = {
+        'id'      => "y2-#{el_id}",
+        'name'    => meas2['name'],
+        'formula' => meas2_formula,
+        'format'  => meas2['format'].is_a?(Hash) ? meas2['format'] :
+                     ({ 'kind' => 'number', 'formatString' => ',.0f' })
+      }
+      kind = 'combo-chart' unless %w[pie-chart donut-chart].include?(kind)
+      warnings << "'#{cap}' detected as dual-axis (synchronized=true or 2+ measures) — emitted as combo-chart"
+    end
+
     element = {
       'id'      => el_id,
       'kind'    => kind,
@@ -417,6 +451,15 @@ layout.each do |dash|
       'source'  => { 'kind' => 'table', 'elementId' => opts[:master_id] },
       'columns' => [dim_col_obj, meas_col_obj]
     }
+    element['columns'] << extra_meas_col if extra_meas_col
+
+    # Reference lines / bands / trendlines from Tableau — surface so the agent
+    # adds them by hand in Sigma's chart editor. Auto-emission of referenceMarks
+    # is tracked in beads-sigma-7ak.
+    if z['ref_marks'] && !z['ref_marks'].empty?
+      kinds = z['ref_marks'].map { |m| m['kind'] }.tally.map { |k, n| "#{n}× #{k}" }.join(', ')
+      warnings << "'#{cap}' has Tableau reference marks (#{kinds}) — Sigma supports referenceMarks on chart elements; add manually post-publish (or see beads-sigma-7ak)"
+    end
 
     if kind == 'pie-chart' || kind == 'donut-chart'
       element['color'] = { 'id' => dim_col_obj['id'] }
@@ -432,7 +475,9 @@ layout.each do |dash|
         x_axis['sort'] = { 'by' => meas_col_obj['id'], 'direction' => sigma_dir }
       end
       element['xAxis'] = x_axis
-      element['yAxis'] = [{ 'id' => meas_col_obj['id'] }]
+      y_axis_list = [{ 'id' => meas_col_obj['id'] }]
+      y_axis_list << { 'id' => extra_meas_col['id'] } if extra_meas_col
+      element['yAxis'] = y_axis_list
     end
 
     # Surface action filters (they get skipped — these are cross-chart actions,
@@ -735,16 +780,29 @@ if opts[:pages_mode] == :worksheet
         'body' => "## #{ws_name}"
       }
     end
-    # Auto-controls duplicated per page (Sigma controls are page-scoped). Each
-    # page gets its own copy with a unique element `id` (workbook-globally
-    # unique); the `controlId` stays the same across pages because controls are
-    # page-scoped and formulas resolve against the current page's controls.
-    # Parameter controls go first so the rendered order is param → filters.
+    # Auto-controls duplicated per page. Both `id` and `controlId` need to be
+    # workbook-globally unique (Sigma rejects duplicates). We track per-page
+    # controlId rewrites so any param-driven Switch() formula on this page's
+    # charts can be rewritten to reference the suffixed controlId.
+    ws_slug = ws_name.downcase.gsub(/\W+/, '-')[0..20]
+    ctl_rewrites = {}
     (param_controls + auto_controls).each do |c|
       dup = JSON.parse(c.to_json)
-      ws_slug = ws_name.downcase.gsub(/\W+/, '-')[0..20]
-      dup['id'] = "#{dup['id']}-#{ws_slug}"
+      original_cid = dup['controlId']
+      dup['id']        = "#{dup['id']}-#{ws_slug}"
+      dup['controlId'] = "#{dup['controlId']}-#{ws_slug}"
+      ctl_rewrites[original_cid] = dup['controlId']
       page_extras << dup
+    end
+    # Rewrite Switch / If formulas on this page's chart calc columns.
+    els.each do |el|
+      (el['columns'] || []).each do |col|
+        f = col['formula'].to_s
+        ctl_rewrites.each do |from, to|
+          f = f.gsub("[#{from}]", "[#{to}]")
+        end
+        col['formula'] = f
+      end
     end
     pages << {
       'name'     => ws_name,
@@ -760,3 +818,44 @@ else
   warn "wrote #{opts[:out]}  (#{all_elements.size} elements: #{all_extras.size} controls/text + #{elements.size} charts)"
 end
 warnings.each { |w| warn "  WARN  #{w}" }
+
+# ---- Tableau dashboard actions companion file -----------------------------
+# Action filters were translated into element-level filters when possible; the
+# leftover Tableau-internal action wiring (which source-tile filters which
+# target-tile set) is non-translatable without Sigma's cross-element wiring
+# API. Emit a companion actions.md so the agent (or customer) can replicate
+# the cross-chart interactivity by hand post-publish.
+actions = []
+(layout || []).each do |dash|
+  (dash['zones'] || []).each do |z|
+    next unless z['kind'] == 'chart'
+    (z['filters'] || []).select { |f| f['is_action'] }.each do |af|
+      # Tableau's action filter column looks like
+      #   [federated.<id>].[Action (Region)]
+      # Pull "Region" out as the dim that the action filters on.
+      raw = (af['raw_param'] || af['column'] || '').to_s
+      dim = (raw[/\[Action \(([^)]+)\)\]/, 1] || raw)
+      actions << {
+        'target'  => z['caption'],
+        'source'  => dim,
+        'column'  => dim
+      }
+    end
+  end
+end
+unless actions.empty?
+  actions_md_path = opts[:out].sub(/\.json$/, '-actions.md')
+  md = String.new
+  md << "# Tableau dashboard actions — post-publish setup\n\n"
+  md << "Sigma cross-chart filtering replaces Tableau's filter actions. For each\n"
+  md << "row below, in the published Sigma workbook: select the source element,\n"
+  md << "open Actions → Add filter action, target the listed element on the named\n"
+  md << "column.\n\n"
+  md << "| Source dim | Target chart | Filter column |\n"
+  md << "|---|---|---|\n"
+  actions.uniq.each do |a|
+    md << "| #{a['source']} | #{a['target']} | #{a['column']} |\n"
+  end
+  File.write(actions_md_path, md)
+  warn "wrote #{actions_md_path} (#{actions.size} action entries)"
+end

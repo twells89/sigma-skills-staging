@@ -219,6 +219,47 @@ xml.elements.each('//worksheet') do |ws|
     formats[field.to_s] = val.to_s
   end
 
+  # Per-worksheet dual-axis / synchronized-axis detection. Tableau combo charts
+  # ship two measures on the same dim shelf and a `synchronized='true'`
+  # attribute on the axis encoding inside <style-rule element='axis'>. We surface:
+  #   dual_axis: bool       — true if any axis has synchronized='true' or there
+  #                            are 2+ distinct quantitative measures
+  #   measures:  [{column, derivation}]
+  axis_synced = false
+  ws.elements.each('.//style-rule[@element="axis"]/encoding') do |e|
+    if e.attributes['synchronized'].to_s == 'true'
+      axis_synced = true
+      break
+    end
+  end
+  measures = []
+  ws.elements.each('.//column-instance') do |ci|
+    col = ci.attributes['column']
+    deriv = ci.attributes['derivation']
+    next if col.nil? || deriv.nil?
+    next unless ci.attributes['type'] == 'quantitative'
+    next if %w[None User].include?(deriv)
+    measures << { 'column' => col.to_s, 'derivation' => deriv.to_s }
+  end
+  # Conservative: only flag dual_axis when Tableau explicitly synchronized two
+  # axes. Multi-measure worksheets without sync are usually pivot tables or
+  # measure-name shelves, not combo charts.
+  dual_axis = axis_synced
+
+  # Per-worksheet reference lines / bands. Each <formula> is the calc that
+  # produces the line value (e.g., total / avg / median / constant). The full
+  # nuance (band fill, label format) is not extracted — the agent picks it up
+  # post-conversion. We surface enough to know reference marks ARE present so a
+  # warning fires per chart.
+  ref_marks = []
+  ws.elements.each('.//formatted-text') do |_ft|
+    # No-op: <formatted-text> often appears in tooltips, not ref-lines. Filter via parent.
+  end
+  ws.elements.each('.//reference-line') { |_| ref_marks << { 'kind' => 'line' } }
+  ws.elements.each('.//reference-band') { |_| ref_marks << { 'kind' => 'band' } }
+  ws.elements.each('.//reference-distribution') { |_| ref_marks << { 'kind' => 'distribution' } }
+  ws.elements.each('.//trendline-model') { |_| ref_marks << { 'kind' => 'trendline' } }
+
   # Encoding channels (color / size / detail / shape / label / tooltip).
   # Color is the key one for multi-series approximations (Sales by Segment etc).
   channels = {}
@@ -265,7 +306,10 @@ xml.elements.each('//worksheet') do |ws|
     aggregations:  aggregations,
     channels:      channels,
     formats:       formats,
-    calculations:  calcs
+    calculations:  calcs,
+    dual_axis:     dual_axis,
+    measures:      measures.uniq { |m| m['column'] },
+    ref_marks:     ref_marks
   }
 end
 
@@ -285,25 +329,37 @@ end
 def translate_format(tableau_fmt)
   s = tableau_fmt.to_s
   return nil if s.empty?
+  # Tableau format strings can have multiple segments split by ';':
+  #   positive;negative;zero;text
+  # The negative segment encodes parens / explicit minus / [Red]. d3-format
+  # supports a `(` sign modifier that wraps negatives in parens. We detect that
+  # case and prepend `(` to the format string.
+  segments = s.split(';')
+  pos = segments[0] || s
+  neg = segments[1]
+  paren_negative = neg && neg.include?('(') && neg.include?(')')
+  prefix = paren_negative ? '(' : ''
+
   # Percent — p<digits>[.<digits>]%
-  if (m = s.match(/^p\d*(?:\.(\d+))?%$/i))
+  if (m = pos.match(/^p\d*(?:\.(\d+))?%$/i))
     decimals = (m[1] || '').length
-    return { 'kind' => 'number', 'formatString' => ",.#{decimals}%" }
+    return { 'kind' => 'number', 'formatString' => "#{prefix},.#{decimals}%" }
   end
   # Tableau locale-currency code — C<locale>[.<digits>]% (e.g., C1033% = $#,##0)
-  if (m = s.match(/^C\d+(?:\.(\d+))?%?$/))
+  if (m = pos.match(/^C\d+(?:\.(\d+))?%?$/))
     decimals = (m[1] || '').length
-    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+    return { 'kind' => 'number', 'formatString' => "#{prefix}$,.#{decimals}f", 'currencySymbol' => '$' }
   end
-  # Currency
-  if s.start_with?('$')
-    decimals = (s.match(/\.(0+)/) || [])[1].to_s.length
-    return { 'kind' => 'number', 'formatString' => "$,.#{decimals}f", 'currencySymbol' => '$' }
+  # Currency — leading $ or c"$" / c\"$\"
+  if pos =~ /^c?["\\]*\$/ || pos.start_with?('$')
+    # Look for #...0.00 to extract decimals
+    decimals = (pos.match(/\.(0+)/) || [])[1].to_s.length
+    return { 'kind' => 'number', 'formatString' => "#{prefix}$,.#{decimals}f", 'currencySymbol' => '$' }
   end
   # Plain number — count decimals after the decimal point
-  if s =~ /^[#,0]+(?:\.(0+))?$/
+  if pos =~ /^[#,0]+(?:\.(0+))?$/
     decimals = ($1 || '').length
-    return { 'kind' => 'number', 'formatString' => ",.#{decimals}f" }
+    return { 'kind' => 'number', 'formatString' => "#{prefix},.#{decimals}f" }
   end
   # Date formats — translate Tableau tokens to strftime
   if s =~ /yyyy|MMM|MM|dd|HH/
@@ -419,6 +475,9 @@ xml.elements.each('//dashboard') do |d|
       'channels'     => (kind == 'chart' ? ws_meta&.dig(:channels)      : nil),
       'formats'      => (kind == 'chart' ? ws_meta&.dig(:formats)       : nil),
       'calculations' => (kind == 'chart' ? ws_meta&.dig(:calculations)  : nil),
+      'dual_axis'    => (kind == 'chart' ? ws_meta&.dig(:dual_axis)     : nil),
+      'measures'     => (kind == 'chart' ? ws_meta&.dig(:measures)      : nil),
+      'ref_marks'    => (kind == 'chart' ? ws_meta&.dig(:ref_marks)     : nil),
       # Resolved filter target (filter/parameter zones only)
       'filter_column_caption'  => (kind == 'filter' || kind == 'parameter' ? filter_col_caption  : nil),
       'filter_column_datatype' => (kind == 'filter' || kind == 'parameter' ? filter_col_datatype : nil)
@@ -428,6 +487,50 @@ xml.elements.each('//dashboard') do |d|
     'dashboard' => d.attributes['name'],
     'zones'     => zones
   }
+end
+
+def unquote_value(s)
+  s = s.to_s.gsub('&quot;', '"')
+  s.sub(/^"/, '').sub(/"$/, '')
+end
+
+## ---- Tableau column aliases -----------------------------------------------
+# Columns can carry per-value aliases that override the raw warehouse value
+# with a friendly display label. Pattern:
+#   <column caption='Region' name='[Region]' ...>
+#     <aliases>
+#       <alias key='"N"' value='North' />
+#       <alias key='"S"' value='South' />
+#     </aliases>
+#   </column>
+# We skip the Tableau-internal `[:Measure Names]` pseudo-column and any aliases
+# whose key references an internal federated id (those map field-ids to display
+# strings, not data values — agent needs to wire those by hand).
+column_aliases = {}
+xml.elements.each('//column') do |col|
+  raw_name = col.attributes['name'].to_s
+  next if raw_name == '[:Measure Names]' || raw_name.empty?
+  # Caption is the human-facing column name; fall back to the bracketed `name`
+  # (with brackets stripped) when caption isn't set — Tableau leaves caption
+  # empty for columns whose name IS already display-friendly (e.g., `[Metric]`).
+  cap = col.attributes['caption']
+  cap = raw_name.gsub(/^\[|\]$/, '') if cap.nil? || cap.empty?
+  next if cap.empty?
+  pairs = []
+  col.each_element('aliases/alias') do |a|
+    k = unquote_value(a.attributes['key'])
+    v = a.attributes['value']
+    next if k.nil? || v.nil? || v.empty?
+    # Drop internal-id keys (federated.* / [usr:foo] / [sum:foo] / [ctd:foo]).
+    next if k =~ /^\[(?:federated|usr|sum|ctd|min|max|avg|none):/i
+    next if k =~ /^\[[\w-]+\]\.\[/  # e.g., [Sample.csv].[usr:Calc...:qk]
+    pairs << { 'key' => k, 'value' => v }
+  end
+  next if pairs.empty?
+  # Keep the richest alias set per caption (a column may appear in multiple
+  # datasource blocks — keep the one with the most pairs).
+  existing = column_aliases[cap]
+  column_aliases[cap] = pairs if existing.nil? || pairs.size > existing.size
 end
 
 ## ---- Tableau parameters ---------------------------------------------------
@@ -442,11 +545,6 @@ end
 #   - min/max/step   when param_domain='range'
 # Sigma maps these to: segmented/list control (list), number/range-slider
 # control (range numeric), date-range control (range date).
-def unquote_value(s)
-  s = s.to_s.gsub('&quot;', '"')
-  s.sub(/^"/, '').sub(/"$/, '')
-end
-
 parameters = []
 xml.elements.each("//column[@param-domain-type]") do |col|
   raw_name = col.attributes['name'].to_s
@@ -508,6 +606,7 @@ meta = {
   'worksheets'     => worksheets.transform_values { |v| v.transform_keys(&:to_s) },
   'shared_filters' => shared_filters,
   'parameters'     => parameters,
+  'column_aliases' => column_aliases,
   'columns_by_guid'=> COL_BY_GUID.transform_values { |v| { 'caption' => v[:caption], 'datatype' => v[:datatype] } }
 }
 META_OUT = OUT.sub(/\.json$/, '-meta.json')
