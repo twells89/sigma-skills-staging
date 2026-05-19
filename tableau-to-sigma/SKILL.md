@@ -124,6 +124,31 @@ are unchanged. Full endpoint inventory and gotchas in `refs/tableau-rest.md`.
 
 ---
 
+## Phase 0a — Scan the workbook for feature gaps (MANDATORY)
+
+Run the gap scanner against the customer's `.twb` *before* anything else. It
+inventories every workbook feature the skill currently handles vs. doesn't, so
+the agent can plan around real translation gaps instead of discovering them
+mid-conversion.
+
+```bash
+ruby scripts/scan-workbook-gaps.rb /tmp/<name>/workbook-content.twb
+# writes <name>-workbook-content-gaps-report.md + <name>-workbook-content-gaps.json
+```
+
+Categories emitted:
+- **✅ Auto** — translated end-to-end without intervention
+- **⚠️ Hint** — agent gets a copy-paste-ready Sigma formula in WARN lines
+- **🛠 Manual** — customer wires up post-publish (action filters, ref-marks)
+- **❌ Unhandled** — feature is used in the .twb but the skill does not yet
+  cover it; the agent should escalate via the `gap-scout` subagent OR file
+  an issue at github.com/twells89/sigma-skills-staging
+
+Share the markdown report with the customer up front to set expectations.
+Save the JSON for the subagent.
+
+---
+
 ## Phase 0 — Estimate cost up front
 
 Before committing to the conversion, predict the agent token cost. Useful for
