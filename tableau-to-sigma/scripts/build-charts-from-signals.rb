@@ -194,6 +194,178 @@ def param_control_ref(caption)
   "[ctl-param-#{caption.downcase.gsub(/\W+/, '-').sub(/-$/, '')}]"
 end
 
+# ---- Tableau table-calc translators ---------------------------------------
+# Translate Tableau table-calculation functions to their Sigma equivalents.
+# Returns the translated formula, plus a hint about Sigma-specific caveats
+# (e.g., "window functions silently error in grouping-table charts — add to a
+# non-grouping context or Custom SQL DM element").
+#
+# Function mappings (Sigma names):
+#   INDEX()                  → RowNumber()
+#   LOOKUP(expr, n)          → Lag(expr, n)  (positive n) / Lead(expr, -n) (neg)
+#   LOOKUP(expr, 0)          → expr  (zero offset is identity)
+#   RANK(expr [, 'desc'])    → Rank(expr [, "desc"])
+#   RANK_DENSE(expr)         → RankDense(expr)
+#   RANK_UNIQUE(expr)        → RowNumber() within ranked partition
+#   RANK_PERCENTILE(expr)    → RankPercentile(expr)
+#   TOTAL(SUM(x))            → Sum(x)  (Sigma metric on master without dim group)
+#   SIZE()                   → Count(*) OVER ()  — no direct Sigma fn; warn
+#   FIRST()                  → RowNumber() - 1   (Tableau FIRST returns 0-indexed)
+#   LAST()                   → no direct equiv; needs Count-RowNumber pattern
+#   ZN(x)                    → Coalesce(x, 0)
+#   COUNTD(x)                → CountDistinct(x)
+#   IIF(c, t, e)             → If(c, t, e)
+#   IFNULL(x, y)             → Coalesce(x, y)
+def translate_tableau_tc(formula)
+  return [nil, nil] if formula.nil? || formula.empty?
+  s = formula.dup
+  hints = []
+  changed = false
+
+  # Order matters — apply table-calc translations BEFORE simple renames so the
+  # match patterns (LOOKUP / TOTAL(COUNTD()) etc.) see the original Tableau
+  # syntax.
+
+  # INDEX() → RowNumber()
+  if s.gsub!(/\bINDEX\s*\(\s*\)/, 'RowNumber()')
+    hints << 'INDEX()→RowNumber()'; changed = true
+  end
+
+  # LOOKUP(expr, 0) — drop the wrapper. Use a balanced-paren match.
+  while s =~ /\bLOOKUP\s*\(\s*((?:[^,()]|\([^()]*\)|\([^()]*\([^()]*\)[^()]*\))+?)\s*,\s*0\s*\)/
+    s = s.sub($~[0], $1)
+    hints << 'LOOKUP(x, 0)→x'; changed = true
+  end
+  # LOOKUP(expr, -n) → Lead(expr, n)
+  while s =~ /\bLOOKUP\s*\(\s*((?:[^,()]|\([^()]*\)|\([^()]*\([^()]*\)[^()]*\))+?)\s*,\s*-(\d+)\s*\)/
+    s = s.sub($~[0], "Lead(#{$1}, #{$2})")
+    hints << 'LOOKUP(x, -n)→Lead(x, n)'; changed = true
+  end
+  # LOOKUP(expr, n) where n >= 1 → Lag(expr, n)
+  while s =~ /\bLOOKUP\s*\(\s*((?:[^,()]|\([^()]*\)|\([^()]*\([^()]*\)[^()]*\))+?)\s*,\s*(\d+)\s*\)/
+    s = s.sub($~[0], "Lag(#{$1}, #{$2})")
+    hints << 'LOOKUP(x, n)→Lag(x, n)'; changed = true
+  end
+
+  # TOTAL(SUM(x)) → Sum(x); TOTAL(COUNTD(x)) → CountDistinct(x); TOTAL(AVG(x))
+  if s.gsub!(/\bTOTAL\s*\(\s*SUM\s*\(((?:[^()]|\([^()]*\))+)\)\s*\)/, 'Sum(\1)')
+    hints << 'TOTAL(SUM(x))→Sum(x) (non-grouping context)'; changed = true
+  end
+  if s.gsub!(/\bTOTAL\s*\(\s*COUNTD\s*\(((?:[^()]|\([^()]*\))+)\)\s*\)/, 'CountDistinct(\1)')
+    hints << 'TOTAL(COUNTD(x))→CountDistinct(x) (non-grouping context)'; changed = true
+  end
+  if s.gsub!(/\bTOTAL\s*\(\s*AVG\s*\(((?:[^()]|\([^()]*\))+)\)\s*\)/, 'Avg(\1)')
+    hints << 'TOTAL(AVG(x))→Avg(x) (non-grouping context)'; changed = true
+  end
+
+  # RANK([col], 'desc') / RANK([col]) / RANK_DENSE / RANK_PERCENTILE
+  if s.gsub!(/\bRANK\s*\(\s*((?:[^,()]|\([^()]*\))+?)\s*,\s*'(asc|desc)'\s*\)/, 'Rank(\1, "\2")')
+    hints << "RANK→Rank"; changed = true
+  end
+  if s.gsub!(/\bRANK\s*\(\s*((?:[^,()]|\([^()]*\))+?)\s*\)/, 'Rank(\1)')
+    hints << "RANK→Rank"
+    changed = true
+  end
+  if s.gsub!(/\bRANK_DENSE\s*\(\s*((?:[^,()]|\([^()]*\))+?)\s*\)/, 'RankDense(\1)')
+    hints << "RANK_DENSE→RankDense"; changed = true
+  end
+  if s.gsub!(/\bRANK_PERCENTILE\s*\(\s*((?:[^,()]|\([^()]*\))+?)\s*\)/, 'RankPercentile(\1)')
+    hints << "RANK_PERCENTILE→RankPercentile"; changed = true
+  end
+
+  # Simple renames done AFTER table-calc rewrites so the table-calc patterns
+  # match the original Tableau spelling.
+  if s.gsub!(/\bZN\s*\(/, 'Coalesce(')
+    # ZN takes one arg; pair the matching close-paren and append `, 0`. Walk
+    # the string and balance parens to find the right `)`.
+    out = String.new
+    i = 0
+    while i < s.length
+      if s[i, 9] == 'Coalesce(' && (i == 0 || s[i - 1] !~ /\w/)
+        out << 'Coalesce('
+        depth = 1
+        j = i + 9
+        while j < s.length && depth > 0
+          depth += 1 if s[j] == '('
+          depth -= 1 if s[j] == ')'
+          break if depth == 0
+          j += 1
+        end
+        out << s[i + 9...j] << ', 0)'
+        i = j + 1
+      else
+        out << s[i]
+        i += 1
+      end
+    end
+    s = out
+    changed = true
+  end
+  if s.gsub!(/\bIIF\s*\(/, 'If(')
+    changed = true
+  end
+  if s.gsub!(/\bIFNULL\s*\(/, 'Coalesce(')
+    changed = true
+  end
+  if s.gsub!(/\bCOUNTD\s*\(/, 'CountDistinct(')
+    changed = true
+  end
+
+  # SIZE() — no direct Sigma equivalent for partition size at the formula level.
+  # Leave as-is and warn so the agent rewrites manually (commonly Count(*)+OVER).
+  if s.include?('SIZE()')
+    hints << 'SIZE() has no direct Sigma equivalent — rewrite as Count(*) in a non-grouping context or Custom SQL'
+  end
+
+  # FIRST() / LAST() — special.
+  if s.include?('FIRST()')
+    hints << 'FIRST() → RowNumber() - 1 (Tableau FIRST is 0-indexed first row)'
+  end
+  if s.include?('LAST()')
+    hints << 'LAST() → no direct Sigma equivalent — use a Count() - RowNumber() pattern or Custom SQL'
+  end
+
+  # LOD calcs — Tableau's `{FIXED [dim] : AGG([m])}` family.
+  # Translation strategy (Sigma):
+  #   {FIXED [dim] : SUM([m])}    → workbook metric `Sum([m])` grouped by [dim]
+  #                                 OR Custom SQL `SUM(m) OVER (PARTITION BY dim)`
+  #   {FIXED : SUM([m])}          → unscoped `Sum([m])` (workbook-level scalar)
+  #   {INCLUDE [dim] : SUM([m])}  → add [dim] to chart grouping and just use Sum
+  #   {EXCLUDE [dim] : SUM([m])}  → remove [dim] from chart grouping, use Sum
+  # The full translation needs context (chart's grouping cols), so we surface
+  # the suggested Sigma expression as a hint rather than auto-emitting.
+  if s =~ /\{\s*FIXED\s+\[([^\]]+)\]\s*:\s*(SUM|AVG|MIN|MAX|COUNT|COUNTD)\s*\(\[([^\]]+)\]\)\s*\}/i
+    dim, agg, m = $1, $2.upcase, $3
+    sigma_agg = { 'SUM' => 'Sum', 'AVG' => 'Avg', 'MIN' => 'Min', 'MAX' => 'Max',
+                  'COUNT' => 'Count', 'COUNTD' => 'CountDistinct' }[agg]
+    sigma_expr = "#{sigma_agg}([Master/#{m}]) over the partition of [Master/#{dim}]"
+    hints << "FIXED LOD → #{sigma_expr}; OR Custom SQL DM element with #{agg}(#{m}) OVER (PARTITION BY #{dim})"
+    changed = true
+  end
+  if s =~ /\{\s*FIXED\s*:\s*(SUM|AVG|MIN|MAX|COUNT|COUNTD)\s*\(\[([^\]]+)\]\)\s*\}/i
+    agg, m = $1.upcase, $2
+    sigma_agg = { 'SUM' => 'Sum', 'AVG' => 'Avg', 'MIN' => 'Min', 'MAX' => 'Max',
+                  'COUNT' => 'Count', 'COUNTD' => 'CountDistinct' }[agg]
+    hints << "FIXED-no-dim LOD → workbook scalar metric #{sigma_agg}([Master/#{m}]) (no group by)"
+    changed = true
+  end
+  if s =~ /\{\s*INCLUDE\s+\[([^\]]+)\]\s*:\s*(SUM|AVG)\s*\(\[([^\]]+)\]\)\s*\}/i
+    dim, agg, m = $1, $2.upcase, $3
+    hints << "INCLUDE LOD on [#{dim}] → add [Master/#{dim}] to chart grouping, use plain #{agg}([Master/#{m}])"
+    changed = true
+  end
+  if s =~ /\{\s*EXCLUDE\s+\[([^\]]+)\]\s*:\s*(SUM|AVG)\s*\(\[([^\]]+)\]\)\s*\}/i
+    dim, agg, m = $1, $2.upcase, $3
+    hints << "EXCLUDE LOD on [#{dim}] → remove [Master/#{dim}] from chart grouping, use plain #{agg}([Master/#{m}])"
+    changed = true
+  end
+
+  return [nil, nil] unless changed
+  hints.uniq!
+  hints << 'NOTE: Sigma window functions (Rank/Lag/Lead/Cumulative*) silently error in grouping-table charts and DM-element calc cols — add to a workbook-master non-grouping context OR a Custom SQL DM element' if hints.any? { |h| h =~ /Rank|Lag|Lead|RowNumber/ }
+  [s, hints.join('; ')]
+end
+
 # ---- Parameter / CASE translator ------------------------------------------
 # Tableau CASE-on-parameter:
 #   CASE [Parameters].[Analysis Type]
@@ -559,6 +731,13 @@ layout.each do |dash|
           'formula' => translated
         }
         warnings << "'#{cap}' parameter-driven calc #{c['name']} → translated to Switch: #{translated[0..120]}"
+        next
+      end
+
+      # Try table-calc / common-fn translations (INDEX/LOOKUP/TOTAL/RANK/ZN/etc.).
+      tc_translated, tc_hint = translate_tableau_tc(formula)
+      if tc_translated
+        warnings << "'#{cap}' Tableau table-calc #{c['name']} → Sigma:  #{tc_translated[0..160]}  [#{tc_hint}]"
         next
       end
 
