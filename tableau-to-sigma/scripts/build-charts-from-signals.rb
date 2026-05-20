@@ -50,6 +50,7 @@
 
 require 'json'
 require 'csv'
+require 'date'
 require 'optparse'
 require_relative 'learned-rules'
 
@@ -904,16 +905,49 @@ if opts[:auto_controls]
         'columnId' => m['id']
       }]
     when 'relative-date'
-      # Tableau's relative-date with first-period=0/last-period=0 +
-      # period-type=year means "this year". Sigma's "current" mode + unit takes
-      # the same role; count=0 isn't valid so we omit it.
+      # Tableau "this year" / "this month" / "this quarter" → translate to
+      # Sigma `mode: between` with hardcoded startDate/endDate. The previously-
+      # tried `mode: current, unit: <period>` only applies at UI render time —
+      # it does NOT filter Sigma's chart-data SQL queries (Phase 6 parity
+      # showed every relative-date chart returning unfiltered data). Hardcoded
+      # dates apply at query time AND on the UI. Trade-off: filter "freezes"
+      # — next year someone must update it manually. The mirror of v4's
+      # reference workbook.
       spec['controlType'] = 'date-range'
-      spec['mode']        = 'current'
-      spec['unit']        = f['period_type'] || 'year'
+      spec['mode']        = 'between'
+      period = (f['period_type'] || 'year').downcase
+      now = Time.now
+      if period == 'year'
+        start_d = "#{now.year}-01-01T00:00:00Z"
+        end_d   = "#{now.year}-12-31T23:59:59Z"
+      elsif period == 'quarter'
+        q       = ((now.month - 1) / 3) + 1
+        start_m = (q - 1) * 3 + 1
+        start_d = "#{now.year}-#{start_m.to_s.rjust(2, '0')}-01T00:00:00Z"
+        end_m   = start_m + 2
+        end_day = Date.new(now.year, end_m, -1).day
+        end_d   = "#{now.year}-#{end_m.to_s.rjust(2, '0')}-#{end_day.to_s.rjust(2,'0')}T23:59:59Z"
+      elsif period == 'month'
+        start_d = now.strftime('%Y-%m-01T00:00:00Z')
+        last    = Date.new(now.year, now.month, -1).day
+        end_d   = now.strftime("%Y-%m-#{last.to_s.rjust(2,'0')}T23:59:59Z")
+      else
+        # Fallback: pass-through current+unit; agent updates manually
+        spec['mode'] = 'current'
+        spec['unit'] = period
+        spec['filters'] = [{
+          'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+          'columnId' => m['id']
+        }]
+        next
+      end
+      spec['startDate'] = start_d
+      spec['endDate']   = end_d
       spec['filters'] = [{
         'source'   => { 'kind' => 'table', 'elementId' => opts[:master_id] },
         'columnId' => m['id']
       }]
+      warnings << "shared filter '#{cap}' relative-date '#{period}' → emitted as mode:between with hardcoded current-#{period} dates (#{start_d[0..9]}..#{end_d[0..9]}). Re-run next #{period} to refresh."
     when 'number-range'
       spec['controlType'] = 'range-slider'
       spec['filters'] = [{
