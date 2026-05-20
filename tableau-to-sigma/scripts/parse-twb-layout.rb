@@ -489,6 +489,44 @@ xml.elements.each('//dashboard') do |d|
   }
 end
 
+# Sheet-only workbooks (no <dashboard> blocks — just standalone worksheets)
+# still need a zone list so downstream build-charts-from-signals can match
+# Sigma chart-elements to Tableau views. Emit a synthetic dashboard per
+# worksheet so the parser output looks normal to the build script.
+if dashboards.empty? && !worksheets.empty?
+  worksheets.each_key do |ws_name|
+    ws_meta    = worksheets[ws_name]
+    chart_kind = chart_kind_for(ws_meta)
+    dashboards << {
+      'dashboard' => "[synthetic] #{ws_name}",
+      'zones'     => [{
+        'id'           => '1',
+        'kind'         => 'chart',
+        'caption'      => ws_name,
+        'view_ref'     => nil,
+        'x_pct'        => 0.0,
+        'y_pct'        => 0.0,
+        'w_pct'        => 100.0,
+        'h_pct'        => 100.0,
+        'chart_kind'   => chart_kind,
+        'mark_class'   => ws_meta[:mark_class],
+        'geo_role'     => ws_meta[:geo_role],
+        'sort'         => ws_meta[:sort],
+        'filters'      => ws_meta[:filters],
+        'aggregations' => ws_meta[:aggregations],
+        'channels'     => ws_meta[:channels],
+        'formats'      => ws_meta[:formats],
+        'calculations' => ws_meta[:calculations],
+        'dual_axis'    => ws_meta[:dual_axis],
+        'measures'     => ws_meta[:measures],
+        'ref_marks'    => ws_meta[:ref_marks],
+        'filter_column_caption'  => nil,
+        'filter_column_datatype' => nil
+      }]
+    }
+  end
+end
+
 def unquote_value(s)
   s = s.to_s.gsub('&quot;', '"')
   s.sub(/^"/, '').sub(/"$/, '')
