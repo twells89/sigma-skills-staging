@@ -45,6 +45,8 @@ INVENTORY = [
     status: :auto, blurb: "Tableau's sort direction carries into the chart's xAxis.sort." },
   { name: 'Parameter (list domain) + CASE-on-param',   pat: /param-domain-type='list'/,
     status: :auto, blurb: "List parameters become segmented controls; CASE/IF-on-param calcs translate to Sigma Switch()." },
+  { name: 'Parameter (numeric range)',                 pat: /param-domain-type='range'/,
+    status: :auto, blurb: 'Numeric range parameters become number-range controls. Skips orphan params not referenced by any worksheet calc.' },
   { name: 'Dual-axis (synchronized) combo charts',     pat: /synchronized='true'/,
     status: :auto, blurb: 'Synchronized-axis worksheets emit Sigma combo-chart with two yAxis groups.' },
   { name: 'Custom SQL data source',                    pat: /<relation\s[^>]*\btype='text'/,
@@ -81,8 +83,8 @@ INVENTORY = [
     status: :manual, blurb: 'Hierarchies map to pivot rowsBy OR a segmented drill-level control (beads-sigma-jbw).' },
 
   # UNHANDLED — feature actively used in real workbooks but not surfaced yet
-  { name: 'Parameter (numeric range domain)',          pat: /param-domain-type='range'/,
-    status: :unhandled, blurb: 'Skill detects but does NOT auto-emit control (Sigma API gap, see beads-sigma-ebw).' },
+  # (numeric-range param moved to auto in commit 1d3445d — scout discovered the
+  # number-range controlType is correct)
   { name: 'WINDOW_* aggregates (WINDOW_SUM/AVG/MAX...)', pat: /\bWINDOW_(SUM|AVG|MIN|MAX|COUNT|MEDIAN|PERCENTILE|VAR|STDEV)\b/,
     status: :unhandled, blurb: 'Skill warns; needs translation to Sigma Cumulative*/Moving* or Custom SQL (beads-sigma-427).' },
   { name: 'RUNNING_* totals',                          pat: /\bRUNNING_(SUM|AVG|COUNT|MIN|MAX)\b/,
