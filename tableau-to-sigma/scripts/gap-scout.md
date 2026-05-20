@@ -1,110 +1,120 @@
-# gap-scout subagent
+# gap-scout subagent — guide for the main agent
 
-A focused subagent the main tableau-to-sigma agent spawns when `scan-workbook-gaps.rb`
-flags an **❌ Unhandled** or **⚠️ Hint** feature in the customer's workbook.
+When `scan-workbook-gaps.rb` flags an ❌ Unhandled (or high-volume ⚠️ Hint)
+feature in the customer's workbook, spawn a separate subagent — the "gap
+scout" — to figure out a Sigma translation that works against the customer's
+actual Sigma site.
 
-The scout takes ONE gap at a time, attempts a translation, validates it against
-Sigma's API, and either:
-1. ✅ Writes the working rule to `~/.tableau-to-sigma/learned-rules.yaml`
-   so future conversions on the same site pick it up automatically
-2. ❌ Files a structured issue at github.com/twells89/sigma-skills-staging
-   with the XML snippet + failed attempts so the maintainer sees the pattern
+The scout writes successful translations to `~/.tableau-to-sigma/learned-rules.yaml`
+(in the customer's home dir, NOT the skill repo, so `git pull` of the skill
+never clobbers them). Subsequent conversions on the same machine apply the
+rule automatically.
 
-## When to spawn this subagent
+## When to spawn
 
-The main agent should spawn it when the gap report shows any `:unhandled` row
-OR when an `:hint` row has count >5 (high enough to be worth automating). The
-main agent does NOT do this discovery itself — the scout runs in isolation with
-its own context budget so the main conversion isn't disturbed.
+After Phase 0a's gap report is produced. For each `:unhandled` row, OR for
+any `:hint` row whose count is high enough to be worth automating, spawn ONE
+scout per gap. Run them in parallel where possible — they're independent.
 
-## Inputs (passed in the prompt)
+## How to spawn (from the main agent)
 
-- `gap`: a single object from `<workbook>-gaps.json`'s `detected_features` list
-- `twb_path`: path to the customer's `.twb` (for extracting example formulas)
-- `sigma_dm_id`: an existing Sigma data-model id with master columns the scout
-  can use for validation POSTs
-- `sigma_master_element_id`: typically `master`
-- `budget`: max number of Sigma POSTs (default: 3 per attempt, 3 attempts = 9)
+Use the Agent tool with `subagent_type: 'general-purpose'`. Self-contained
+prompt:
 
-## Procedure
+```
+You are a translation scout. Your job: propose a Sigma formula that
+replaces a Tableau pattern, validate it against Sigma's API, and persist
+the rule if it works.
 
-1. **Find concrete examples in the .twb**
-   Use `grep` / REXML to pull 3-5 example XML snippets matching the gap's pattern.
-   Excerpt: formula text, surrounding column metadata, datatype.
+INPUTS
+- Tableau feature: <feature name, e.g. "WINDOW_AVG">
+- Sample formulas: <3-5 grep'd examples from the customer's .twb>
+- Sigma data-model id: <dm-id>
+- Sigma master element id: <element-id>
+- Sigma folder id: <folder-id>
 
-2. **Propose a Sigma translation**
-   Use the existing skill knowledge (refs/data-model-spec.md +
-   refs/workbook-layout.md + scripts/lib/sigma_functions.rb's whitelist) to
-   propose 1-3 candidate Sigma formulas. Prefer translations that use ONLY
-   functions in `SigmaFunctions::ALL` — anything outside that list silently
-   errors in Sigma.
+PROCEDURE
+1. Read the relevant skill docs:
+   - tableau-to-sigma/refs/data-model-spec.md
+   - tableau-to-sigma/refs/workbook-layout.md
+   - tableau-to-sigma/scripts/lib/sigma_functions.rb (the whitelist —
+     anything outside ALL_SET silently errors)
+2. Propose ONE candidate Sigma formula. Prefer functions in the whitelist.
+   For window/rank/cumulative functions, remember they silently error in
+   workbook-master grouping-table calc cols AND in DM-element calc cols
+   — route to a non-grouping context (workbook scratchpad calc) or a
+   Custom SQL DM element with explicit OVER(...).
+3. Run:
+   ruby scripts/scout-validate-and-persist.rb \
+     --feature '<feature>' \
+     --pattern '<Tableau regex, capture groups for column refs>' \
+     --template '<Sigma template using \1, \2 for captures>' \
+     --test-formula '<the candidate with REAL column names from this DM>' \
+     --data-model-id <dm-id> \
+     --master-element-id <element-id> \
+     --folder-id <folder-id> \
+     --description '<one-line>' \
+     --hint '<post-publish caveat, e.g., "non-grouping context only">' \
+     --example-from '<which workbook/line>'
+4. Parse the JSON result.
+   - status=validated  → success; rule is now in the customer's local YAML
+   - status=escalated  → propose a different candidate (up to 3 attempts)
+                          OR escalate via `gh issue create` if `gh` works
 
-3. **Build a minimal test workbook**
-   Construct a workbook spec with:
-   - The existing master element (via `sigma_dm_id` + `sigma_master_element_id`)
-   - One chart that uses the candidate translation as a column formula
-   - Any required control / filter
-   POST to `/v2/workbooks/spec` and read back `/v2/workbooks/{id}/elements/{el}/columns`.
+OUTPUT
+Return a one-paragraph summary: feature, candidate, status (validated /
+escalated / abandoned-after-N-attempts), and the workbook_id of the test
+spec for cleanup later.
+```
 
-4. **Validate via column-type guard**
-   - If every column's `type.type != "error"` → SUCCESS, capture the rule
-   - If any column errors → record the error, try the next candidate, repeat
-     up to `budget` times
+## What the scout depends on
 
-5. **On SUCCESS**
-   Append the rule to `~/.tableau-to-sigma/learned-rules.yaml`:
-   ```yaml
-   - feature: "Tableau WINDOW_AVG"
-     tableau_pattern: '\bWINDOW_AVG\s*\(SUM\s*\(\[([^\]]+)\]\)\s*\)'
-     sigma_formula:   'MovingAvg(Sum([Master/$1]), -10, 10)'
-     hint:            'Sigma window functions silently error in grouping-table charts'
-     validated_at:    '2026-05-19T16:42:00Z'
-     example_xml:     '<formula>WINDOW_AVG(SUM([Sales]))</formula>'
-     example_from:    'workbook.twb (line 1234)'
-   ```
-   Future runs of the main agent should load this file at start and apply rules
-   before falling back to WARN-only behavior.
+- `scripts/validate-sigma-formula.rb` — primitive that POSTs a minimal test
+  workbook + runs the column-type guard. Returns JSON.
+- `scripts/scout-validate-and-persist.rb` — wraps validate-sigma-formula and
+  on success appends to `~/.tableau-to-sigma/learned-rules.yaml`; on failure
+  writes a structured escalation to `~/.tableau-to-sigma/escalations/`.
+- `scripts/learned-rules.rb` — the loader the main build script uses. The
+  customer never edits this; the scout writes it.
 
-6. **On FAILURE**
-   Write a structured escalation:
-   ```yaml
-   gap: <name>
-   tableau_snippet: <XML fragment>
-   attempts:
-     - sigma_formula: <candidate 1>
-       error: <error from Sigma API>
-     - sigma_formula: <candidate 2>
-       error: ...
-   ```
-   Save to `~/.tableau-to-sigma/escalations/<timestamp>-<gap-slug>.yaml`.
-   ALSO: invoke `gh issue create` (if `gh` available) OR `bd create` (if
-   .beads-sigma present) to file the issue automatically. Issue body includes
-   the snippet, attempts, and a one-line headline like
-   "Tableau→Sigma: figure out translation for WINDOW_AVG(SUM(x))".
+## File locations (CRITICAL)
 
-## Output
+| File | Path | Why |
+|---|---|---|
+| Learned rules | `~/.tableau-to-sigma/learned-rules.yaml` | Customer home. `git pull` cannot clobber. |
+| Escalations | `~/.tableau-to-sigma/escalations/*.yaml` | Same — customer-local. |
+| Override for testing | `$TABLEAU_TO_SIGMA_HOME` env var | Points at a sandbox path for CI. |
 
-Return to the main agent:
-- `status`: "auto-now-handled" | "needs-manual-followup" | "escalated-to-issue"
-- `rule_path`: path to the learned-rules.yaml entry (if success)
-- `escalation_path`: path to the escalation file (if failure)
-- `attempts`: count
-- `sigma_workbook_ids`: list of test workbook IDs to clean up later
+The `.gitignore` in this repo also blocks `.tableau-to-sigma/` from being
+committed if someone accidentally creates it inside the repo.
 
 ## Why a separate subagent
 
-- **Context isolation**: the scout makes many POST attempts; each round-trip
-  could be 200-500 tokens of Sigma error output. Keeping that out of the main
-  conversion's context window is critical for long migrations.
-- **Bounded budget**: cap N attempts to prevent runaway costs. Main agent
-  isn't blocked on the scout — can continue other work in parallel.
-- **Reusable across workbooks**: when the scout figures out a rule, every
-  future customer running the skill picks it up via learned-rules.yaml.
+- **Context isolation**: each Sigma POST response is verbose. Keeping the
+  reasoning + validation loops out of the main conversion's context is
+  critical for large multi-workbook migrations.
+- **Bounded budget**: capped at N attempts per gap. Failure doesn't block
+  the main conversion — failed gaps just remain as `WARN` lines telling the
+  agent to handle manually post-publish.
+- **Compounds across customers**: every customer who runs the scout
+  contributes to their local rules library. If we ever decide to bless a
+  rule for the global skill, it gets promoted from `confidence: validated`
+  to a built-in regex in `build-charts-from-signals.rb`.
 
 ## Status
 
-Phase 1: scan-workbook-gaps.rb (DONE — shipped 2026-05-19)
-Phase 2: gap-scout subagent definition (THIS FILE — DONE, prototype)
-Phase 3: actual subagent invocation wiring + learned-rules.yaml loader (TODO,
-  tracked in beads-sigma-<id-tbd>)
-Phase 4: github issue auto-filing on escalation (TODO)
+| Phase | Status | Path |
+|---|---|---|
+| 1: pre-flight gap scanner | ✅ shipped commit 8016adf | `scripts/scan-workbook-gaps.rb` |
+| 2: scout subagent design  | ✅ this file (current commit) | `scripts/gap-scout.md` |
+| 3a: validation primitive  | ✅ this commit | `scripts/validate-sigma-formula.rb` |
+| 3b: scout wrapper script  | ✅ this commit | `scripts/scout-validate-and-persist.rb` |
+| 3c: learned-rules loader  | ✅ this commit | `scripts/learned-rules.rb` |
+| 3d: build-script integration | ✅ this commit | `build-charts-from-signals.rb` reads via `LearnedRules.load`/`apply` |
+| 4: auto-file GitHub/beads issues on escalation | ⏳ TODO (beads-sigma-0b3) | — |
+| 5: promote-rule-to-built-in flow | ⏳ TODO (future) | — |
+
+End-to-end validation: scout validated `WINDOW_AVG(SUM([Sales]))` → `Avg([Master/Sales])`
+against the Orders DM, wrote rule to local YAML, build script automatically
+applied the rule on a synthetic `.twb` with that formula (no maintainer
+intervention).

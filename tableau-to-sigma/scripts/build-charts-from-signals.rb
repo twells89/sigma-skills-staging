@@ -51,6 +51,7 @@
 require 'json'
 require 'csv'
 require 'optparse'
+require_relative 'learned-rules'
 
 opts = { master_id: 'master' }
 OptionParser.new do |p|
@@ -149,6 +150,11 @@ end
 layout = JSON.parse(File.read(opts[:layout]))
 mmap   = JSON.parse(File.read(opts[:mmap]))
 meta   = opts[:meta] ? JSON.parse(File.read(opts[:meta])) : { 'worksheets' => {}, 'shared_filters' => [] }
+# Customer-learned rules (~/.tableau-to-sigma/learned-rules.yaml). Empty list
+# is normal for first-time customers — rules accumulate as the gap-scout
+# subagent validates translations.
+LEARNED_RULES = LearnedRules.load
+warn "loaded #{LEARNED_RULES.length} customer-learned rule(s) from #{LearnedRules.rules_path}" if LEARNED_RULES.any?
 gw     = JSON.parse(File.read(File.join(opts[:tab], 'get-workbook.json')))
 views  = gw.dig('views', 'view') || []
 views  = [views] unless views.is_a?(Array)
@@ -731,6 +737,17 @@ layout.each do |dash|
           'formula' => translated
         }
         warnings << "'#{cap}' parameter-driven calc #{c['name']} → translated to Switch: #{translated[0..120]}"
+        next
+      end
+
+      # Try customer-learned rules FIRST — these are translations the scout
+      # subagent has validated against this customer's Sigma site. Anything
+      # here is known-to-work in their context, so it wins over built-in
+      # heuristics. Source: ~/.tableau-to-sigma/learned-rules.yaml (user home,
+      # never clobbered by skill updates).
+      lr_translated, lr_hint = LearnedRules.apply(LEARNED_RULES, formula)
+      if lr_translated
+        warnings << "'#{cap}' learned-rule applied to #{c['name']} → Sigma:  #{lr_translated[0..160]}  [#{lr_hint}]"
         next
       end
 

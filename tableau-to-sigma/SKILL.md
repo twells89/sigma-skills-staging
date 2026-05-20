@@ -147,6 +147,29 @@ Categories emitted:
 Share the markdown report with the customer up front to set expectations.
 Save the JSON for the subagent.
 
+### Phase 0a-scout — spawn the gap-scout subagent for unhandled features
+
+For every `❌ Unhandled` row in the gap report (and for high-volume `⚠️ Hint`
+rows worth automating), spawn a `gap-scout` subagent via the Agent tool. Each
+scout takes ONE gap, proposes a Sigma translation, validates against the
+customer's Sigma site via `scripts/validate-sigma-formula.rb`, and:
+- on success → writes the rule to `~/.tableau-to-sigma/learned-rules.yaml`
+  (the customer's home dir — `git pull` of the skill cannot clobber it).
+  All future workbook conversions on this machine pick up the rule via
+  `scripts/learned-rules.rb` automatically.
+- on failure → writes to `~/.tableau-to-sigma/escalations/` and (Phase 4)
+  files a GitHub issue via `gh`.
+
+The build script (`build-charts-from-signals.rb`) loads learned rules at
+startup; matching rules apply *before* the built-in translators, so customer-
+discovered translations override defaults. See `scripts/gap-scout.md` for the
+full subagent prompt + procedure.
+
+Customer-local files always live under `~/.tableau-to-sigma/`:
+- `learned-rules.yaml`   — accumulated translation rules
+- `escalations/*.yaml`   — gaps the scout couldn't solve
+- (override path for testing with `TABLEAU_TO_SIGMA_HOME` env var)
+
 ---
 
 ## Phase 0 — Estimate cost up front
