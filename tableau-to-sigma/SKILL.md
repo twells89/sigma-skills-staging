@@ -36,8 +36,13 @@ which calc translation, which layout) — not orchestration.
 | `scripts/setup-tableau.rb` | One-time Tableau PAT setup (only needed for PAT mode — see `refs/tableau-rest.md`) |
 | `scripts/get-tableau-token.sh` | One-shot signin → exports `TABLEAU_AUTH_TOKEN` + `TABLEAU_SITE_ID` |
 | `scripts/tableau-discover.rb` | PAT-mode Phase 1 discovery in one CLI: workbook + views + VDS metadata + GraphQL + .twb content |
-| `scripts/parse-twb-layout.rb` | Parse a `.twb` XML file into a per-dashboard zone list. Per chart zone surfaces: position (`x/y/w/h%`), `chart_kind`, `mark_class`, `geo_role`, `sort`, `filters`, `aggregations` (per-column derivation: Sum/Avg/CountD/Month-Trunc/etc.), `channels` (color/size/detail/label encoding). Use as a deterministic Phase 5 layout + chart-config scaffold. |
-| `scripts/build-charts-from-signals.rb` | Generate Sigma chart-element specs from parse-twb-layout output + view CSVs + a master-column map. Honors `sort` (no sort emitted when Tableau had none), `aggregations` (right aggregator per measure: Sum/Avg/Min/Max/Median/CountDistinct), date-truncation (`Month-Trunc` → `DateTrunc("month", …)`), and emits warnings for action filters and color-channel multi-series cases. |
+| `scripts/scan-workbook-gaps.rb` | **Phase 0a (mandatory):** scan a `.twb` and emit `gaps-report.md` + `gaps.json` categorising every feature into ✅ auto / ⚠️ hint / 🛠 manual / ❌ unhandled. Run BEFORE any other phase. |
+| `scripts/gap-scout.md` | **Phase 0a-scout:** subagent prompt + protocol for resolving ❌ Unhandled gaps. Main agent spawns one scout per gap via the Agent tool. |
+| `scripts/validate-sigma-formula.rb` | Scout primitive: POST a tiny test workbook with a candidate formula, read back column types, return JSON `{ status: ok|error }`. Auto-expands the DM element's columns onto the test master so candidate refs to real data resolve. |
+| `scripts/scout-validate-and-persist.rb` | Scout wrapper: call validate-sigma-formula, on success append the rule to `~/.tableau-to-sigma/learned-rules.yaml` (customer's HOME, never the skill repo), on failure write `~/.tableau-to-sigma/escalations/<ts>-<slug>.yaml` AND auto-file a GitHub or beads issue. |
+| `scripts/learned-rules.rb` | Loader module: reads `~/.tableau-to-sigma/learned-rules.yaml` at startup. Customer-discovered rules apply BEFORE the built-in translators in `build-charts-from-signals.rb`. |
+| `scripts/parse-twb-layout.rb` | Parse a `.twb` XML file into a per-dashboard zone list plus a sister `*-meta.json` (worksheets + shared_filters + parameters + column_aliases). Per chart zone surfaces: position (`x/y/w/h%`), `chart_kind`, `mark_class`, `geo_role`, `sort`, `filters` (with resolved column captions + member values + action-vs-value flag), `aggregations`, `channels`, `formats` (Tableau format strings → Sigma d3-format with paren-negative handling), `calculations`, `dual_axis` (synchronized-axes detection), `ref_marks` (reference lines/bands/trendlines), `filter_column_caption`. |
+| `scripts/build-charts-from-signals.rb` | Generate Sigma chart-element specs from parse-twb-layout output + view CSVs + master-column map. Auto-translates: column aliases → `Switch(…)` calc, parameter-driven CASE/IF chains → `Switch([ctl-param-x], …)` with controlId rewrite per page, table calcs (INDEX/LOOKUP/TOTAL/RANK/ZN/IIF/COUNTD) → Sigma equivalents, Tableau formats (p%.%/C1033%/`(neg)`) → Sigma d3-format. Honors `--page-per-worksheet`, `--auto-controls`. Loads customer learned-rules first. Writes `*-actions.md` companion listing Tableau action filters for post-publish cross-filter setup. |
 | `scripts/extract-custom-sql.rb` | Phase 1f: pull Custom SQL blocks behind a workbook via Metadata GraphQL + .twb XML fallback. Output → `/tmp/<name>/custom-sql.json`. |
 | `scripts/lib/tableau_rest.rb` | Ruby wrapper for the Tableau REST endpoints the skill uses |
 | `scripts/estimate-cost.rb` | Predict input/output token cost from workbook + datasource metadata |
@@ -379,7 +384,11 @@ mcp__sigma-mcp-v2__search   query="<table name>"   entityTypes=["table"]
 
 ## Phase 2.5 — Detect view-level filters (mandatory)
 
-> **The Tableau view CSV is the source of truth for what the dashboard *renders* — not what's in the warehouse.** Tableau MCP does not expose worksheet/dashboard filters directly, so you have to **infer them from the data the view emits**. A view that omits part of a dimension's values isn't a coincidence; it's a filter, and you must translate it into Sigma. Skipping this step ships a workbook that "renders fine" but disagrees with the source on totals, axis ticks, or visible categories.
+> **Two sources, in order of authority:**
+> 1. **`parse-twb-layout.rb`'s `*-meta.json`** — `shared_filters` (workbook-level filter shelf) and per-chart `zone.filters` (worksheet-level) carry resolved column captions, member-value lists, and an `is_action` flag distinguishing value filters from cross-chart action filters. `build-charts-from-signals.rb --auto-controls` translates list / relative-date / number-range shared filters into Sigma controls per page automatically.
+> 2. **View CSV ↔ warehouse diff** (legacy fallback) — for `.twbx`-less workbooks or when the agent suspects the parser missed a filter, compare distinct values in the view CSV against the warehouse.
+
+The diff method is still mandatory for any workbook where you don't have the `.twb` content. When you DO have it, trust the parser's filter output first — it carries member values that the CSV can't reveal.
 
 For every dimension column on every view, compare:
 
@@ -538,6 +547,46 @@ On error: read the message → fix the offending column formula → re-validate 
 ---
 
 ## Phase 5 — Build the Sigma workbook
+
+### 5a-auto. Run build-charts-from-signals first
+
+For most workbooks, `build-charts-from-signals.rb` produces a usable starting spec:
+
+```bash
+ruby scripts/build-charts-from-signals.rb \
+  --tableau-dir /tmp/<name> \
+  --layout /tmp/<name>/dashboard-layout.json \
+  --meta /tmp/<name>/dashboard-layout-meta.json \
+  --master-map /tmp/<name>/master-columns.json \
+  --master-element-id master \
+  --auto-controls --page-per-worksheet \
+  --title "<Workbook Title>" \
+  --out /tmp/<name>/chart-specs.json
+```
+
+What the build script auto-handles (no agent action needed):
+- ✅ chart-kind from `mark` class (bar/line/area/pie/scatter/map)
+- ✅ sort direction from `<sort>` (xAxis.sort emitted only when Tableau sorted)
+- ✅ aggregator from `column-instance derivation` (Sum/Avg/CountD/Median)
+- ✅ DateTrunc for `Month-Trunc`/`Year-Trunc` dimensions
+- ✅ Tableau format strings → Sigma d3-format (incl. paren-negative)
+- ✅ Column aliases → `Switch(...)` calc on the chart's dim column
+- ✅ Shared-view filters → per-page Sigma controls (list/date-range/number-range)
+- ✅ Parameters (list domain) → segmented controls
+- ✅ Parameter-driven CASE/IF chains → `Switch([ctl-param-X], ...)` calc
+- ✅ Table calcs INDEX/LOOKUP/TOTAL/RANK/ZN/IIF/COUNTD → Sigma equivalents
+- ✅ Synchronized-axis worksheets → `combo-chart` kind w/ two yAxis groups
+- ✅ Customer-discovered learned-rules from `~/.tableau-to-sigma/learned-rules.yaml`
+
+What WARN lines mean — act on each one:
+- `'X' parameter-driven calc … → translated to Switch: …` — already emitted, no action needed
+- `'X' Tableau table-calc … → Sigma: ...` — copy-paste the formula into a master column if it's used by multiple charts
+- `'X' learned-rule applied to … → Sigma: ...` — already emitted, no action needed
+- `'X' has Tableau reference marks (...)` — manually add Sigma `referenceMarks` to the chart post-publish (see beads-sigma-7ak)
+- `'X' has a color channel on …` — multi-series fan-out: agent emits one yAxis per category in the chart spec
+- `'X' has N Tableau action filter(s) — skipped` — read `<out>-actions.md` and wire Sigma cross-element filtering manually
+- `'X' detected as dual-axis` — auto-emitted as combo-chart; verify the right kind in the readback
+- `parameter '...' is a numeric range — skipped auto-control` — add a number control by hand (blocked on beads-sigma-ebw)
 
 ### 5a. Write the workbook spec
 

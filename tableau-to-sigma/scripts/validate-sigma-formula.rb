@@ -96,21 +96,24 @@ dm_element   = (dm_spec['pages'] || []).flat_map { |p| p['elements'] || [] }
 dm_element_name = dm_element && dm_element['name']
 dm_cols = (dm_element && dm_element['columns']) || []
 
-# Pull column display names from formulas like `[ORDER_FACT/Order Id]` →
-# "Order Id". Each becomes a passthrough column on the test master.
+# Build passthrough master columns from the DM element. Prefer the element-
+# level `name` (which respects any renames the DM author did) over parsing
+# the underlying-table name out of `[SOURCE/Col]` formulas — those two can
+# differ when the DM renames a column.
 master_columns = []
 dm_cols.each do |c|
-  f = c['formula'].to_s
-  m = f.match(/^\[[^\/]+\/([^\]]+)\]$/)
-  if m && dm_element_name
-    name = m[1]
-    slug = name.downcase.gsub(/\W+/, '-').sub(/-$/, '')
-    master_columns << {
-      'id'      => "m-#{slug}",
-      'name'    => name,
-      'formula' => "[#{dm_element_name}/#{name}]"
-    }
+  display_name = c['name']
+  if (display_name.nil? || display_name.empty?) && (m = c['formula'].to_s.match(/^\[[^\/]+\/([^\]]+)\]$/))
+    display_name = m[1]
   end
+  next if display_name.nil? || display_name.empty?
+  next unless dm_element_name
+  slug = display_name.downcase.gsub(/\W+/, '-').sub(/-$/, '')
+  master_columns << {
+    'id'      => "m-#{slug}",
+    'name'    => display_name,
+    'formula' => "[#{dm_element_name}/#{display_name}]"
+  }
 end
 master_columns << { 'id' => 'm-passthrough', 'name' => 'PassThrough', 'formula' => 'RowNumber()' } if master_columns.empty?
 
