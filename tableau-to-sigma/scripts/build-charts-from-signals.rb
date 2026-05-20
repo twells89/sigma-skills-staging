@@ -125,8 +125,12 @@ end
 # Match a CSV header (e.g., "Gross Revenue", "Distinct count of Order Id") to
 # a master-table column using regex map.
 def map_column(header, mmap)
+  # Strip leading/trailing whitespace from the header before matching. Tableau
+  # column captions sometimes carry trailing whitespace (e.g., "Order Date ")
+  # from the source .twb XML — `(?i)^order date$` won't match it without this.
+  h = header.to_s.strip
   mmap.each do |pat, info|
-    return info if Regexp.new(pat).match?(header.to_s)
+    return info if Regexp.new(pat).match?(h)
   end
   nil
 end
@@ -808,9 +812,20 @@ end
 # resolves to this control.
 param_controls = []
 if opts[:auto_controls]
+  # Determine which parameter captions are actually referenced by any worksheet
+  # calc. Tableau workbooks often define orphan parameters (defined but not used
+  # by any calc field) — emitting controls for those clutters the dashboard
+  # with widgets that filter nothing. Skip them.
+  referenced_caps = (meta['worksheets'] || {}).values
+    .flat_map { |w| (w['calculations'] || []).flat_map { |c| c['parameter_refs'] || [] } }
+    .uniq
   (meta['parameters'] || []).each_with_index do |p, i|
     cap = p['caption'].to_s.strip
     next if cap.empty?
+    unless referenced_caps.include?(cap)
+      warnings << "parameter '#{cap}' is defined in Tableau but not referenced by any worksheet calc — skipped auto-control (orphan parameter)"
+      next
+    end
     slug = cap.downcase.gsub(/\W+/, '-').sub(/-$/, '')
     spec = {
       'id'        => "el-param-#{slug}",

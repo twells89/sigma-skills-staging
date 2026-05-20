@@ -101,7 +101,12 @@ end
 # --- .twb fallback (embedded Custom SQL) ---
 if opts[:twb] && File.exist?(opts[:twb])
   twb = REXML::Document.new(File.read(opts[:twb]))
-  twb.elements.each('//datasource/connection') do |conn|
+  # Top-level datasource definitions only — `//datasource` also matches the
+  # `<datasource>` REFERENCE blocks inside every worksheet, and walking those
+  # repeats the same custom-SQL `<relation>` once per worksheet that uses it.
+  # Customer report: a workbook with 28 real datasources got 482 hits. Scope
+  # the XPath to the canonical top-level location.
+  twb.elements.each('/workbook/datasources/datasource/connection') do |conn|
     conn.elements.each(".//relation[@type='text']") do |rel|
       sql = rel.text.to_s.strip
       next if sql.empty?

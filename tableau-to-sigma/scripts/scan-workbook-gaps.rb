@@ -159,7 +159,15 @@ def main
     xml = REXML::Document.new(content)
     n_dash = xml.elements.to_a('//dashboard').count
     n_ws   = xml.elements.to_a('//worksheet').count
-    n_ds   = xml.elements.to_a('//datasource[@caption]').count
+    # Count REAL datasource definitions only — at /workbook/datasources/datasource.
+    # The same `<datasource>` tag also appears inside every `<worksheet>` as a
+    # REFERENCE to that worksheet's source — counting `//datasource` would
+    # multiply by ~(worksheets × datasource-refs-per-worksheet) and over-
+    # report by orders of magnitude (one customer saw 482 reported for 28
+    # actual sources). Also exclude the synthetic `Parameters` source.
+    n_ds = xml.elements.to_a('/workbook/datasources/datasource').count { |d|
+      d.attributes['name'] != 'Parameters' && !d.attributes['name'].to_s.start_with?('Parameters ')
+    }
   rescue StandardError
     n_dash = n_ws = n_ds = '?'
   end
