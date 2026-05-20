@@ -50,6 +50,8 @@ OptionParser.new do |p|
   p.on('--example-from S')         { |v| opts[:example_from] = v }
   p.on('--max-attempts N', Integer){ |v| opts[:max_attempts] = v }
   p.on('--chart-kind S')           { |v| opts[:chart_kind] = v }
+  p.on('--escalate-to S', 'gh | beads | none (default: auto — try gh, then beads)') { |v| opts[:escalate_to] = v }
+  p.on('--github-repo S', 'GitHub repo for issue filing (default: twells89/sigma-skills-staging)') { |v| opts[:github_repo] = v }
 end.parse!
 
 %i[feature pattern template test_formula dm_id el_id].each { |k| abort("missing --#{k.to_s.tr('_','-')}") unless opts[k] }
@@ -107,9 +109,44 @@ else
     'escalated_at'    => Time.now.utc.iso8601
   }
   esc_path = LearnedRules.escalate(payload)
+
+  # Auto-file: try gh first, then beads, then skip.
+  filed_via = nil
+  filed_id  = nil
+  target    = opts[:escalate_to] || 'auto'
+  title = "Tableau→Sigma gap: #{opts[:feature]} (#{opts[:description] || 'no description'})"
+  body  = String.new
+  body << "**Feature:** `#{opts[:feature]}`\n\n"
+  body << "**Tableau pattern:** `#{opts[:pattern]}`\n\n"
+  body << "**Tried Sigma template:** `#{opts[:template]}`\n\n"
+  body << "**Test formula POSTed:** `#{opts[:test_formula]}`\n\n"
+  body << "**Sigma response:**\n```json\n#{JSON.pretty_generate(attempt['result'])}\n```\n\n"
+  body << "**Example source:** #{opts[:example_from] || '(not provided)'}\n\n"
+  body << "**Escalation YAML:** `#{esc_path}`\n\n"
+  body << "_Filed automatically by `scripts/scout-validate-and-persist.rb`._\n"
+
+  if %w[auto gh].include?(target) && system('which gh > /dev/null 2>&1')
+    repo = opts[:github_repo] || 'twells89/sigma-skills-staging'
+    out, _err, st = Open3.capture3('gh', 'issue', 'create', '--repo', repo, '--title', title, '--body', body, '--label', 'tableau-to-sigma,gap-scout-escalation')
+    if st.success?
+      filed_via = 'gh'
+      filed_id  = out.strip.split('/').last
+    end
+  end
+
+  if filed_via.nil? && %w[auto beads].include?(target) && system('which bd > /dev/null 2>&1') && Dir.exist?(File.expand_path('~/.beads-sigma'))
+    out, _err, st = Open3.capture3({ 'PWD' => File.expand_path('~/.beads-sigma') }, 'bd', 'create', title, '--priority', '2', '--labels', 'sigma-converter,tableau-to-sigma,gap-scout-escalation', '--description', body, '--silent', chdir: File.expand_path('~/.beads-sigma'))
+    if st.success?
+      filed_via = 'beads'
+      filed_id  = out.strip
+    end
+  end
+
   puts JSON.pretty_generate({
     'status'          => 'escalated',
     'escalation_path' => esc_path,
+    'filed_via'       => filed_via,
+    'filed_id'        => filed_id,
     'attempts'        => [attempt]
   })
   exit 2
