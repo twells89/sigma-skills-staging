@@ -85,20 +85,41 @@ label   = opts[:label] || 'scout-test-col'
 # against the DM's columns. To validate, we POST and read back the chart's
 # column types.
 
+# Auto-discover the DM element's columns so test formulas that reference real
+# data columns (e.g., `[Master/Gross Revenue]`) resolve cleanly. Without this,
+# the test master only exposes a synthetic PassThrough column and any candidate
+# touching real data fails with a misleading "dependency not found" error.
+dm_spec_resp = http(:get, "/v2/dataModels/#{opts[:dm_id]}/spec")
+dm_spec      = JSON.parse(dm_spec_resp.body) rescue {}
+dm_element   = (dm_spec['pages'] || []).flat_map { |p| p['elements'] || [] }
+                                       .find { |e| e['id'] == opts[:el_id] }
+dm_element_name = dm_element && dm_element['name']
+dm_cols = (dm_element && dm_element['columns']) || []
+
+# Pull column display names from formulas like `[ORDER_FACT/Order Id]` →
+# "Order Id". Each becomes a passthrough column on the test master.
+master_columns = []
+dm_cols.each do |c|
+  f = c['formula'].to_s
+  m = f.match(/^\[[^\/]+\/([^\]]+)\]$/)
+  if m && dm_element_name
+    name = m[1]
+    slug = name.downcase.gsub(/\W+/, '-').sub(/-$/, '')
+    master_columns << {
+      'id'      => "m-#{slug}",
+      'name'    => name,
+      'formula' => "[#{dm_element_name}/#{name}]"
+    }
+  end
+end
+master_columns << { 'id' => 'm-passthrough', 'name' => 'PassThrough', 'formula' => 'RowNumber()' } if master_columns.empty?
+
 master_el = {
-  'id'   => 'master',
-  'kind' => 'table',
-  'name' => 'Master',
-  'source' => { 'kind' => 'data-model', 'dataModelId' => opts[:dm_id], 'elementId' => opts[:el_id] },
-  # We need at least one master column; pull the first one by referencing a
-  # generic field. We can't know the field name without inspecting the DM, so
-  # we expect the caller to embed [Master/<col>] in the formula and let Sigma
-  # complain at validation time if the column doesn't exist. The master
-  # element here just needs to exist with some passthrough column so cross-
-  # element refs from the test chart can resolve.
-  'columns' => [
-    { 'id' => 'm-passthrough', 'formula' => 'RowNumber()', 'name' => 'PassThrough' }
-  ],
+  'id'              => 'master',
+  'kind'            => 'table',
+  'name'            => 'Master',
+  'source'          => { 'kind' => 'data-model', 'dataModelId' => opts[:dm_id], 'elementId' => opts[:el_id] },
+  'columns'         => master_columns,
   'visibleAsSource' => false
 }
 
