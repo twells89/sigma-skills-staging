@@ -184,6 +184,29 @@ Customer-local files always live under `~/.tableau-to-sigma/`:
 - `escalations/*.yaml`   — gaps the scout couldn't solve
 - (override path for testing with `TABLEAU_TO_SIGMA_HOME` env var)
 
+### Phase 0b — Pick the conversion mode (MANDATORY, ask the customer)
+
+Before building anything, **ask the customer which mode they want**. There is
+no good default — picking the wrong one wastes the whole conversion.
+
+| Mode | When | Output |
+|---|---|---|
+| **Dashboard fidelity** (default for dashboard URLs like `/views/<WB>/<Dashboard>`) | Customer wants the source dashboard recreated 1:1 in Sigma | One Sigma page with all charts positioned in the same grid as Tableau; shared filters as page-level controls; layout XML mirrors the dashboard's zone tree |
+| **Page-per-worksheet** (default for `/sheets/<Sheet>` URLs OR when the customer says "split it up") | Customer wants each worksheet adjustable independently, OR the dashboard is too dense to recreate cleanly | One Sigma page per Tableau worksheet; shared filters duplicated on each page |
+
+When the customer's URL is a dashboard URL and they haven't explicitly said
+"split into pages," the agent MUST ask: "Want me to recreate the dashboard
+1:1 (all 6 tiles on one page) or break each worksheet into its own Sigma
+page?" Don't assume.
+
+For dashboard mode, `build-charts-from-signals.rb` is invoked WITHOUT
+`--page-per-worksheet` — that emits the legacy flat-array output. Then a
+separate layout script positions the chart elements in a grid matching the
+Tableau dashboard's zone x/y/w/h percentages (parse-twb-layout already
+extracts these).
+
+For page-per-worksheet mode, pass `--page-per-worksheet`.
+
 ---
 
 ## Phase 0 — Estimate cost up front
