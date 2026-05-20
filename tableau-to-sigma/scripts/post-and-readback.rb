@@ -102,3 +102,24 @@ if res.is_a?(Net::HTTPSuccess)
 else
   warn "WARN: could not fetch /columns for type guard (got HTTP #{res.code}); skipping"
 end
+
+# Phase 6 nag — column-type guard catches formula-resolution errors but does
+# NOT compare data values to Tableau. Phase 6 (mandatory per SKILL.md) is the
+# ONLY thing that confirms the chart actually reproduces the source. Emit a
+# clear next-step prompt so the agent (or human) doesn't silently skip it.
+if opts[:type] == 'workbook'
+  warn ""
+  warn "================================================================"
+  warn "NEXT STEP — Phase 6 (MANDATORY): verify data parity vs Tableau"
+  warn "================================================================"
+  warn "Column-type guard PASSES means formulas RESOLVE. It does NOT mean"
+  warn "the chart values match Tableau's. Run this BEFORE declaring done:"
+  warn ""
+  warn "  ruby scripts/phase6-parity.rb \\"
+  warn "    --tableau <dir-with-views/-and-get-workbook.json> \\"
+  warn "    --workbook-id #{oid}"
+  warn ""
+  warn "Add --extract-mode --extract-tol 0.30 if the Tableau workbook has"
+  warn "a .hyper extract (drift between live + cached data is expected)."
+  warn "================================================================"
+end

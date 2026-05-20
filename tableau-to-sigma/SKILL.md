@@ -758,6 +758,25 @@ PUT preserves existing element IDs. Only newly-added elements get new IDs.
 
 > **A conversion is not complete until Phase 6 has run and either passed or been explicitly accepted with documented divergences.** PUT returning `success: true` only proves the spec parsed — it tells you nothing about whether each chart shows the right numbers. Two recent customer-visible bugs both reached the customer because Phase 6 was skipped: a window-function calc compiling silently as `error` and a pie chart wired to the wrong dimension.
 
+### 6 — one-step (preferred)
+
+```bash
+ruby scripts/phase6-parity.rb \
+  --tableau /tmp/<name> \
+  --workbook-id <sigma-workbook-id>
+# add --extract-mode --extract-tol 0.30 when source workbook has a .hyper extract
+```
+
+This runs everything below as one command: builds the plan, fetches Sigma
+actuals via the workbook elements API, runs the verifier, prints a
+pass/fail summary, writes `/tmp/<name>/parity-final.json`. Exits non-zero
+on divergence. Use this as the default — the per-step path below is for
+debugging.
+
+`scripts/post-and-readback.rb` now prints a "NEXT STEP — Phase 6" prompt
+with the exact invocation at the end of every workbook POST, so the agent
+sees the reminder right after the spec lands. Don't ignore it.
+
 ### 6a. Auto-build a parity plan
 
 Don't hand-write the plan. Use the auto-builder, which matches Sigma chart-element names to Tableau view CSVs and emits a plan keyed by chart:
