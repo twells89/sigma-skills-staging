@@ -827,11 +827,17 @@ if opts[:auto_controls]
       }
       spec['value'] = p['default_value']
     elsif p['param_domain'] == 'range' && %w[integer real].include?(p['datatype'])
-      # Numeric range parameters need a control shape that the workbook spec
-      # API currently doesn't accept under controlType=number. Emit a warning
-      # so the agent can add the control by hand; don't break the spec.
-      warnings << "parameter '#{cap}' is a numeric range (#{p['datatype']}) — skipped auto-control; agent should add a number/range control manually"
-      next
+      # Numeric range parameter → Sigma `number-range` control (discovered by
+      # gap-scout 2026-05-20, beads-sigma-ebw). Two-handle slider; the single-
+      # value Tableau parameter is rendered as a range with handles initially
+      # collapsed to the default. `mode` and `values` don't round-trip on
+      # readback but the workbook renders correctly (known Sigma quirk).
+      spec['controlType'] = 'number-range'
+      spec['mode']        = 'between'
+      min = p['min'] ? (p['datatype'] == 'real' ? p['min'].to_f : p['min'].to_i) : nil
+      max = p['max'] ? (p['datatype'] == 'real' ? p['max'].to_f : p['max'].to_i) : nil
+      spec['values']      = [min, max].compact if min && max
+      warnings << "parameter '#{cap}' is a numeric range — emitted as number-range control (Sigma 2-handle slider; Tableau's single-handle UX needs manual post-publish tweak)"
     elsif p['param_domain'] == 'range' && %w[date datetime].include?(p['datatype'])
       spec['controlType'] = 'date-range'
       spec['mode'] = 'between'

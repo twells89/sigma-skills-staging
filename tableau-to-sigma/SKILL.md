@@ -96,6 +96,8 @@ eval "$(scripts/get-token.sh)"
 > the exported var dies immediately. Keep eval + curl in the same `bash -c '...'`
 > invocation.
 
+> **Inline Python inside bash — DON'T.** Triple-nested escapes (`f"...{e.get(\\\"name\\\")}..."` inside `python3 -c "..."` inside `bash -c '...'`) silently break. Instead **always write a `.py` file with `Write` and call it via `python3 file.py`.** Same rule for any inline script over ~5 lines: write it to disk, then exec. It's not slower, it's deterministic, and the file becomes a reusable artifact. (Same applies to Ruby — prefer `ruby file.rb` over `ruby -e '...'`.)
+
 ### Tableau access — two modes
 
 The skill supports two transports for Tableau-side discovery. **Prefer MCP** when
@@ -153,6 +155,13 @@ Share the markdown report with the customer up front to set expectations.
 Save the JSON for the subagent.
 
 ### Phase 0a-scout — spawn the gap-scout subagent for unhandled features
+
+> **MANDATORY, parallelizable.** As soon as the gap scanner produces `gaps.json`,
+> read the `detected_features` array and **spawn one `gap-scout` Agent per row
+> whose `status` is `unhandled`** (and optionally for high-volume `hint` rows).
+> Use `run_in_background: true` so the scout runs in parallel with the rest of
+> conversion — by the time you reach Phase 5, the scout has either persisted a
+> rule or escalated. Don't read the gap report and proceed without doing this.
 
 For every `❌ Unhandled` row in the gap report (and for high-volume `⚠️ Hint`
 rows worth automating), spawn a `gap-scout` subagent via the Agent tool. Each
