@@ -117,14 +117,22 @@ back to PAT mode.
 ```bash
 eval "$(scripts/get-tableau-token.sh)"
 ruby scripts/tableau-discover.rb \
-  --workbook-name "<name>" \
-  --datasource-name "<name>" \
+  --workbook-id <luid> \
   --out /tmp/<name>
 ```
 
-Produces the same artifacts as MCP-driven Phase 1 (`get-workbook.json`, `ds-metadata.json`,
-`views/*.csv`, dashboard PNG, plus `workbook-content.twb`). Downstream scripts in Phases 2–6
-are unchanged. Full endpoint inventory and gotchas in `refs/tableau-rest.md`.
+Produces the same artifacts as MCP-driven Phase 1 in a single run: `get-workbook.json`,
+`workbook-content.twb`, `ds-metadata.json` + `graphql-fields.json` (VDS field list + GraphQL
+formulas), `views/*.csv` (fetched concurrently), and the dashboard PNG. Downstream scripts
+in Phases 2–6 are unchanged. Full endpoint inventory and gotchas in `refs/tableau-rest.md`.
+
+`--datasource-name` / `--datasource-luid` are **optional** — the script parses the
+downloaded `.twb` for the first non-Parameters `<datasource caption='X'>` and looks it up
+on the site automatically. Pass `--no-auto-ds` to disable, or `--datasource-luid` to force
+a specific datasource when the workbook has multiple.
+
+View CSV fetches run in parallel (6 concurrent threads). The dashboard PNG is fetched solo
+afterward to avoid VizQL session contention.
 
 > **One signin attempt only.** Tableau Cloud invalidates a PAT after 4 consecutive failed
 > signins. `get-tableau-token.sh` runs exactly once; never wrap it in a retry loop.
@@ -234,14 +242,25 @@ against ~10 measured conversions before use in customer quotes.
 
 ## Phase 1 — Discover the Tableau datasource structure
 
-### 1a. Find the datasource
+### 1a. Resolve the name the customer gave you
+
+The customer's name may be a **datasource**, a **workbook**, or a **dashboard view inside a workbook**. Tableau Cloud's search and list endpoints partition by content type, so you have to try each before declaring no match.
 
 ```
-mcp__tableau__search-content   terms="<datasource name>"   filter.contentTypes=["datasource"]
+# Workbook by name
+mcp__tableau__search-content   terms="<name>"   filter.contentTypes=["workbook"]
+
+# Dashboard view by name — falls back to workbook owner via the view's response
+mcp__tableau__list-views       filter="name:eq:<name>"
+
+# Datasource by name
+mcp__tableau__search-content   terms="<name>"   filter.contentTypes=["datasource"]
 mcp__tableau__list-datasources
 ```
 
-### 1b. Find workbooks sourced from it
+If the workbook search returns nothing, **try `list-views` next** — the customer almost certainly named a dashboard sheet (e.g. "Orders Overview") that lives inside a differently-named workbook ("Orders Conversion Test"). The view response includes the parent workbook's LUID.
+
+### 1b. Find workbooks sourced from a datasource
 
 ```
 mcp__tableau__search-content   terms="<datasource name>"   filter.contentTypes=["workbook"]
@@ -624,32 +643,68 @@ What WARN lines mean — act on each one:
 
 > **`folderId` is required here too.**
 
-Source the master table from the data model. **Always set `visibleAsSource: false` on
-the master table** — it is a source for charts, not a table users browse directly.
+#### The two-page rule — master always on a dedicated "Data" page
+
+> **MANDATORY.** Every workbook spec MUST have at least two pages: one named `Data`
+> containing the master table, and one or more *content* pages containing charts,
+> controls, and text. Charts on content pages source the master via cross-page
+> `"elementId": "master"` references. **Do not** place the master alongside charts
+> on a content page — it shows up as a giant table on the dashboard, and users
+> have to manually delete it post-publish.
+
+Spec skeleton (two pages, master on `Data`, all charts on `Orders Overview`):
 
 ```json
 {
-  "id": "master",
-  "kind": "table",
-  "name": "Master",
-  "visibleAsSource": false,
-  "source": {
-    "kind": "data-model",
-    "dataModelId": "<dataModelId>",
-    "elementId": "<elementId from dm-ids.json>"
-  },
-  "columns": [
-    { "id": "c-sales", "formula": "[Orders/Sales]", "name": "Sales" }
-  ],
-  "order": ["c-sales"]
+  "name": "Orders Overview",
+  "folderId": "<folder-id>",
+  "schemaVersion": 1,
+  "pages": [
+    {
+      "id": "page-data",
+      "name": "Data",
+      "elements": [
+        {
+          "id": "master",
+          "kind": "table",
+          "name": "Master",
+          "visibleAsSource": false,
+          "source": {
+            "kind": "data-model",
+            "dataModelId": "<dataModelId>",
+            "elementId": "<elementId from dm-ids.json>"
+          },
+          "columns": [
+            { "id": "m-sales", "formula": "[Order Fact/Sales]", "name": "Sales" }
+          ],
+          "order": ["m-sales"]
+        }
+      ]
+    },
+    {
+      "id": "page-overview",
+      "name": "Orders Overview",
+      "elements": [
+        { "id": "txt-title", "kind": "text", "body": "# Orders Dashboard" },
+        {
+          "id": "el-kpi-sales",
+          "kind": "kpi-chart",
+          "source": { "kind": "table", "elementId": "master" },
+          "columns": [{ "id": "k-sales", "formula": "Sum([Master/Sales])", "name": "Total Sales" }],
+          "value": { "id": "k-sales" }
+        }
+      ]
+    }
+  ]
 }
 ```
 
-Master-table column formulas use the DM element's `name` as prefix (`[Orders/Sales]`, not the element ID).
-
-Charts and KPIs on content pages source the master table and use ITS `name` as prefix.
-Cross-page element references are fully supported — place the master on a hidden "Data"
-page and reference it from every other page's elements via `"elementId": "master"`.
+Rules:
+- Master `kind` is `table`, `visibleAsSource: false`, sourced from the DM element.
+- Master-column formulas use the DM element's `name` as prefix (`[Order Fact/Sales]`, not the element ID).
+- Charts and controls source the master with `"elementId": "master"` regardless of which page they live on — cross-page references are fully supported.
+- Chart-column formulas use the master table's `name` as prefix (`[Master/Sales]`).
+- Layout XML must produce **one `<Page>` tag per page**, including a tiny full-width `<LayoutElement elementId="master" .../>` inside the Data page's `<Page>`.
 
 > **Master-table column scope.** Default: pull every column you've already denormalized
 > in the DM into the master with passthrough formulas. The master is cheap; amending it
@@ -751,6 +806,23 @@ The script:
 - PUTs the full payload back.
 
 PUT preserves existing element IDs. Only newly-added elements get new IDs.
+
+### 5f. Compile-check every element (MANDATORY)
+
+```bash
+bash scripts/verify-workbook.sh <workbookId>
+```
+
+POST is permissive — it accepts specs whose column formulas don't actually resolve at query time. Those failures surface as string literals in the compiled SQL (`'Unknown column "[X]"'` / `'Circular column reference to [X]'`), and the UI renders the element as empty. `post-and-readback.rb`'s column-type guard catches **some** of these (columns whose type resolves as `error`), but not all. `verify-workbook.sh` asks the server's compiler directly via `GET /v2/workbooks/{id}/elements/{eid}/query` and greps the markers — catches everything the spec-level validator misses.
+
+Exit codes:
+- `0` — every queryable element compiles clean
+- `1` — one or more elements have unresolved/circular formula references; fix the offending columns in the spec, re-PUT, re-verify
+- `2` — setup error (missing env, bad workbook ID)
+
+Control elements and other non-queryable kinds are correctly skipped.
+
+This step is mandatory and must run before declaring the conversion done.
 
 ---
 

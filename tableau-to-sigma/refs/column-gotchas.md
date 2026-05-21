@@ -1,5 +1,28 @@
 # Column Naming Gotchas
 
+## Sigma auto-normalizes raw → friendly names on POST
+
+Sigma transforms a column's raw warehouse name into a "friendly name" for formula references, **and the POST validator silently rewrites your formula refs to match**. Verified May 2026 against `aws-api.sigmacomputing.com` — POSTed a DM with four different references to the same column and read the spec back:
+
+| Submitted formula | Server stored as |
+|---|---|
+| `[ORDER_FACT/ORDER_ID]` | `[ORDER_FACT/Order Id]` |
+| `[ORDER_FACT/order_id]` | `[ORDER_FACT/Order Id]` |
+| `[ORDER_FACT/Order Id]` | `[ORDER_FACT/Order Id]` |
+| `[ORDER_FACT/Order_Id]` | `[ORDER_FACT/Order Id]` |
+
+Two normalization rules combine:
+1. **Special chars** stripped — `/`, `-`, `.`, `[`, `]`, leading/trailing whitespace.
+2. **Casing and word boundaries** — `ALL_CAPS_WITH_UNDERSCORES` → title-cased with spaces; `camelCase` → split on case boundaries.
+
+Examples observed: `DATE` → `Date`, `UNIT PRICE` → `Unit Price`, `ORDER_ID` → `Order ID`, `V userId` → `V User Id`, `Net/Gross` → `Net Gross`.
+
+**Practical impact for tableau-to-sigma:** the skill emits raw warehouse refs like `[ORDER_FACT/ORDER_ID]` and they work because of this auto-fix. **Don't fight it** — emit the raw warehouse name, let Sigma normalize. The readback will show you the canonical friendly name if you ever need to write a cross-element ref or controlId.
+
+> **The auto-fix doesn't cover everything.** Some edge cases still produce `Unknown column "[X]"` strings in the compiled SQL — invisible at POST time. Always run `scripts/verify-workbook.sh <workbookId>` after PUT to catch the residue. See Phase 5f in SKILL.md.
+
+**Alternate verification: `mcp__sigma-mcp-v2__describe`.** When you want to inspect a single element's compiled column types + resolved formulas without running the bash script, `describe` with `type: workbook-element` returns DDL like `"col-id" number -- "Friendly Name" | Formula: <resolved formula>`. Columns whose type comes back as `error` are the silent-failure case the auto-normalizer didn't fix. Useful during iterative spec authoring.
+
 ## The slash problem
 
 Sigma uses `/` as the source-prefix separator in formula references: `[TableName/ColumnName]`.
