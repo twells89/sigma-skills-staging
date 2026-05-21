@@ -648,7 +648,11 @@ layout.each do |dash|
       element['color'] = { 'id' => dim_col_obj['id'] }
       element['value'] = { 'id' => meas_col_obj['id'] }
     else
-      x_axis = { 'id' => dim_col_obj['id'] }
+      # Breaking-change-2026-05-21: xAxis takes singular `columnId` (string),
+      # yAxis takes plural `columnIds` (array on the object — NOT array of
+      # objects). The old `xAxis: {id: ...}` / `yAxis: [{id: ...}]` shape
+      # is rejected by the live API on new POSTs.
+      x_axis = { 'columnId' => dim_col_obj['id'] }
       # Sort: only set when Tableau explicitly sorted. parse-twb-layout emits
       # nil when there's no <sort> on the worksheet — leave Sigma's xAxis
       # unsorted in that case (natural order matches Tableau's default).
@@ -658,9 +662,9 @@ layout.each do |dash|
         x_axis['sort'] = { 'by' => meas_col_obj['id'], 'direction' => sigma_dir }
       end
       element['xAxis'] = x_axis
-      y_axis_list = [{ 'id' => meas_col_obj['id'] }]
-      y_axis_list << { 'id' => extra_meas_col['id'] } if extra_meas_col
-      element['yAxis'] = y_axis_list
+      y_column_ids = [meas_col_obj['id']]
+      y_column_ids << extra_meas_col['id'] if extra_meas_col
+      element['yAxis'] = { 'columnIds' => y_column_ids }
     end
 
     # Surface action filters (they get skipped — these are cross-chart actions,

@@ -345,28 +345,28 @@ If you need a spec-only approximation (no manual UI step) and the panel-by dimen
     {"id": "ov-corp", "formula": "Sum(If([Master/Segment] = \"Corporate\", [Master/Sales], Null))", "name": "Corporate"},
     {"id": "ov-home", "formula": "Sum(If([Master/Segment] = \"Home Office\", [Master/Sales], Null))", "name": "Home Office"}
   ],
-  "yAxis": [{"id": "ov-cons"}, {"id": "ov-corp"}, {"id": "ov-home"}],
-  "xAxis": {"id": "ov-date"}
+  "yAxis": {"columnIds": ["ov-cons", "ov-corp", "ov-home"]},
+  "xAxis": {"columnId": "ov-date"}
 }
 ```
 
-`yAxis` (not `measures`) is the correct field for both `line-chart` and `bar-chart`. Using `measures` causes the API to reject the request with `"Invalid array: ...yAxis, got undefined"`.
+**Breaking change 2026-05-21:** `xAxis` takes a singular `columnId` (string); `yAxis` takes plural `columnIds` (array). The OLD `xAxis: {id: ...}` / `yAxis: [{id: ...}]` shape is rejected by the live API on new POSTs. `yAxis` is still the correct field name (not `measures`).
 
 `xAxis` is the canonical x-axis field for both `bar-chart` and `line-chart`. `dimension` is accepted by the API but is not the canonical form. Prefer `xAxis` for both.
 
 ```json
 {
   "kind": "bar-chart",
-  "xAxis": {"id": "bar-city"},
-  "yAxis": [{"id": "bar-sales"}]
+  "xAxis": {"columnId": "bar-city"},
+  "yAxis": {"columnIds": ["bar-sales"]}
 }
 ```
 
 ```json
 {
   "kind": "line-chart",
-  "xAxis": {"id": "lc-month"},
-  "yAxis": [{"id": "lc-sales"}]
+  "xAxis": {"columnId": "lc-month"},
+  "yAxis": {"columnIds": ["lc-sales"]}
 }
 ```
 
@@ -382,8 +382,8 @@ All `yAxis` entries are shown as separate series.
     {"id": "bar-seg",    "name": "Segment",  "formula": "[Master/Segment]"},
     {"id": "bar-sales",  "name": "Sales",    "formula": "Sum([Master/Sales])"}
   ],
-  "xAxis": {"id": "bar-region"},
-  "yAxis": [{"id": "bar-sales"}],
+  "xAxis": {"columnId": "bar-region"},
+  "yAxis": {"columnIds": ["bar-sales"]},
   "color": {"by": "category", "column": "bar-seg"}
 }
 ```
@@ -403,8 +403,8 @@ If you need an explicit one-series-per-category breakdown instead (e.g., for sta
 {
   "kind": "bar-chart",
   "stacking": "stacked",
-  "xAxis": {"id": "bar-region"},
-  "yAxis": [{"id": "bar-cons"}, {"id": "bar-corp"}]
+  "xAxis": {"columnId": "bar-region"},
+  "yAxis": {"columnIds": ["bar-cons", "bar-corp"]}
 }
 ```
 
@@ -421,8 +421,8 @@ Same spec as `line-chart` with `"kind": "area-chart"`. Supports `stacking` with 
     {"id": "a-date",    "formula": "DateTrunc(\"month\", [Master/Order Date])", "name": "Month"},
     {"id": "a-revenue", "formula": "Sum([Master/Sales])", "name": "Revenue"}
   ],
-  "xAxis": {"id": "a-date"},
-  "yAxis": [{"id": "a-revenue"}],
+  "xAxis": {"columnId": "a-date"},
+  "yAxis": {"columnIds": ["a-revenue"]},
   "stacking": "none"
 }
 ```
@@ -440,15 +440,12 @@ entry to render that series as a line instead:
     {"id": "c-rev",     "formula": "Sum([Master/Revenue])", "name": "Revenue"},
     {"id": "c-orders",  "formula": "Count([Master/OrderId])", "name": "Orders"}
   ],
-  "xAxis": {"id": "c-channel"},
-  "yAxis": [
-    {"id": "c-rev"},
-    {"id": "c-orders", "type": "line"}
-  ]
+  "xAxis": {"columnId": "c-channel"},
+  "yAxis": {"columnIds": ["c-rev", "c-orders"]}
 }
 ```
 
-Only `"type": "line"` has been observed. Omitting `type` defaults to bar.
+> **Combo-chart per-series type (`bar` vs `line`) is unverified under the new axis shape (2026-05-21 breaking change).** Under the old shape, per-series `type` lived on each `yAxis` array entry. The new `yAxis: {columnIds: [...]}` has no per-entry slot. The canonical place for per-series type is now to be determined — check `jq '.components.schemas.ComboChart' /tmp/sigma-api.json`. Until verified, emit the columns and let the chart editor handle the per-series type post-publish.
 
 ### Scatter chart
 
@@ -463,12 +460,12 @@ Uses `"kind": "scatter-chart"`. `xAxis` takes a single column ID; `yAxis` is an 
     {"id": "s-qty",    "formula": "Sum([Master/Quantity])", "name": "Quantity"},
     {"id": "s-cat",    "formula": "[Master/Category]",    "name": "Category"}
   ],
-  "xAxis": {"id": "s-sales"},
-  "yAxis": [{"id": "s-profit"}, {"id": "s-qty"}]
+  "xAxis": {"columnId": "s-sales"},
+  "yAxis": {"columnIds": ["s-profit", "s-qty"]}
 }
 ```
 
-Single-measure yAxis (`"yAxis": [{"id": "s-profit"}]`) is also valid — same array shape, one entry.
+Single-measure yAxis (`"yAxis": {"columnIds": ["s-profit"]}`) is also valid — same array shape, one entry.
 
 ### Map elements
 
@@ -573,8 +570,8 @@ If your geo dimension doesn't fit one of the five `regionType` values above (e.g
     {"id": "bar-city",  "formula": "[Master/City]",       "name": "City"},
     {"id": "bar-sales", "formula": "Sum([Master/Sales])", "name": "Sales"}
   ],
-  "yAxis": [{"id": "bar-sales"}],
-  "xAxis": {"id": "bar-city", "sort": {"by": "bar-sales", "direction": "descending"}}
+  "yAxis": {"columnIds": ["bar-sales"]},
+  "xAxis": {"columnId": "bar-city", "sort": {"by": "bar-sales", "direction": "descending"}}
 }
 ```
 
@@ -598,12 +595,10 @@ the chart editor after publish.
 
 **Series `color` on `yAxis` entries is silently accepted but not persisted.** PUT succeeds without error but GET strips the field. Expected shape for when this is wired up:
 ```json
-"yAxis": [
-  {"id": "col-revenue", "color": "#E84393"},
-  {"id": "col-orders", "type": "line", "color": "#2196F3"}
-]
+"yAxis": {"columnIds": ["col-revenue", "col-orders"]}
 ```
-Check GET round-trip before relying on this — when GET starts returning `color`, it's safe to use.
+
+Under the old `yAxis: [{id, color, type}]` array-of-objects shape, per-series color/type were attempted as per-entry fields but PUT-stripped on round-trip. The new `yAxis: {columnIds: [...]}` has no per-entry slot. Per-series color and per-series chart type for combo-chart need a different (still-TBD) field — likely a series-config block keyed by `columnId`. Until verified, set series color via the chart editor post-publish.
 
 ## Element kinds supported
 
@@ -882,8 +877,8 @@ Use a regular `bar-chart` with a manual `If()` bucketing formula as the `xAxis` 
     {"id": "bucket", "formula": "If([Master/Sales] < 100, \"$0-$100\", If([Master/Sales] < 500, \"$100-$500\", \"$500+\"))", "name": "Sales Bucket"},
     {"id": "cnt",    "formula": "Count()", "name": "Orders"}
   ],
-  "xAxis": {"id": "bucket"},
-  "yAxis": [{"id": "cnt"}]
+  "xAxis": {"columnId": "bucket"},
+  "yAxis": {"columnIds": ["cnt"]}
 }
 ```
 
@@ -1080,8 +1075,8 @@ To hard-code a top-N filter on a chart element (not user-adjustable), add a `fil
 {
   "kind": "bar-chart",
   "columns": [...],
-  "xAxis": {"id": "PRODUCT_NAME", "sort": {"by": "nZea2N896k", "direction": "descending"}},
-  "yAxis": [{"id": "nZea2N896k"}],
+  "xAxis": {"columnId": "PRODUCT_NAME", "sort": {"by": "nZea2N896k", "direction": "descending"}},
+  "yAxis": {"columnIds": ["nZea2N896k"]},
   "filters": [{
     "id": "top-10-filter",
     "columnId": "nZea2N896k",

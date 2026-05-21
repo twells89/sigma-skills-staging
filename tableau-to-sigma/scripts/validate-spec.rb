@@ -128,6 +128,17 @@ spec.fetch('pages', []).each do |page|
     if %w[bar-chart line-chart area-chart combo-chart scatter-chart].include?(kind)
       errors << "#{name}: use yAxis not measures for #{kind}" if el['measures']
       errors << "#{name}: #{kind} missing yAxis" unless el['yAxis']
+      # Breaking-change-2026-05-21: xAxis / yAxis took new shape.
+      # OLD (now rejected): xAxis: {id: ...}, yAxis: [{id: ...}]
+      # NEW (required):     xAxis: {columnId: ...}, yAxis: {columnIds: [...]}
+      if (xa = el['xAxis']).is_a?(Hash) && xa['id'] && !xa['columnId']
+        errors << "#{name}: xAxis uses old shape {id: ...} — must be {columnId: ...} (breaking change 2026-05-21)"
+      end
+      if (ya = el['yAxis']).is_a?(Array)
+        errors << "#{name}: yAxis uses old shape [{id: ...}] — must be {columnIds: [...]} (breaking change 2026-05-21)"
+      elsif ya.is_a?(Hash) && !ya['columnIds']
+        errors << "#{name}: yAxis missing columnIds array"
+      end
     end
 
     if kind == 'pivot-table'
