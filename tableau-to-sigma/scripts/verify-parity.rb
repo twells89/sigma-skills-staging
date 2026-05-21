@@ -41,9 +41,46 @@ OptionParser.new do |p|
 end.parse!
 abort('--plan required') unless opts[:plan]
 
+MONTH_NUM = {
+  'january' => 1, 'february' => 2, 'march' => 3, 'april' => 4, 'may' => 5, 'june' => 6,
+  'july' => 7, 'august' => 8, 'september' => 9, 'october' => 10, 'november' => 11, 'december' => 12,
+  'jan' => 1, 'feb' => 2, 'mar' => 3, 'apr' => 4, 'jun' => 6,
+  'jul' => 7, 'aug' => 8, 'sep' => 9, 'sept' => 9, 'oct' => 10, 'nov' => 11, 'dec' => 12
+}.freeze
+
+# Canonicalize date-like dimension values so monthly buckets compare equal across
+# representations (e.g. Sigma raw SQL "2026-01-01T00:00:00.000" vs Tableau view
+# label "January 2026" both → "2026-01"). Non-date strings pass through.
+def canonicalize_dim(v)
+  return v unless v.is_a?(String)
+  s = v.strip
+  # ISO datetime, day=1, midnight → month bucket (T or space separator)
+  if (m = s.match(/\A(\d{4})-(\d{2})-01[T ]00:00:00(?:\.0+)?(?:Z|[+-]\d{2}:?\d{2})?\z/))
+    return "#{m[1]}-#{m[2]}"
+  end
+  # ISO date, first of month → month bucket
+  if (m = s.match(/\A(\d{4})-(\d{2})-01\z/))
+    return "#{m[1]}-#{m[2]}"
+  end
+  # "January 2026" / "Jan 2026"
+  if (m = s.match(/\A([A-Za-z]+)\s+(\d{4})\z/)) && (mnum = MONTH_NUM[m[1].downcase])
+    return format('%s-%02d', m[2], mnum)
+  end
+  # Already-canonical "YYYY-MM"
+  return s if s.match?(/\A\d{4}-\d{2}\z/)
+  v
+end
+
 def round_row(row)
-  # Convert all numerics to Float-rounded so Integer 11 and Float 11.0 compare equal in the set.
-  row.map { |v| v.is_a?(Numeric) ? v.to_f.round(2) : v }
+  # Convert all numerics to Float-rounded so Integer 11 and Float 11.0 compare equal in the set,
+  # and canonicalize date-like dim strings so equivalent monthly buckets match.
+  row.map do |v|
+    if v.is_a?(Numeric)
+      v.to_f.round(2)
+    else
+      canonicalize_dim(v)
+    end
+  end
 end
 
 def strict_compare(exp, act)

@@ -137,6 +137,27 @@ spec.fetch('pages', []).each do |page|
   end
 end
 
+if opts[:type] == 'workbook'
+  spec.fetch('pages', []).each do |page|
+    els = page.fetch('elements', [])
+    masters = els.select do |e|
+      e['kind'] == 'table' &&
+        e['visibleAsSource'] == false &&
+        e.dig('source', 'kind') == 'data-model'
+    end
+    next if masters.empty?
+
+    others = els.reject { |e| masters.include?(e) }
+    unless others.empty?
+      master_names = masters.map { |m| m['name'] || m['id'] }.join(', ')
+      kind_counts = Hash.new(0)
+      others.each { |o| kind_counts[o['kind']] += 1 }
+      other_kinds = kind_counts.map { |k, n| "#{n} #{k}" }.join(', ')
+      errors << "page \"#{page['name'] || page['id']}\" mixes master table(s) [#{master_names}] with #{other_kinds}. Move the master to a dedicated \"Data\" page; charts on content pages reference it via cross-page elementId."
+    end
+  end
+end
+
 errors.each { |e| puts "ERROR: #{e}" }
 puts "--- #{errors.size} errors"
 exit(errors.empty? ? 0 : 1)

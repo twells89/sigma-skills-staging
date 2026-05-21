@@ -33,6 +33,7 @@ OptionParser.new do |o|
   o.on('--workbook-id ID')        { |v| opts[:workbook_id] = v }
   o.on('--datasource-name NAME')  { |v| opts[:datasource_name] = v }
   o.on('--datasource-luid LUID')  { |v| opts[:datasource_luid] = v }
+  o.on('--no-auto-ds', 'Disable .twb-based datasource auto-detect') { opts[:no_auto_ds] = true }
   o.on('--out DIR', 'Output directory (required)') { |v| opts[:out] = v }
   o.on('--skip-images')           { opts[:fetch_view_images] = 'none' }
   o.on('--all-view-images')       { opts[:fetch_view_images] = 'all' }
@@ -59,11 +60,67 @@ warn "wrote get-workbook.json  (id=#{wb['id']} views=#{wb.dig('views', 'view')&.
 views = wb.dig('views', 'view') || []
 views = [views] unless views.is_a?(Array)
 
-# 2. Datasource metadata (VDS + GraphQL)
+# 2a. Download workbook content (.twb / .twbx) FIRST so we can auto-detect
+#     the primary datasource caption from it when --datasource-name is omitted.
+twb_xml = nil
+unless opts[:skip_content]
+  bytes = Tableau.download_workbook_content(wb['id'])
+  if bytes.start_with?("PK\x03\x04")
+    twbx_path = File.join(opts[:out], 'workbook-content.twbx')
+    File.binwrite(twbx_path, bytes)
+    warn "wrote workbook-content.twbx  (#{bytes.bytesize} bytes)"
+
+    require 'tmpdir'
+    Dir.mktmpdir do |tmp|
+      unless system('unzip', '-o', '-q', twbx_path, '-d', tmp)
+        warn '.twbx auto-unzip failed (unzip command not available?); leaving .twbx in place'
+      else
+        inner = Dir.glob(File.join(tmp, '**', '*.twb')).first
+        if inner
+          twb_path = File.join(opts[:out], 'workbook-content.twb')
+          FileUtils.cp(inner, twb_path)
+          warn "extracted workbook-content.twb  (#{File.size(twb_path)} bytes) from .twbx"
+          twb_xml = File.read(twb_path)
+        else
+          warn '.twbx contained no inner .twb — odd'
+        end
+      end
+    end
+  else
+    twb_path = File.join(opts[:out], 'workbook-content.twb')
+    File.binwrite(twb_path, bytes)
+    warn "wrote workbook-content.twb  (#{bytes.bytesize} bytes)"
+    twb_xml = bytes.force_encoding('UTF-8')
+  end
+end
+
+# 2b. Datasource metadata (VDS + GraphQL) — with .twb-based auto-detect
 ds_luid = opts[:datasource_luid]
 if ds_luid.nil? && opts[:datasource_name]
   hit = Tableau.find_datasource_by_name(opts[:datasource_name])
   ds_luid = hit['id'] if hit
+end
+
+if ds_luid.nil? && !opts[:no_auto_ds] && twb_xml
+  # Parse .twb for the first non-Parameters <datasource caption='X'> and try to
+  # find that datasource on the Tableau site. Strip the trailing "+ (...)" Tableau
+  # decoration that virtual-connection-backed datasources get.
+  caption = twb_xml.scan(/<datasource\s+caption='([^']+)'/).flatten
+                   .reject { |c| c == 'Parameters' }
+                   .first
+  if caption
+    bare = caption.sub(/\s*\+?\s*\(New Virtual Connection\)\s*$/i, '').strip
+    %W[#{caption} #{bare}].uniq.each do |cand|
+      hit = Tableau.find_datasource_by_name(cand)
+      if hit
+        ds_luid = hit['id']
+        opts[:datasource_name] = cand
+        warn "auto-detected datasource from .twb: #{cand.inspect} (luid=#{ds_luid})"
+        break
+      end
+    end
+    warn "could not resolve auto-detected datasource caption #{caption.inspect}; pass --datasource-luid to override" if ds_luid.nil?
+  end
 end
 
 if ds_luid
@@ -76,17 +133,31 @@ if ds_luid
   File.write(File.join(opts[:out], 'graphql-fields.json'), JSON.pretty_generate(gql))
   warn 'wrote graphql-fields.json'
 else
-  warn 'no --datasource-luid/--datasource-name supplied; skipping VDS + GraphQL fetches'
+  warn 'no --datasource-luid/--datasource-name supplied (and auto-detect found nothing); skipping VDS + GraphQL fetches'
 end
 
-# 3. View CSVs (all in sequence — REST endpoints handle this fine, unlike MCP image contention)
-views.each do |v|
-  csv = Tableau.view_data(v['id'])
-  File.write(File.join(opts[:out], 'views', "#{v['id']}.csv"), csv)
-  warn "wrote views/#{v['id']}.csv  (#{v['name']})"
-rescue Tableau::Error => e
-  warn "view CSV failed for #{v['name']} (#{v['id']}): #{e.message.lines.first&.chomp}"
+# 3. View CSVs — fire in parallel via threads. REST CSV endpoint handles concurrency
+#    fine, unlike MCP image fetches which contend on VizQL sessions. Cap parallelism
+#    at 6 to be polite to Tableau Cloud.
+require 'thread'
+view_pool = Queue.new
+views.each { |v| view_pool << v }
+csv_threads = Array.new([6, views.size].min) do
+  Thread.new do
+    until view_pool.empty?
+      v = view_pool.pop(true) rescue nil
+      break unless v
+      begin
+        csv = Tableau.view_data(v['id'])
+        File.write(File.join(opts[:out], 'views', "#{v['id']}.csv"), csv)
+        warn "wrote views/#{v['id']}.csv  (#{v['name']})"
+      rescue Tableau::Error => e
+        warn "view CSV failed for #{v['name']} (#{v['id']}): #{e.message.lines.first&.chomp}"
+      end
+    end
+  end
 end
+csv_threads.each(&:join)
 
 # 4. View images
 case opts[:fetch_view_images]
@@ -111,36 +182,6 @@ when 'all'
   end
 end
 
-# 5. Workbook content (.twb XML or .twbx bytes — auto-extract the inner .twb if zipped)
-unless opts[:skip_content]
-  bytes = Tableau.download_workbook_content(wb['id'])
-  if bytes.start_with?("PK\x03\x04")
-    twbx_path = File.join(opts[:out], 'workbook-content.twbx')
-    File.binwrite(twbx_path, bytes)
-    warn "wrote workbook-content.twbx  (#{bytes.bytesize} bytes)"
-
-    # Auto-unzip so downstream scripts (parse-twb-layout, extract-custom-sql) can
-    # always operate on workbook-content.twb without a manual unzip step.
-    require 'tmpdir'
-    Dir.mktmpdir do |tmp|
-      unless system('unzip', '-o', '-q', twbx_path, '-d', tmp)
-        warn '.twbx auto-unzip failed (unzip command not available?); leaving .twbx in place'
-      else
-        inner = Dir.glob(File.join(tmp, '**', '*.twb')).first
-        if inner
-          twb_path = File.join(opts[:out], 'workbook-content.twb')
-          FileUtils.cp(inner, twb_path)
-          warn "extracted workbook-content.twb  (#{File.size(twb_path)} bytes) from .twbx"
-        else
-          warn '.twbx contained no inner .twb — odd'
-        end
-      end
-    end
-  else
-    twb_path = File.join(opts[:out], 'workbook-content.twb')
-    File.binwrite(twb_path, bytes)
-    warn "wrote workbook-content.twb  (#{bytes.bytesize} bytes)"
-  end
-end
+# 5. Workbook content was downloaded earlier (step 2a) so the auto-detect could see it.
 
 warn 'done.'

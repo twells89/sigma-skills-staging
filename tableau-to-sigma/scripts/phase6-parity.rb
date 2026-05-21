@@ -61,7 +61,7 @@ TOK  = ENV['SIGMA_API_TOKEN'] || (
   req['Authorization'] = "Basic #{Base64.strict_encode64("#{cid}:#{cs}")}"
   req['Content-Type']  = 'application/x-www-form-urlencoded'
   req.body = 'grant_type=client_credentials'
-  JSON.parse(Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }).fetch('access_token')
+  JSON.parse(Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }.body).fetch('access_token')
 )
 
 def http_json(path)
