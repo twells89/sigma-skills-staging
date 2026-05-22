@@ -515,6 +515,48 @@ Differences from upstream `sigma-workbooks` charts.md:
 
 `tableau-to-sigma`'s `build-charts-from-signals.rb` auto-emits Tableau `<reference-line>` elements with formula in `{average, median, max, min, sum, count}` as Sigma `refMarks` with formula values, and Tableau `<trendline-model>` elements as Sigma `trendlines` (column = primary measure, model name passed through). Bands, distributions, and percentage-bands are still surfaced as WARN for manual editor wiring.
 
+#### Axis format (`xAxis.format` / `yAxis.format`, verified 2026-05-22)
+
+Both axes accept an optional `format` object. Verified shape from a UI-built workbook readback:
+
+```yaml
+xAxis:
+  columnId: <dim_id>
+  format:
+    marks: tick                   # toggle tick marks
+    scale:
+      type: time                  # time (datetime axis) | linear | log
+      zero: false
+
+yAxis:
+  columnIds: [<meas_id>]
+  format:
+    scale:
+      type: log                   # linear (default) | log
+      domain: { min: <n>, max: <n> }
+      zero: true
+```
+
+**Per-column number format lives on the column entry, NOT on the axis.** Verified shape:
+
+```yaml
+columns:
+  - id: <meas_id>
+    formula: '[Metrics/Total Revenue]'
+    format:
+      kind: number                # number | datetime | percent
+      formatString: "$,.2f"       # d3-format syntax
+      currencySymbol: "$"
+```
+
+`build-charts-from-signals.rb` already emits per-column `format` from Tableau format strings via `tableau_format_to_sigma()` — verified shape matches the live API. **Axis-level scale (log/domain/zero) is NOT auto-emitted yet** — needs Tableau-side parser work plus a `.twb` fixture with explicit log/min/max axis settings to verify the `<format-axis>` XML pattern.
+
+#### Tooltips — confirmed UI-only (verified 2026-05-22)
+
+Tooltip customization is **UI-only**, like trellis. We verified this by deliberately customizing the tooltip panel in a UI-built workbook and re-fetching the spec via the REST API — no `tooltip:` field was written back at any level (chart element, column entry, or page). Sigma's spec API does not persist tooltip config.
+
+**Do not speculatively emit `tooltip:` fields** — they'll be silently dropped. Tableau workbooks with custom tooltips should be flagged with a WARN so the conversion agent can configure the tooltip manually in the Sigma editor post-conversion.
+
 #### Data labels (`dataLabel`, verified 2026-05-22)
 
 `dataLabel` is a separate chart-element field. The minimum required shape — what Sigma writes when the user just enables "show data labels" with no further customization — is **literally one field**:
