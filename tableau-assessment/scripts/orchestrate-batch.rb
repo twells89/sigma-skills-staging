@@ -65,7 +65,9 @@ selected = plan['workbooks'].select { |w| selected_ids.include?(w['workbookId'])
 abort 'no workbooks selected' if selected.empty?
 
 # Group by cluster — one leader per cluster, rest are followers.
-by_cluster = selected.group_by { |w| w['cluster_id'] || "singleton-#{w['workbookId'][0..7]}" }
+by_cluster = selected.group_by do |w|
+  w['cluster_id'] || "singleton-#{w['workbookId'].to_s[0..7].empty? ? 'unknown' : w['workbookId'][0..7]}"
+end
 clusters = by_cluster.map do |cid, members|
   # Highest-score member is the leader (most likely to be representative).
   sorted = members.sort_by { |m| -(m['score'].to_f) }

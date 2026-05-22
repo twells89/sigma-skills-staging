@@ -477,6 +477,8 @@ Skill(
 
 ### Option B — Bulk parallel migration
 
+> **Where to run this:** Option B requires the **`Agent()` tool**, which is only available to a **top-level interactive Claude Code session**. Subagents in a nested context (i.e., when this assessment itself is being driven by a parent `Agent()` call) cannot themselves spawn further `Agent()` calls — they only have `Bash + run_in_background`. If you're nested, do NOT attempt Option B from within; surface the batch-plan to the parent session and let it drive the wave fan-out.
+
 ```bash
 ruby scripts/orchestrate-batch.rb \
   --plan /tmp/assessment-<site>/migration-plan.json \
@@ -490,6 +492,8 @@ This emits `batch-plan.json` with wave-by-wave subagent briefs. The conversation
 1. For each wave in order, **batch its subagents into messages of `--concurrent` parallel `Agent()` calls**. Each `Agent()` gets `subagent_type: "general-purpose"` and the `agent_brief` string from the plan as its `prompt`. Set `run_in_background: true` on all of them — agents in a wave run truly in parallel and the conversation-layer waits for completion notifications.
 2. After every wave completes, run `ruby /tmp/assessment-<site>/batch/aggregate-results.rb` to show the running tally and surface YELLOW (review-needed) and RED (failed) results immediately.
 3. Final aggregation prints the GREEN / YELLOW / RED breakdown and per-workbook Sigma URLs.
+
+> **Mid-batch progress** depends on Agent completion notifications, not stdout streaming. The aggregator only sees completed subagent result lines in `batch-results.jsonl` — there's no in-flight "X% done" indicator. Use the completion notifications themselves as the progress signal.
 
 **Cluster-aware execution**: a cluster's leader subagent runs first (alone or with other clusters' leaders in parallel) so it can build/pick the DM. Followers run in the next wave reusing the leader's DM via `find-or-pick-dm.rb` + `inspect-dm-shape.rb`. Within a cluster, **leaders never run in the same wave as their own followers**. The orchestrator handles this ordering.
 

@@ -73,13 +73,17 @@ def extract_warehouse_tables(twb_path)
 end
 
 # --- workbook side ---
+# Field-name compatibility: shortlist.json uses `luid` for the workbook id.
+# Older formats may have used `workbookId` or `id`. Accept all three.
+# `fetch-all-twbs.rb` writes .twb files at `twbs/<luid>.twb` — match by LUID,
+# NOT by sanitized name (name-matching was the bug that produced 0 DM clusters
+# in the 2026-05-22 e2e validation run).
 workbook_entries = shortlist.map do |w|
   name = w['name']
-  workbookId = w['workbookId'] || w['id']
+  workbookId = w['luid'] || w['workbookId'] || w['id']
   tag = w['tag']
-  # Find the local .twb (fetch-all-twbs.rb names files by sanitized workbook name)
-  twb_candidates = Dir.glob(File.join(twb_dir, '*.twb'))
-  twb_path = twb_candidates.find { |p| File.basename(p, '.twb').gsub(/[^a-z0-9]/i, '').downcase == name.to_s.gsub(/[^a-z0-9]/i, '').downcase }
+  twb_path = workbookId ? File.join(twb_dir, "#{workbookId}.twb") : nil
+  twb_path = nil unless twb_path && File.exist?(twb_path)
   whouse_tables = twb_path ? extract_warehouse_tables(twb_path) : []
   cx = (complexity['workbooks'] || {})[name] || {}
 
