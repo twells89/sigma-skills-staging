@@ -515,6 +515,19 @@ Differences from upstream `sigma-workbooks` charts.md:
 
 `tableau-to-sigma`'s `build-charts-from-signals.rb` auto-emits Tableau `<reference-line>` elements with formula in `{average, median, max, min, sum, count}` as Sigma `refMarks` with formula values, and Tableau `<trendline-model>` elements as Sigma `trendlines` (column = primary measure, model name passed through). Bands, distributions, and percentage-bands are still surfaced as WARN for manual editor wiring.
 
+#### Data labels (`dataLabel`, verified 2026-05-22)
+
+`dataLabel` is a separate chart-element field. The minimum required shape — what Sigma writes when the user just enables "show data labels" with no further customization — is **literally one field**:
+
+```yaml
+dataLabel:
+  labels: shown    # shown | hidden
+```
+
+Optional sub-fields documented in upstream `sigma-workbooks/charts.md` (`labelDisplay`, `valueFormat`, `totals`, plus `seriesDataLabel` on combo-charts) only appear when the user customizes further; omit them on the default-on case. `text` and per-mark formatting are unverified.
+
+`build-charts-from-signals.rb` auto-emits `dataLabel: { labels: shown }` when the Tableau worksheet has a Label or Text encoding channel populated. The worksheet-level "Show Mark Labels" toggle (Worksheet → Show Mark Labels) lives in a separate `.twb` XML node and is **not** detected yet — TODO when a fixture is available.
+
 ### Map elements
 
 Sigma supports two map kinds via spec: **`region-map`** (choropleth — fills named geographic regions) and **`point-map`** (lat/long bubbles or symbols).

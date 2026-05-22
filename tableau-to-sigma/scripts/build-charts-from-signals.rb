@@ -763,6 +763,25 @@ layout.each do |dash|
       warnings << "'#{cap}' has a color channel on #{z['channels']['color']['column']} — chart is single-series; agent should fan-out yAxis with one If() per category (see refs/workbook-layout.md \"Multi-series chart patterns\")"
     end
 
+    # Data labels — verified canonical shape 2026-05-22 against UI-built workbook
+    # (workbookUrlId 5xKqmuAXGooHxRgFrdk6VY): minimum required is just
+    #   dataLabel: { labels: shown }
+    # Optional fields (labelDisplay, valueFormat, totals, seriesDataLabel for
+    # combo) are only present when the user customizes further — leave them off
+    # for the default-on case.
+    #
+    # Tableau signal: Label or Text encoding channel present on the worksheet.
+    # The worksheet-level "Show Mark Labels" toggle (Worksheet menu) lives in a
+    # separate .twb XML node we don't parse yet — TODO: add detection when a
+    # fixture with that toggle is available.
+    if %w[bar-chart line-chart area-chart combo-chart scatter-chart pie-chart donut-chart].include?(kind)
+      has_label_channel = z.dig('channels', 'label', 'column') || z.dig('channels', 'text', 'column')
+      if has_label_channel
+        element['dataLabel'] = { 'labels' => 'shown' }
+        warnings << "'#{cap}' auto-emitted dataLabel:{labels:shown} from Tableau Label/Text encoding — verify formatting (Sigma defaults are minimal)"
+      end
+    end
+
     # Per-chart value filters (skip action filters — already warned above).
     # Translate each non-action filter into a Sigma element-level filter spec
     # using the parser's normalized fields (column_caption, kind, members,
