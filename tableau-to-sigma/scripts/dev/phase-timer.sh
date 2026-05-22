@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
+# DEV / PROFILING ONLY. Do NOT source during real customer conversions —
+# the start/end log lines and phase-timings.json artifact are internal
+# instrumentation noise that's only useful when iterating on the skill
+# itself. Use only when the user explicitly asks for timing data
+# ("time it", "where did the minutes go", "profile this").
+#
 # Lightweight phase-timing helper. Source from a conversion driver and
 # call phase_start / phase_end around each major phase. Call phase_report
 # at the end to flush phase-timings.json.
 #
 # Usage:
-#   source scripts/phase-timer.sh
+#   source scripts/dev/phase-timer.sh
 #   PHASE_TIMINGS_OUT=/tmp/foo/phase-timings.json
 #   phase_start "Phase 1"
 #   ruby scripts/tableau-discover.rb ...
