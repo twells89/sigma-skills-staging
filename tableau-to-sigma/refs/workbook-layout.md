@@ -551,6 +551,23 @@ columns:
 
 `build-charts-from-signals.rb` already emits per-column `format` from Tableau format strings via `tableau_format_to_sigma()` — verified shape matches the live API. **Axis-level scale (log/domain/zero) is NOT auto-emitted yet** — needs Tableau-side parser work plus a `.twb` fixture with explicit log/min/max axis settings to verify the `<format-axis>` XML pattern.
 
+#### Dual-axis combo charts — right-hand scale is UI-only (verified 2026-05-22)
+
+Sigma renders combo-charts with a separate right-hand y-axis scale in the editor, but **the spec API does not persist that secondary axis config**. Verified against a UI-built workbook (workbookUrlId `5xKqmuAXGooHxRgFrdk6VY`) where a true dual-axis chart shows two scales in the UI but the spec readback contains only:
+
+```yaml
+yAxis:
+  columnIds:
+    - <primary_measure_id>            # bare string = bar series on primary axis
+    - { columnId: <other_id>, type: line }   # line series — STILL ON PRIMARY AXIS in spec
+  format:
+    scale: { ... }                    # ONE format block, applies to both
+```
+
+No `series2`, no `secondaryYAxis`, no `axis: series2` on the column entry — all silently dropped. Closest spec-faithful emit for Tableau dual-axis is **combo-chart with both measures sharing the primary axis**; the right-hand scale must be configured manually in the Sigma editor post-conversion. WARN the agent so they know to do that step.
+
+This joins `trellis` and `tooltip` as Sigma's "advanced chart presentation" UI-only features. POSTing speculative dual-axis fields is a dead end.
+
 #### Tooltips — confirmed UI-only (verified 2026-05-22)
 
 Tooltip customization is **UI-only**, like trellis. We verified this by deliberately customizing the tooltip panel in a UI-built workbook and re-fetching the spec via the REST API — no `tooltip:` field was written back at any level (chart element, column entry, or page). Sigma's spec API does not persist tooltip config.
