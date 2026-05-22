@@ -61,6 +61,8 @@ permissions audit, dataset similarity at depth). Those still live in Hakkoda.
 | `scripts/aggregate-complexity.rb` | Run `scan-workbook-gaps.rb` (from tableau-to-sigma) against every `.twb`; emit `complexity.json` |
 | `scripts/build-shortlist.rb` | Cross-tabulate usage × complexity; rank by `value / (1 + cost)`; emit `shortlist.json` |
 | `scripts/render-readout.rb` | Compose final `readout.md` from `inventory.json` + `complexity.json` + `shortlist.json` |
+| `scripts/migration-plan.rb` | Phase 6: combine shortlist + data-sources + .twb warehouse-table extraction into `migration-plan.json` with per-workbook `recommended_path` (`tableau-to-sigma` / `vds-to-snowflake` / `retire` / `blocked`), DM clusters (Jaccard ≥ 0.5 on shared warehouse tables + fact-table overlap), and a suggested first batch. Input contract for the conversion handoff. |
+| `scripts/orchestrate-batch.rb` | Phase 7 (optional): produce a `batch-plan.json` with wave-style scheduling for parallel `tableau-to-sigma` subagent execution. Cluster leaders run first to build/pick their DM; followers reuse via `find-or-pick-dm.rb` + `inspect-dm-shape.rb`. Continue-on-failure. Outputs ready-to-fire `agent_brief` strings for the conversation-layer to pass into `Agent()` calls. |
 
 Scripts that need warehouse-table data (the MCP query-datasource calls against
 Admin Insights) are NOT scripts — the agent fires those directly per the recipes
@@ -420,19 +422,106 @@ Deliverables in `/tmp/assessment-<site>/`:
 
 ---
 
-## Handoff to tableau-to-sigma
+## Phase 6 — Build the migration plan
 
-The migration shortlist is directly consumable by the conversion skill. After
-review, hand the top N workbook LUIDs to `tableau-to-sigma`:
+After `render-readout.rb` finishes, **always** run:
 
-> "Migrate the top 5 from this assessment: <list of workbook URLs>. Use the
-> shortlist's `auto/hint/manual/unhandled` flags to set expectations per
-> workbook."
+```bash
+ruby scripts/migration-plan.rb --out /tmp/assessment-<site>
+```
 
-The conversion skill's Phase 0a (`scan-workbook-gaps.rb`) will produce the SAME
-gap-counts that this assessment already cached, so it can skip re-scanning.
-(Phase 2 enhancement: have `tableau-to-sigma` read this skill's `complexity.json`
-directly when both are present in the same `/tmp/<site>/` dir.)
+This composes `migration-plan.json` from `shortlist.json`, `data-sources.json`, and the cached `.twb`s. Each workbook gets a `recommended_path`:
+
+| `recommended_path` | What it means |
+|---|---|
+| `tableau-to-sigma` | Ready for conversion. ≤5 manual/unhandled features, score > 0. |
+| `tableau-to-sigma-with-scout` | Needs `gap-scout` subagent runs for unhandled calc fields first. |
+| `vds-to-snowflake` | Datasource (not workbook) flagged as `land-in-warehouse` or `red-flag` — best to materialize in Snowflake first, then convert the workbook on top. |
+| `retire` | No usage (accesses=0); recommend not migrating. |
+| `blocked` | >5 manual/unhandled features; needs human rework before automation can help. |
+
+The plan also computes **DM clusters** — workbooks that share warehouse tables (Jaccard ≥ 0.5 + at least one shared `*_FACT`-shaped table). The bulk-conversion orchestrator uses these to share a single Sigma data model across a cluster's workbooks instead of building N redundant DMs.
+
+---
+
+## Phase 7 — Hand off to the next skill (MANDATORY: ask the user)
+
+**After Phase 6, the assessment agent MUST present a `AskUserQuestion` menu** so the user picks the next step. Do NOT silently end the assessment — the user is here to migrate something, surface the choice. Build the menu dynamically from `migration-plan.json`'s summary:
+
+```
+Assessment summary:
+  • N workbooks total, M ready for conversion (score-ranked, top 8 below)
+  • K datasources flagged for VDS→Snowflake first
+  • C DM clusters detected (workbooks sharing warehouse tables)
+
+What next?
+  → Migrate top N dashboards in parallel  [tableau-to-sigma × N subagents]
+  → Migrate one specific dashboard  [pick from list]
+  → Land Tableau datasources in Snowflake first  [tableau-vds-to-snowflake]
+  → Do both: VDS first, then dashboards  [chained]
+  → Just write the readout — act later
+```
+
+Use the `AskUserQuestion` tool to render this. Each option dispatches differently:
+
+### Option A — Single dashboard
+
+User picks one workbook. Invoke the conversion skill in the **same conversation** (not a subagent — agent stays in the assessment thread):
+
+```
+Skill(
+  skill: "tableau-to-sigma",
+  args:  "Convert workbook <luid> (<name>) from the just-finished assessment at /tmp/assessment-<site>. Read /tmp/assessment-<site>/migration-plan.json for the recommended_path, blockers, and warehouse_tables for this workbook. Use the cluster's denorm plan if one exists."
+)
+```
+
+### Option B — Bulk parallel migration
+
+```bash
+ruby scripts/orchestrate-batch.rb \
+  --plan /tmp/assessment-<site>/migration-plan.json \
+  --out  /tmp/assessment-<site>/batch \
+  --concurrent 3 \
+  --limit 8
+```
+
+This emits `batch-plan.json` with wave-by-wave subagent briefs. The conversation-layer agent then:
+
+1. For each wave in order, **batch its subagents into messages of `--concurrent` parallel `Agent()` calls**. Each `Agent()` gets `subagent_type: "general-purpose"` and the `agent_brief` string from the plan as its `prompt`. Set `run_in_background: true` on all of them — agents in a wave run truly in parallel and the conversation-layer waits for completion notifications.
+2. After every wave completes, run `ruby /tmp/assessment-<site>/batch/aggregate-results.rb` to show the running tally and surface YELLOW (review-needed) and RED (failed) results immediately.
+3. Final aggregation prints the GREEN / YELLOW / RED breakdown and per-workbook Sigma URLs.
+
+**Cluster-aware execution**: a cluster's leader subagent runs first (alone or with other clusters' leaders in parallel) so it can build/pick the DM. Followers run in the next wave reusing the leader's DM via `find-or-pick-dm.rb` + `inspect-dm-shape.rb`. Within a cluster, **leaders never run in the same wave as their own followers**. The orchestrator handles this ordering.
+
+**Parity tiers** (continue-on-failure):
+- **GREEN** — workbook posted clean (0 column-errors, `verify-workbook.rb` clean), all chart actuals strict-PASS. Ready to publish.
+- **YELLOW** — workbook posted clean BUT one or more charts diverge in values. Structural conversion succeeded; review numbers before stakeholder.
+- **RED** — column-type errors, POST failure, verify failure, or no actuals fetchable. Auto-files a beads ticket; batch continues.
+
+### Option C — VDS to Snowflake first
+
+User wants to land Tableau-managed datasources into Snowflake before dashboards. Invoke:
+
+```
+Skill(
+  skill: "tableau-vds-to-snowflake",
+  args:  "Land these <K> datasources from /tmp/assessment-<site>/migration-plan.json (each flagged recommended_path=vds-to-snowflake) into Snowflake. After completion, workbooks that source from these datasources become candidates for tableau-to-sigma conversion."
+)
+```
+
+### Option D — Both (chained)
+
+Run Option C, then on completion run Option B. The orchestrator picks workbooks where the source datasources now exist as Snowflake tables.
+
+### Option E — Just write the readout
+
+End the assessment. User will pick this up later.
+
+---
+
+## Pre-Phase-6 enhancement: complexity reuse
+
+The conversion skill's Phase 0a (`scan-workbook-gaps.rb`) produces the same gap-counts this assessment already cached in `complexity.json`. When invoking `tableau-to-sigma` from this assessment's handoff, point it at the assessment dir — the converter can skip re-scanning.
 
 ---
 
