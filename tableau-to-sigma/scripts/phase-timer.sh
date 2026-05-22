@@ -17,8 +17,19 @@
 # This avoids the bash array → python3 -c interpolation problems we hit
 # when phase names contain shell-meaningful characters.
 
-PHASE_TIMINGS_TMP="${PHASE_TIMINGS_TMP:-$(mktemp -t phase-timings.XXXXXX)}"
-: > "$PHASE_TIMINGS_TMP"
+# State file. Two modes:
+# - Caller exports PHASE_TIMINGS_TMP before sourcing → append-only (survives
+#   across separate Bash tool-call blocks in an agent session). This is the
+#   correct usage when phases span multiple shell invocations.
+# - Caller doesn't export → fresh mktemp + truncate (single-shell usage).
+# beads-sigma-hf4: previous version always truncated on source, losing
+# accumulated rows across blocks. Now we only truncate when we created
+# the file in this source.
+if [ -z "${PHASE_TIMINGS_TMP:-}" ]; then
+  PHASE_TIMINGS_TMP=$(mktemp -t phase-timings.XXXXXX)
+  : > "$PHASE_TIMINGS_TMP"
+  export PHASE_TIMINGS_TMP
+fi
 PHASE_CURRENT_NAME=""
 PHASE_CURRENT_START=""
 

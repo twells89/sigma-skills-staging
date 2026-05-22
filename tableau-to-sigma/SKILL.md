@@ -55,9 +55,10 @@ which calc translation, which layout) — not orchestration.
 | `scripts/auto-parity-plan.rb` | Phase 6a: auto-build a parity plan by matching Sigma chart elements to Tableau view CSVs (with `--rename` for renamed tiles). Output → `/tmp/<name>/parity-plan.json` wrapped as `{ extract, charts: [...] }` |
 | `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
 | `scripts/export-chart-png.rb` | Phase 6d (visual): export PNG screenshots of every chart in the converted Sigma workbook via `/v2/workbooks/{wb}/export` → `/v2/query/{q}/download`. Catches visual regressions CSV value parity can miss (silently-dropped log scale, missing data labels, wrong chart kind, palette drift). Output: per-element PNGs + `_manifest.json`. Pair with the Tableau MCP `get-view-image` to side-by-side compare source vs target. |
-| `scripts/find-or-pick-dm.rb` | Phase 1.5: scan existing DMs in the org and recommend reuse when one already covers the workbook's columns. Score = 0.7·column-overlap + 0.2·table-overlap + 0.1·metric-overlap. Parallel-fetches DM specs (~2s for 50 DMs). Output: `dm-match.json` with ranked candidates + recommendation. Non-destructive. Reuse skips Phase 2 + 3 entirely. |
+| `scripts/find-or-pick-dm.rb` | Phase 1.5: scan existing DMs in the org and recommend reuse when one already covers the workbook's columns. Score = 0.7·column-overlap + 0.2·table-overlap + 0.1·metric-overlap. Parallel-fetches DM specs (~2s for 50 DMs). Output: `dm-match.json` with ranked candidates + recommendation. Non-destructive. Reuse skips Phase 2 + 3 entirely. `--auto-pick` flag (with tie-window safety) skips the user-confirm step when there's a clear winner. |
+| `scripts/inspect-dm-shape.rb` | Phase 1.5b (MANDATORY when reusing): inspect the reused DM's element graph and emit a denormalization plan classifying every column as `fact` (direct ref) or `dim` (needs Lookup). Output: `dm-denorm-plan.json` with the exact Lookup formula per dim column. Eliminates the 2–3 min spec-rework loop when the reused DM has separate dim elements (a non-pre-denormalized DM shape). |
 | `scripts/scan-customer-style.rb` | Phase 0c: sample N recent workbooks in the customer's Sigma org and aggregate style signals (color palettes, number-format strings, layout grids, chart-kind mix, dataLabel preference, element naming case, density). Lets the converter emit specs that match house conventions instead of generic defaults. |
-| `scripts/phase-timer.sh` | Source helper for phase timing. `phase_start "<name>"` / `phase_end` around each phase; `phase_report` at the end flushes a JSON summary to `$PHASE_TIMINGS_OUT`. Use to profile real conversions and find the slow phases. |
+| `scripts/phase-timer.sh` | Source helper for phase timing. `phase_start "<name>"` / `phase_end` around each phase; `phase_report` at the end flushes a JSON summary to `$PHASE_TIMINGS_OUT`. Use to profile real conversions and find the slow phases. **Across multiple Bash tool-call blocks** in an agent session, export `PHASE_TIMINGS_TMP=<path>` BEFORE the first source — the helper then appends across blocks instead of starting fresh. |
 | `scripts/lib/layout.rb` | Layout-XML helpers (`gc`, `le`, `page_xml`, `assemble`) — `require`'d by per-workbook layout configs |
 
 ---
@@ -444,6 +445,30 @@ Surface this in your conversation with the user:
 When reusing, jump straight from Phase 1.5 to Phase 5 — the workbook spec's table elements set `source: { kind: data-model, dataModelId: <recommended_dm_id>, elementId: <chosen-element-id> }` and use formula prefixes derived from the existing DM's element name (e.g. `[Plugs Sales/Revenue]`).
 
 The picker is **non-destructive** — it never modifies any DM. The downstream phase decides reuse vs build.
+
+### Phase 1.5b — DM-shape preflight (MANDATORY when reusing)
+
+> **Before writing the workbook spec, inspect the reused DM's element graph.** Skipping this is the single biggest source of conversion-time waste — a workbook POST that fails with `Cannot resolve columns on table master: dependency not found: formula reference customer_dim/region` forces 2–3 minutes of spec-rework.
+
+Run:
+```bash
+ruby scripts/inspect-dm-shape.rb \
+  --dm-id <recommended_dm_id> \
+  --out /tmp/<name>/dm-denorm-plan.json
+```
+
+The plan classifies every column on the DM as either:
+- **`location: "fact"`** — already on the fact element, reference directly as `[Master/<col>]`
+- **`location: "dim"`** — lives on a separate dim element, must use `Lookup([<DimElement>/<col>], [Master/<FK>], [<DimElement>/<PK>])`
+
+For each dim column in `dm-denorm-plan.json`, the script provides the exact Lookup formula. When writing the workbook master table:
+1. The primary master table sources from the fact element (use the `fact_element.id` from the plan).
+2. For each dim element referenced by the workbook's worksheets, add a **hidden master table** sourcing that dim element (`visibleAsSource: false`).
+3. Master-column formulas use the plan's `column_resolution["<col>"].formula` verbatim.
+
+The plan also surfaces `unmatched_dim_elements` — dim elements with no detectable FK on the fact (often calendar tables). If a worksheet references columns from one of these, you'll need to manually identify the join key.
+
+Measured 2026-05-22 against the same Tableau workbook in two consecutive conversions: the run that skipped this preflight rewound 130s (21.5% of total) on the failed-POST rework path. The plan computes in ~1s and eliminates that overhead.
 
 ---
 
@@ -911,7 +936,7 @@ The output is wrapped as `{ "extract": <bool>, "charts": [...] }` — the `extra
 
 ### 6b. Fetch Sigma actuals
 
-For every chart in the plan that lacks an `actual` key, query Sigma and paste the result rows:
+For every chart in the plan that lacks an `actual` key, query Sigma via the MCP tool. **Fire all N chart queries in a SINGLE parallel tool-use batch** — one message with N `mcp__sigma-mcp-v2__query` tool blocks side-by-side. Each individual query takes ~5–20s; parallel cap is bounded by the slowest one, sequential is N × that.
 
 ```
 mcp__sigma-mcp-v2__query  type="workbook"  workbookId="<wbId>"
@@ -919,6 +944,8 @@ mcp__sigma-mcp-v2__query  type="workbook"  workbookId="<wbId>"
 ```
 
 The plan file pre-populates `sql_template` and `workbookId` on each chart — just run the SQL and paste the resulting rows under `"actual": { "rows": [...] }`.
+
+> **DO NOT try to fetch actuals via REST.** `POST /v2/workbooks/{wb}/query` does not exist (returns `errorcause: UnmatchedHandler` with empty body — silent failure). The MCP path is canonical. An earlier version of `auto-parity-plan.rb` tried this REST endpoint with a silent-rescue clause; that was a bug, removed in beads-sigma-s04.
 
 > **A chart element's SQL view exposes only that chart's own columns.** A `WHERE "m-order-date-key" BETWEEN ...` against `el-rev-by-region` fails with `Unresolved column`. Two ways to handle:
 > - Query the master table directly (`FROM "workbook"."master"`) and aggregate in SQL.

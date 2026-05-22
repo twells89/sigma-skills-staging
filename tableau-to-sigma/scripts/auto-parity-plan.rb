@@ -117,51 +117,22 @@ sigma_charts.each do |el|
   plan_entries << entry
 end
 
-# Optional: pre-fetch actuals via Sigma REST workbook query endpoint.
-# Parallel-fire with 5 threads + Cloudflare-429 exponential backoff (same
-# envelope as find-or-pick-dm.rb / verify-workbook.rb). beads-sigma-94e.
-# Measured pattern: 5 sequential queries × ~20s each = ~100s; parallel
-# should bring this to ~25-30s (bounded by slowest single query).
-unless opts[:no_fetch]
-  if ENV['SIGMA_API_TOKEN'] && ENV['SIGMA_BASE_URL'] && opts[:wb_id]
-    require 'thread'
-    queue = Queue.new
-    plan_entries.each { |e| queue << e if e['sql_template'] }
-
-    threads = 5.times.map do
-      Thread.new do
-        until queue.empty?
-          entry = queue.pop(true) rescue nil
-          break unless entry
-          uri = URI("#{ENV['SIGMA_BASE_URL']}/v2/workbooks/#{opts[:wb_id]}/query")
-          4.times do |attempt|
-            req = Net::HTTP::Post.new(uri,
-                    'Authorization' => "Bearer #{ENV['SIGMA_API_TOKEN']}",
-                    'Accept'        => 'application/json',
-                    'Content-Type'  => 'application/json')
-            req.body = { sql: entry['sql_template'] }.to_json
-            begin
-              res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
-              code = res.code.to_i
-              if res.is_a?(Net::HTTPSuccess)
-                parsed = JSON.parse(res.body) rescue {}
-                entry['actual'] = { 'rows' => parsed['rows'] } if parsed['rows']
-                break
-              elsif code == 429 || code >= 500
-                sleep 0.5 * (2 ** attempt)   # 0.5, 1, 2, 4s
-              else
-                break
-              end
-            rescue StandardError
-              break  # silent — actuals can be added manually
-            end
-          end
-        end
-      end
-    end
-    threads.each(&:join)
-  end
-end
+# NOTE: an earlier version of this script tried to pre-fetch actuals via
+# POST /v2/workbooks/{wb}/query (REST). That endpoint does NOT exist on
+# Sigma's public REST API — it returns `errorcause: UnmatchedHandler` with
+# an empty body, which was silently swallowed by the rescue clause. The
+# canonical path to fetch chart actuals is the MCP tool
+# `mcp__sigma-mcp-v2__query` (Sigma's official MCP server, which goes
+# through the internal query layer). Fire it from the agent's conversation
+# layer — see phase6-parity.rb for the call shape per chart, and the
+# Phase 6c documentation in SKILL.md for parallel-batch guidance.
+#
+# This script intentionally leaves entry['actual'] unset; the agent fills
+# it after running the MCP queries in parallel (single tool-use message
+# with N parallel tool calls). beads-sigma-s04.
+puts "  NOTE: actuals must be fetched via mcp__sigma-mcp-v2__query (MCP), not REST."
+puts "        Fire all #{plan_entries.size} per-chart queries in ONE parallel tool-use batch,"
+puts "        then merge the rows into the parity plan's actual.rows arrays."
 
 # Wrap output
 output = { 'extract' => extract, 'charts' => plan_entries }
@@ -170,5 +141,5 @@ File.write(opts[:out], JSON.pretty_generate(output))
 puts "wrote #{opts[:out]}"
 puts "  charts matched: #{plan_entries.size}"
 puts "  extract flag:   #{extract}"
-prefetched = plan_entries.count { |e| e['actual'] }
-puts "  actuals pre-fetched: #{prefetched}/#{plan_entries.size}#{prefetched.zero? ? '  (paste actuals manually via mcp__sigma-mcp-v2__query, or run with --workbook-id and a healthy Sigma REST query endpoint)' : ''}"
+puts "  next: fire mcp__sigma-mcp-v2__query for each chart in parallel (one tool-use batch),"
+puts "        then merge the result rows into the parity plan and run verify-parity.rb."
