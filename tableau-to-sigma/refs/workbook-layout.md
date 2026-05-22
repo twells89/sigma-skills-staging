@@ -549,7 +549,23 @@ columns:
       currencySymbol: "$"
 ```
 
-`build-charts-from-signals.rb` already emits per-column `format` from Tableau format strings via `tableau_format_to_sigma()` — verified shape matches the live API. **Axis-level scale (log/domain/zero) is NOT auto-emitted yet** — needs Tableau-side parser work plus a `.twb` fixture with explicit log/min/max axis settings to verify the `<format-axis>` XML pattern.
+`build-charts-from-signals.rb` already emits per-column `format` from Tableau format strings via `tableau_format_to_sigma()` — verified shape matches the live API. **Axis-level scale (log/domain/min/max) is now auto-emitted** (2026-05-22, verified against "Orders Conversion Test" workbook).
+
+Tableau emits axis range/scale overrides inside the worksheet style block:
+
+```xml
+<style-rule element='axis'>
+  <encoding attr='space' class='0'
+            scope='rows'                  scope='rows'→yAxis, 'cols'→xAxis
+            class='0'                     0=primary, 1=secondary (dual-axis)
+            scale='log'                   log scale (otherwise linear)
+            range-type='fixed'            'fixed' honors min/max, 'automatic' omits domain
+            min='1000.0' max='21015.17'   numeric bounds
+            field='...' field-type='quantitative' />
+</style-rule>
+```
+
+`parse-twb-layout.rb` extracts these into `axis_formats: [{scope, class, scale, range_type, min, max, field}]` on each chart zone. `build-charts-from-signals.rb` consumes them and emits `xAxis.format.scale` / `yAxis.format.scale`. Currently only `class='0'` (primary axis) is emitted; `class='1'` (secondary right axis on dual-axis combo) is parsed but not emitted because the Sigma-side right-axis format field is still unverified.
 
 #### Dual-axis combo charts (verified 2026-05-22, retraction of prior "UI-only" finding)
 
@@ -595,7 +611,18 @@ dataLabel:
 
 Optional sub-fields documented in upstream `sigma-workbooks/charts.md` (`labelDisplay`, `valueFormat`, `totals`, plus `seriesDataLabel` on combo-charts) only appear when the user customizes further; omit them on the default-on case. `text` and per-mark formatting are unverified.
 
-`build-charts-from-signals.rb` auto-emits `dataLabel: { labels: shown }` when the Tableau worksheet has a Label or Text encoding channel populated. The worksheet-level "Show Mark Labels" toggle (Worksheet → Show Mark Labels) lives in a separate `.twb` XML node and is **not** detected yet — TODO when a fixture is available.
+`build-charts-from-signals.rb` auto-emits `dataLabel: { labels: shown }` when ANY of these Tableau signals is present:
+
+1. Label or Text encoding channel populated (drag-to-shelf)
+2. Worksheet-level "Show Mark Labels" toggle. Tableau XML (verified 2026-05-22 against "Orders Conversion Test"):
+
+```xml
+<pane><style><style-rule element='mark'>
+  <format attr='mark-labels-show' value='true' />
+</style-rule></style></pane>
+```
+
+`parse-twb-layout.rb` surfaces this as `mark_labels_show: true` on the chart zone; the emitter ORs it with the encoding-channel path.
 
 ### Map elements
 

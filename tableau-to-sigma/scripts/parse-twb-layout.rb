@@ -226,11 +226,33 @@ xml.elements.each('//worksheet') do |ws|
   #                            are 2+ distinct quantitative measures
   #   measures:  [{column, derivation}]
   axis_synced = false
+  # Axis range/scale/log overrides. Tableau emits these inside
+  #   <style-rule element='axis'><encoding attr='space' .../></style-rule>
+  # Attributes we extract:
+  #   scope='rows'|'cols'           → which Sigma axis: rows→yAxis, cols→xAxis
+  #   class='0'|'1'                 → axis index: 0=primary, 1=secondary (dual-axis)
+  #   scale='log'                   → log scale (otherwise linear)
+  #   range-type='fixed'|'automatic'→ when 'fixed', honor min/max
+  #   min='...' max='...'           → numeric bounds (only meaningful when fixed)
+  # Verified against "Orders Conversion Test" workbook (2026-05-22).
+  axis_formats = []
   ws.elements.each('.//style-rule[@element="axis"]/encoding') do |e|
-    if e.attributes['synchronized'].to_s == 'true'
+    a = e.attributes
+    if a['synchronized'].to_s == 'true'
       axis_synced = true
-      break
     end
+    next unless a['attr'].to_s == 'space'
+    next unless %w[rows cols].include?(a['scope'].to_s)
+    af = {
+      'scope'      => a['scope'].to_s,
+      'class'      => a['class'].to_s,
+      'scale'      => a['scale']&.to_s,
+      'range_type' => a['range-type']&.to_s,
+      'field'      => a['field']&.to_s
+    }
+    af['min'] = a['min'].to_f if a['min']
+    af['max'] = a['max'].to_f if a['max']
+    axis_formats << af.compact
   end
   measures = []
   ws.elements.each('.//column-instance') do |ci|
@@ -328,21 +350,36 @@ xml.elements.each('//worksheet') do |ws|
     }
   end
 
+  # Worksheet-level "Show Mark Labels" toggle. Tableau emits this on the
+  # worksheet's pane style:
+  #   <pane><style><style-rule element='mark'>
+  #     <format attr='mark-labels-show' value='true' />
+  # Verified against "Orders Conversion Test" workbook (2026-05-22).
+  mark_labels_show = false
+  ws.elements.each(".//pane//style-rule[@element='mark']/format") do |f|
+    if f.attributes['attr'].to_s == 'mark-labels-show' && f.attributes['value'].to_s == 'true'
+      mark_labels_show = true
+      break
+    end
+  end
+
   worksheets[name] = {
-    mark_class:    mark_class,
-    geo_role:      geo_role,
-    has_lat:       has_lat,
-    has_long:      has_long,
-    has_geometry:  has_geometry,
-    sort:          sort_info,
-    filters:       filters_info,
-    aggregations:  aggregations,
-    channels:      channels,
-    formats:       formats,
-    calculations:  calcs,
-    dual_axis:     dual_axis,
-    measures:      measures.uniq { |m| m['column'] },
-    ref_marks:     ref_marks
+    mark_class:       mark_class,
+    geo_role:         geo_role,
+    has_lat:          has_lat,
+    has_long:         has_long,
+    has_geometry:     has_geometry,
+    sort:             sort_info,
+    filters:          filters_info,
+    aggregations:     aggregations,
+    channels:         channels,
+    formats:          formats,
+    calculations:     calcs,
+    dual_axis:        dual_axis,
+    measures:         measures.uniq { |m| m['column'] },
+    ref_marks:        ref_marks,
+    axis_formats:     axis_formats,
+    mark_labels_show: mark_labels_show
   }
 end
 
@@ -511,6 +548,8 @@ xml.elements.each('//dashboard') do |d|
       'dual_axis'    => (kind == 'chart' ? ws_meta&.dig(:dual_axis)     : nil),
       'measures'     => (kind == 'chart' ? ws_meta&.dig(:measures)      : nil),
       'ref_marks'    => (kind == 'chart' ? ws_meta&.dig(:ref_marks)     : nil),
+      'axis_formats' => (kind == 'chart' ? ws_meta&.dig(:axis_formats)  : nil),
+      'mark_labels_show' => (kind == 'chart' ? ws_meta&.dig(:mark_labels_show) : nil),
       # Resolved filter target (filter/parameter zones only)
       'filter_column_caption'  => (kind == 'filter' || kind == 'parameter' ? filter_col_caption  : nil),
       'filter_column_datatype' => (kind == 'filter' || kind == 'parameter' ? filter_col_datatype : nil)
@@ -553,6 +592,8 @@ if dashboards.empty? && !worksheets.empty?
         'dual_axis'    => ws_meta[:dual_axis],
         'measures'     => ws_meta[:measures],
         'ref_marks'    => ws_meta[:ref_marks],
+        'axis_formats' => ws_meta[:axis_formats],
+        'mark_labels_show' => ws_meta[:mark_labels_show],
         'filter_column_caption'  => nil,
         'filter_column_datatype' => nil
       }]

@@ -754,6 +754,28 @@ layout.each do |dash|
           extra_meas_col['id'])
       end
       element['yAxis'] = { 'columnIds' => y_column_ids }
+
+      # Axis format (log scale, fixed min/max). parse-twb-layout extracts these
+      # from Tableau's <style-rule element='axis'><encoding attr='space' ...>
+      # nodes per worksheet. Sigma side shape verified 2026-05-22:
+      #   format: { scale: { type: log | linear, domain: {min, max}, zero } }
+      # Tableau→Sigma scope mapping: rows→yAxis, cols→xAxis. class='0' is
+      # primary, class='1' is secondary (dual-axis right side, currently
+      # unverified from Sigma side — emit primary only for now).
+      (z['axis_formats'] || []).each do |af|
+        next unless af['class'].to_s == '0'  # primary only
+        target = af['scope'] == 'rows' ? 'yAxis' : 'xAxis'
+        scale = {}
+        scale['type']   = 'log' if af['scale'] == 'log'
+        if af['range_type'] == 'fixed' && af['min'] && af['max']
+          scale['domain'] = { 'min' => af['min'], 'max' => af['max'] }
+        end
+        next if scale.empty?
+        element[target] ||= {}
+        element[target]['format'] ||= {}
+        element[target]['format']['scale'] = scale
+        warnings << "'#{cap}' auto-emitted #{target}.format.scale from Tableau axis override (scale=#{af['scale']}, range=#{af['range_type']}) — verify visual fidelity"
+      end
     end
 
     # Surface action filters (they get skipped — these are cross-chart actions,
@@ -775,19 +797,19 @@ layout.each do |dash|
     # Data labels — verified canonical shape 2026-05-22 against UI-built workbook
     # (workbookUrlId 5xKqmuAXGooHxRgFrdk6VY): minimum required is just
     #   dataLabel: { labels: shown }
-    # Optional fields (labelDisplay, valueFormat, totals, seriesDataLabel for
-    # combo) are only present when the user customizes further — leave them off
-    # for the default-on case.
-    #
-    # Tableau signal: Label or Text encoding channel present on the worksheet.
-    # The worksheet-level "Show Mark Labels" toggle (Worksheet menu) lives in a
-    # separate .twb XML node we don't parse yet — TODO: add detection when a
-    # fixture with that toggle is available.
+    # Two Tableau signals trigger this:
+    #   1. Label or Text encoding channel on the worksheet (drag-to-shelf)
+    #   2. Worksheet-level "Show Mark Labels" toggle, surfaced by parse-twb-layout
+    #      from <pane><style><style-rule element='mark'>
+    #             <format attr='mark-labels-show' value='true'/>
+    #      (verified against "Orders Conversion Test" workbook, 2026-05-22)
     if %w[bar-chart line-chart area-chart combo-chart scatter-chart pie-chart donut-chart].include?(kind)
       has_label_channel = z.dig('channels', 'label', 'column') || z.dig('channels', 'text', 'column')
-      if has_label_channel
+      has_mark_labels   = z['mark_labels_show'] == true
+      if has_label_channel || has_mark_labels
         element['dataLabel'] = { 'labels' => 'shown' }
-        warnings << "'#{cap}' auto-emitted dataLabel:{labels:shown} from Tableau Label/Text encoding — verify formatting (Sigma defaults are minimal)"
+        src = has_label_channel ? 'Label/Text encoding' : 'worksheet "Show Mark Labels" toggle'
+        warnings << "'#{cap}' auto-emitted dataLabel:{labels:shown} from Tableau #{src} — verify formatting (Sigma defaults are minimal)"
       end
     end
 

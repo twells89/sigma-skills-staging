@@ -57,6 +57,10 @@ INVENTORY = [
     status: :auto, blurb: 'Auto-translated to Sigma RowNumber/Lag/Lead/Rank/Coalesce/If/CountDistinct.' },
   { name: 'Negative number format (parens)',           pat: /;\s*\([^)]*\)/,
     status: :auto, blurb: 'Parens-on-negative segment translates to Sigma d3-format with ( prefix.' },
+  { name: 'Axis range / scale override (log, fixed min/max)', pat: /<encoding\s+attr='space'[^>]*(?:scale='log'|range-type='fixed')/,
+    status: :auto, blurb: 'Per-axis log scale and fixed min/max translate to Sigma xAxis/yAxis format.scale (type / domain).' },
+  { name: 'Show Mark Labels worksheet toggle',         pat: /<format\s+attr='mark-labels-show'\s+value='true'/,
+    status: :auto, blurb: "Worksheet-level Show Mark Labels toggle emits Sigma dataLabel:{labels:shown}." },
 
   # HINT — surfaces a translated formula or setup note as a WARN; agent acts
   { name: 'IF/ELSEIF chain calc',                      pat: /\bIF\b[^']+\bELSEIF\b[^']+\bEND\b/i,
