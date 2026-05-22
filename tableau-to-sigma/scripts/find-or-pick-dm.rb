@@ -38,11 +38,12 @@ require 'net/http'
 require 'uri'
 require 'optparse'
 
-# Default limit 50: perf testing (2026-05-22) showed the picker's top-score
-# saturates by ~25 DMs in this org, and the per-DM cost elbows hard after 50
-# (0.065s/DM → 0.25s/DM — likely Sigma falls off a cached-spec hot path).
-# limit=50 finishes in ~3s; limit=200 took 40s with no score improvement.
-opts = { limit: 50, min_score: 0.6 }
+# Default limit 25: perf testing (2026-05-22) showed the picker's top-score
+# saturates by ~25 DMs in this org; the wall-time curve elbows hard after 50
+# (0.065s/DM → 0.25s/DM — Sigma drops off a cached-spec hot path). limit=25
+# finishes in ~2s. Earlier default was 50; dropping to 25 saves ~12s per
+# picker run with no score regression. beads-sigma-3kw.
+opts = { limit: 25, min_score: 0.6 }
 OptionParser.new do |p|
   p.on('--workbook-signature P') { |v| opts[:sig]      = v }
   p.on('--out P')                { |v| opts[:out]      = v }
@@ -84,9 +85,17 @@ if opts[:force_new]
   exit 1
 end
 
-# 1. List existing data models.
+# 1. List ALL data models, then sort deterministically before applying --limit.
+# Sigma's /v2/dataModels list endpoint returns server page-order, not
+# relevance order. Without a stable client-side sort, the same workbook
+# picks different candidates on different runs (observed: 3 conversions of
+# the same Tableau workbook reached 3 different recommendations). Fix:
+# fetch all DMs (cheap — one list call per 100), sort by updatedAt desc
+# (recent DMs are usually more relevant), then take the first --limit for
+# parallel spec-fetch + scoring. Stable tiebreaker by name. beads-sigma-3kw.
 all_dms = []
 page = nil
+hard_cap = 500
 loop do
   qs = "limit=100"
   qs += "&page=#{page}" if page
@@ -96,11 +105,18 @@ loop do
   rows = data['entries'] || data['dataModels'] || []
   break if rows.empty?
   all_dms.concat(rows)
-  break if all_dms.size >= opts[:limit]
+  break if all_dms.size >= hard_cap
   page = data['nextPage']
   break if page.nil? || page.empty?
 end
-warn "scanning #{[all_dms.size, opts[:limit]].min} of #{all_dms.size} data models"
+
+# Deterministic ranking: updatedAt desc, then name asc.
+all_dms = all_dms.sort_by do |dm|
+  [-(Time.parse(dm['updatedAt'].to_s).to_i rescue 0), dm['name'].to_s]
+end
+require 'time'   # ensure Time.parse loaded (rescue covers if not)
+
+warn "found #{all_dms.size} total DMs; scoring top #{[all_dms.size, opts[:limit]].min} by updatedAt"
 
 # 2. Fetch each DM's spec and extract its signature (tables + columns + metrics).
 def normalize_fqn(s)
