@@ -31,7 +31,19 @@ spec = JSON.parse(File.read(ARGV[0]))
 external_names = []  # element names that are sources OUTSIDE this spec (e.g., DM elements when validating a workbook)
 if opts[:type] == 'workbook' && opts[:dm_context]
   ctx = JSON.parse(File.read(opts[:dm_context]))
-  external_names.concat(ctx.fetch('pages', []).flat_map { |p| p.fetch('elements', []).map { |e| e['name'] } }.compact)
+  # Accept both shapes:
+  #   - post-and-readback.rb output: { pages: [{ elements: [...] }] }
+  #   - flat element list:           { elements: [...] }   (legacy / hand-written)
+  if ctx['pages'].is_a?(Array)
+    external_names.concat(ctx['pages'].flat_map { |p| p.fetch('elements', []).map { |e| e['name'] } }.compact)
+  elsif ctx['elements'].is_a?(Array)
+    external_names.concat(ctx['elements'].map { |e| e['name'] }.compact)
+  end
+  if external_names.empty?
+    abort "validate-spec.rb: --dm-context loaded 0 element names from #{opts[:dm_context]}. " \
+          "Expected either {pages:[{elements:[...]}]} (post-and-readback output) or {elements:[...]} (flat). " \
+          "Re-run post-and-readback.rb --type datamodel and pass its --out file."
+  end
 end
 
 errors = []
@@ -144,6 +156,23 @@ spec.fetch('pages', []).each do |page|
     if kind == 'pivot-table'
       errors << "#{name}: pivot-table must use rowsBy/columnsBy" if el['rows'] || el['columnGroups']
       errors << "#{name}: pivot-table without rowsBy renders only a grand-total row" if (el['rowsBy'] || []).empty?
+      # Shape: values is a flat string-array of column IDs; rowsBy/columnsBy are {id: "..."} object arrays.
+      # Mixing these up costs multiple POST iterations because the API rejects with a generic Invalid array message.
+      if (vals = el['values']).is_a?(Array)
+        bad_val = vals.find { |v| v.is_a?(Hash) }
+        errors << "#{name}: pivot-table values must be a flat string array like [\"col-id\"], not [{id:...}] (got #{bad_val.inspect})" if bad_val
+      end
+      %w[rowsBy columnsBy].each do |key|
+        next unless (entries = el[key]).is_a?(Array)
+        bad = entries.find { |e| e.is_a?(String) || (e.is_a?(Hash) && !e['id']) }
+        if bad.is_a?(String)
+          errors << "#{name}: pivot-table #{key} must be objects like [{id: \"col-id\"}], not bare strings (got #{bad.inspect})"
+        elsif bad.is_a?(Hash) && bad['columnId']
+          errors << "#{name}: pivot-table #{key} entries use {id: ...}, not {columnId: ...} (got #{bad.inspect})"
+        elsif bad
+          errors << "#{name}: pivot-table #{key} entry missing id key (got #{bad.inspect})"
+        end
+      end
     end
   end
 end

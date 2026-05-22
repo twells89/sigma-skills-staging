@@ -136,7 +136,8 @@ downloaded `.twb` for the first non-Parameters `<datasource caption='X'>` and lo
 on the site automatically. Pass `--no-auto-ds` to disable, or `--datasource-luid` to force
 a specific datasource when the workbook has multiple.
 
-View CSV fetches run in parallel (6 concurrent threads). The dashboard PNG is fetched solo
+View CSV fetches run in parallel (4 concurrent threads, with one auto-retry on 401 after a
+1.5s backoff per view — see `tableau-discover.rb` line ~145). The dashboard PNG is fetched solo
 afterward to avoid VizQL session contention.
 
 > **One signin attempt only.** Tableau Cloud invalidates a PAT after 4 consecutive failed
@@ -314,13 +315,13 @@ numeric ranges, and `aggregation_hints` parsed from CSV headers like
 
 **The reliable fetch pattern:**
 
-1. Fire all `get-view-data` calls (every sheet + the dashboard view) **in a single parallel batch**. CSVs don't have session contention.
+1. Fire `get-view-data` calls in parallel batches, but **cap each batch at ~4 concurrent calls**. CSVs survive concurrency far better than image fetches, but 7-way batches have produced 6×401 from VizQL contention in the wild (verified 2026-05-22). For >4 views, split into back-to-back batches of 4 (e.g., 7 views → batch of 4, then batch of 3 in the next message).
 
-   > **This is the single biggest perf win in the whole conversion.** Measured 2026-05-22: 7 view-CSVs sequentially = ~200s (~28s per call, range 19–40s). Same 7 calls fired in one parallel batch = ~45s (bounded by the slowest single call). Skipping this parallelization is responsible for ~2.5 min of the historical ~9-min conversion runtime. From your conversation, send a single message with one `mcp__tableau__get-view-data` tool-call per view; do NOT send them in separate messages.
+   > **This is the single biggest perf win in the whole conversion.** Measured 2026-05-22: 7 view-CSVs sequentially = ~200s (~28s per call, range 19–40s). Same 7 calls fired in two batches of 4+3 = ~60-70s (vs. ~45s for an unrestricted batch when no contention hits — but unrestricted goes catastrophically slow once it does, because every 401 retry happens solo). Skipping parallelization entirely is responsible for ~2.5 min of the historical ~9-min conversion runtime. Send each batch as a single message with N `mcp__tableau__get-view-data` tool-call blocks side-by-side; do NOT send them in separate messages.
 2. Fetch **only the dashboard view's PNG** with `get-view-image`. Solo — no other view calls in flight.
 3. If a specific tile's dashboard title looks wrong or truncated, fetch that one sheet's PNG solo to disambiguate.
 
-If `get-view-data` returns 401 for a view, retry that view solo; if it 401s again, skip it.
+If `get-view-data` returns 401 for a view, retry that view solo (the contention almost always clears within a second or two); if it 401s on the solo retry, skip it.
 
 > **Do not parallel-fire `get-view-image` calls.** Even if the CSVs succeeded in parallel, concurrent image requests still 401 due to VizQL session contention. Images are always solo.
 
@@ -1047,7 +1048,7 @@ When to escalate to a visual check rather than just CSV parity:
 | All columns on a table fail together | One bad formula poisons the element | Find the specific bad ref in the error message; fix only that column |
 | `jq: parse error: Invalid numeric literal` | Sigma spec endpoints return YAML | Use `post-and-readback.rb` (it parses YAML); never pipe spec responses to `jq` |
 | Validator flags `[X/col]` as unknown prefix on a workbook spec | `--dm-context` not passed | Re-run with `--dm-context /tmp/<name>/dm-ids.json` |
-| `401` on `get-view-data` in parallel batch | VizQL session contention | Retry that view solo; if still 401, skip — view is inaccessible |
+| `401` on `get-view-data` in parallel batch | VizQL session contention — batches of 5+ trigger this | Cap batches at 4. Retry that view solo after 1-2s (PAT-mode `tableau-discover.rb` does this automatically); if still 401, skip — view is inaccessible |
 | `401` on `get-view-image` | Always solo, never parallel with other view calls | Retry the image solo, no concurrent requests |
 | `429` on Tableau view image | Rate limited | Wait and retry |
 | Column fetch returns empty list | Response key is `entries`, not `columns` | Use `discover-warehouse-columns.rb` (handles this) |

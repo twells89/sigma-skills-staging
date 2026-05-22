@@ -137,22 +137,30 @@ else
 end
 
 # 3. View CSVs — fire in parallel via threads. REST CSV endpoint handles concurrency
-#    fine, unlike MCP image fetches which contend on VizQL sessions. Cap parallelism
-#    at 6 to be polite to Tableau Cloud.
+#    better than MCP image fetches (which contend on VizQL sessions), but at 6+ workers
+#    we've seen 401s on Tableau Cloud. Cap at 4 and auto-retry any 401 once after a
+#    brief backoff — a second-pass solo retry recovers cleanly when contention clears.
 require 'thread'
 view_pool = Queue.new
 views.each { |v| view_pool << v }
-csv_threads = Array.new([6, views.size].min) do
+csv_threads = Array.new([4, views.size].min) do
   Thread.new do
     until view_pool.empty?
       v = view_pool.pop(true) rescue nil
       break unless v
+      attempts = 0
       begin
+        attempts += 1
         csv = Tableau.view_data(v['id'])
         File.write(File.join(opts[:out], 'views', "#{v['id']}.csv"), csv)
         warn "wrote views/#{v['id']}.csv  (#{v['name']})"
       rescue Tableau::Error => e
-        warn "view CSV failed for #{v['name']} (#{v['id']}): #{e.message.lines.first&.chomp}"
+        msg = e.message.lines.first&.chomp || ''
+        if attempts < 2 && msg =~ /\b401\b/
+          sleep(1.5)
+          retry
+        end
+        warn "view CSV failed for #{v['name']} (#{v['id']}) after #{attempts} attempt(s): #{msg}"
       end
     end
   end
