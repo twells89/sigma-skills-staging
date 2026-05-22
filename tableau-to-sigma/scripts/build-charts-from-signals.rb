@@ -650,10 +650,22 @@ layout.each do |dash|
     # Docs (charts.md) suggested bare numbers / strings for `value` but the
     # live API only accepts the wrapped object form. `value.type: column` is
     # also rejected — use `formula` with a column ref instead.
-    ref_emit, ref_skip = [], []
+    ref_emit, trend_emit, ref_skip = [], [], []
     if z['ref_marks'] && !z['ref_marks'].empty? && %w[bar-chart line-chart area-chart combo-chart scatter-chart].include?(kind)
       meas_name = meas_col_obj['name']
       tab_to_sigma_agg = { 'average' => 'Avg', 'median' => 'Median', 'max' => 'Max', 'min' => 'Min', 'sum' => 'Sum', 'count' => 'Count' }
+      # Trendline shape verified 2026-05-22 against a UI-built workbook
+      # (workbookUrlId 5xKqmuAXGooHxRgFrdk6VY). Only `linear` is canonically
+      # verified; other Tableau model-types are passed through under the same
+      # name (Sigma docs list logarithmic/exponential/polynomial/quadratic/power)
+      # and will surface a per-element WARN to verify visually.
+      tab_to_sigma_model = {
+        'linear'      => 'linear',
+        'logarithmic' => 'logarithmic',
+        'exponential' => 'exponential',
+        'polynomial'  => 'polynomial',
+        'power'       => 'power'
+      }
       z['ref_marks'].each do |rm|
         case rm['kind']
         when 'line'
@@ -674,19 +686,34 @@ layout.each do |dash|
           else
             ref_skip << rm
           end
-        when 'band', 'distribution', 'trendline'
-          # Bands need the {type:band} variant which we haven't verified; trendlines
-          # are a separate chart field whose shape isn't UI-roundtripped here yet.
+        when 'trendline'
+          model = tab_to_sigma_model[rm['model'].to_s] || 'linear'
+          trend_emit << {
+            'columnId' => meas_col_obj['id'],
+            'model'    => model,
+            'label'    => { 'visibility' => 'shown' },
+            'value'    => { 'visibility' => 'shown' }
+          }
+        when 'band', 'distribution'
+          # Bands need the {type:band} variant which we haven't verified.
           ref_skip << rm
         end
       end
-      element['refMarks'] = ref_emit unless ref_emit.empty?
+      element['refMarks']   = ref_emit   unless ref_emit.empty?
+      element['trendlines'] = trend_emit unless trend_emit.empty?
       if !ref_skip.empty?
         skip_kinds = ref_skip.map { |r| r['kind'] }.tally.map { |k, n| "#{n}× #{k}" }.join(', ')
-        warnings << "'#{cap}' has #{ref_skip.size} Tableau reference mark(s) not auto-emitted (#{skip_kinds}) — bands/distributions/trendlines need manual review (beads-sigma-7ak / -2th)"
+        warnings << "'#{cap}' has #{ref_skip.size} Tableau reference mark(s) not auto-emitted (#{skip_kinds}) — bands/distributions need manual review (beads-sigma-7ak)"
       end
       if !ref_emit.empty?
         warnings << "'#{cap}' auto-emitted #{ref_emit.size} Sigma refMarks from Tableau reference marks — verify visual fidelity"
+      end
+      if !trend_emit.empty?
+        models_used = trend_emit.map { |t| t['model'] }.uniq
+        non_linear = models_used - ['linear']
+        msg = "'#{cap}' auto-emitted #{trend_emit.size} Sigma trendline(s) (model: #{models_used.join(', ')})"
+        msg += " — only `linear` is canonically verified; visually verify #{non_linear.join('/')} fits" unless non_linear.empty?
+        warnings << msg
       end
     end
 

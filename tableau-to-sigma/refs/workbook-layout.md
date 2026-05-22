@@ -493,9 +493,27 @@ Key facts:
 - `value.type: "column"` (with `columnId`) is also rejected — wrap the column in a `formula` instead.
 - `axis` is `"series"` for the measure axis (Y), `"series2"` for combo-chart's secondary axis, `"axis"` for the X axis.
 - `label.visibility` is `"shown"` or `"hidden"`. `label.text` is optional — Sigma renders a sensible default when absent.
-- For `type: "band"` and the trendline shape — wait for engineering to confirm via another UI-built readback (see `beads-sigma-7ak` / `beads-sigma-2th`).
+- For `type: "band"` — wait for engineering to confirm via another UI-built readback (see `beads-sigma-7ak`).
 
-`tableau-to-sigma`'s `build-charts-from-signals.rb` auto-emits Tableau `<reference-line>` elements with formula in `{average, median, max, min, sum, count}` as Sigma `refMarks` with formula values. Bands, distributions, percentage-bands, and trendlines are surfaced as WARN for manual editor wiring.
+#### Trendlines (verified 2026-05-22)
+
+`trendlines` is a **separate field** on the chart element, sibling to `refMarks`. Canonical shape from a UI-built workbook readback:
+
+```yaml
+trendlines:
+  - columnId: NunneVlI8N        # the y-axis measure column being modeled
+    model: linear               # linear verified; logarithmic/exponential/polynomial/quadratic/power per docs (unverified)
+    label: { visibility: shown }  # toggles the model-name label on the line
+    value: { visibility: shown }  # toggles the equation / R² readout
+    caption: {}                   # optional caption object
+```
+
+Differences from upstream `sigma-workbooks` charts.md:
+- Docs frame `label` as `{ visibility, text }` and don't mention `value` or `caption`. The live readback has **separate** `label` and `value` visibility toggles plus a `caption` object. `text` on `label` is unverified.
+- Docs show `line: { color, width }`. The canonical readback omits it — may be accepted but not the default; treat as unverified.
+- Only `model: linear` is end-to-end verified. Other model names are passed through identically and emitted with a per-chart WARN to verify visually.
+
+`tableau-to-sigma`'s `build-charts-from-signals.rb` auto-emits Tableau `<reference-line>` elements with formula in `{average, median, max, min, sum, count}` as Sigma `refMarks` with formula values, and Tableau `<trendline-model>` elements as Sigma `trendlines` (column = primary measure, model name passed through). Bands, distributions, and percentage-bands are still surfaced as WARN for manual editor wiring.
 
 ### Map elements
 
