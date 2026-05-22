@@ -55,6 +55,9 @@ which calc translation, which layout) — not orchestration.
 | `scripts/auto-parity-plan.rb` | Phase 6a: auto-build a parity plan by matching Sigma chart elements to Tableau view CSVs (with `--rename` for renamed tiles). Output → `/tmp/<name>/parity-plan.json` wrapped as `{ extract, charts: [...] }` |
 | `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
 | `scripts/export-chart-png.rb` | Phase 6d (visual): export PNG screenshots of every chart in the converted Sigma workbook via `/v2/workbooks/{wb}/export` → `/v2/query/{q}/download`. Catches visual regressions CSV value parity can miss (silently-dropped log scale, missing data labels, wrong chart kind, palette drift). Output: per-element PNGs + `_manifest.json`. Pair with the Tableau MCP `get-view-image` to side-by-side compare source vs target. |
+| `scripts/find-or-pick-dm.rb` | Phase 1.5: scan existing DMs in the org and recommend reuse when one already covers the workbook's columns. Score = 0.7·column-overlap + 0.2·table-overlap + 0.1·metric-overlap. Parallel-fetches DM specs (~2s for 50 DMs). Output: `dm-match.json` with ranked candidates + recommendation. Non-destructive. Reuse skips Phase 2 + 3 entirely. |
+| `scripts/scan-customer-style.rb` | Phase 0c: sample N recent workbooks in the customer's Sigma org and aggregate style signals (color palettes, number-format strings, layout grids, chart-kind mix, dataLabel preference, element naming case, density). Lets the converter emit specs that match house conventions instead of generic defaults. |
+| `scripts/phase-timer.sh` | Source helper for phase timing. `phase_start "<name>"` / `phase_end` around each phase; `phase_report` at the end flushes a JSON summary to `$PHASE_TIMINGS_OUT`. Use to profile real conversions and find the slow phases. |
 | `scripts/lib/layout.rb` | Layout-XML helpers (`gc`, `le`, `page_xml`, `assemble`) — `require`'d by per-workbook layout configs |
 
 ---
@@ -311,6 +314,8 @@ numeric ranges, and `aggregation_hints` parsed from CSV headers like
 **The reliable fetch pattern:**
 
 1. Fire all `get-view-data` calls (every sheet + the dashboard view) **in a single parallel batch**. CSVs don't have session contention.
+
+   > **This is the single biggest perf win in the whole conversion.** Measured 2026-05-22: 7 view-CSVs sequentially = ~200s (~28s per call, range 19–40s). Same 7 calls fired in one parallel batch = ~45s (bounded by the slowest single call). Skipping this parallelization is responsible for ~2.5 min of the historical ~9-min conversion runtime. From your conversation, send a single message with one `mcp__tableau__get-view-data` tool-call per view; do NOT send them in separate messages.
 2. Fetch **only the dashboard view's PNG** with `get-view-image`. Solo — no other view calls in flight.
 3. If a specific tile's dashboard title looks wrong or truncated, fetch that one sheet's PNG solo to disambiguate.
 
@@ -405,9 +410,47 @@ Output is a JSON array, one entry per Custom SQL block, with `query` (the raw SQ
 
 ---
 
+## Phase 1.5 — Check for an existing DM the workbook can reuse (DO THIS FIRST)
+
+Before running Phase 2 (warehouse column discovery) and Phase 3 (DM build), check whether the customer's Sigma org **already has a data model** that satisfies the workbook's needs. Reusing an existing DM:
+
+- Avoids DM sprawl (customers complain when they end up with a 4th "Orders" DM)
+- Cuts Phase 2 + Phase 3 entirely on the reuse path — typically the heaviest 2–3 minutes of a conversion
+
+```bash
+# Inputs:
+#   workbook-signature.json — derived from Phase 1 .twb parse + view CSV headers
+#     { tableau_workbook, warehouse_tables: [FQNs], referenced_columns: [...], measures: [...] }
+ruby scripts/find-or-pick-dm.rb \
+  --workbook-signature /tmp/<name>/workbook-signature.json \
+  --out /tmp/<name>/dm-match.json \
+  --limit 100 \
+  [--min-score 0.6]   # default; below: build new
+  [--force-new]        # bypass scan entirely
+```
+
+The picker parallel-fetches DM specs (10 concurrent threads — ~2s for 50 DMs vs ~15s serial). Scoring weights: column overlap 0.7, source-table FQN 0.2, metric overlap 0.1. Output thresholds:
+
+| Score | Action |
+|---|---|
+| ≥ 0.85 | auto-reuse the recommended DM, skip Phase 2 + 3 |
+| 0.6 – 0.85 | ambiguous — **ask the user** before reusing; surface the candidates from `dm-match.json` |
+| < 0.6 | no usable match; proceed to Phase 2 + 3 |
+
+Surface this in your conversation with the user:
+
+> "Found existing DM `<name>` covering N/M of the columns this workbook references. Reuse this DM? It would skip ~2–3 min of conversion time but the workbook will inherit X extra columns (sample: ...). Reply `yes` to reuse, `no` to build new, or `show` to see other candidates."
+
+When reusing, jump straight from Phase 1.5 to Phase 5 — the workbook spec's table elements set `source: { kind: data-model, dataModelId: <recommended_dm_id>, elementId: <chosen-element-id> }` and use formula prefixes derived from the existing DM's element name (e.g. `[Plugs Sales/Revenue]`).
+
+The picker is **non-destructive** — it never modifies any DM. The downstream phase decides reuse vs build.
+
+---
+
 ## Phase 2 — Discover actual warehouse column names
 
 > **This step is mandatory. Do not skip it or infer column names from Tableau.**
+> **Skip Phase 2 entirely if Phase 1.5 recommended a DM you reused.**
 
 Tableau display names ("Sub-Category", "Country/Region") are NOT the same as
 Snowflake warehouse column names ("SUB_CATEGORY", "COUNTRY_REGION"). Using the

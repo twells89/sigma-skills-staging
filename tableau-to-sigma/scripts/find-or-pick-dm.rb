@@ -1,0 +1,287 @@
+#!/usr/bin/env ruby
+# Phase 1.5 — Reuse existing Sigma data models when one already covers the
+# Tableau workbook's needs. Goals:
+#   1. Avoid DM sprawl: don't add a 4th "Orders" DM when the customer already
+#      has three that all point at the same warehouse table.
+#   2. Performance: skip Phase 2 (warehouse column discovery) and Phase 3
+#      (DM build + POST + validate) when reusing — often 2-3 min savings.
+#
+# This script DOES NOT mutate any DM. It only scores existing DMs against the
+# Tableau workbook signature and recommends a candidate (with a warning about
+# inherited columns / RLS / metrics). The downstream phase decides whether to
+# reuse or create new.
+#
+# Usage:
+#   ruby scripts/find-or-pick-dm.rb \
+#     --workbook-signature /tmp/<name>/workbook-signature.json \
+#     --out /tmp/<name>/dm-match.json \
+#     [--limit 200]                    # max DMs to scan
+#     [--min-score 0.6]                # below: no recommendation, build new
+#     [--force-new]                    # always recommend new (skip scan)
+#
+# Input signature shape (produced by Phase 1 + 2.5 — adjust paths as needed):
+#   {
+#     "tableau_workbook":   "Monthly Revenue",
+#     "warehouse_tables":   ["CSA.ORDER_FACT"],          # FQN list
+#     "referenced_columns": ["ORDER_DATE","GROSS_REVENUE","REGION","STATE"],
+#     "measures":           [{"col":"GROSS_REVENUE","derivation":"Sum"}, ...]
+#   }
+#
+# Output: dm-match.json with shape documented in SKILL.md Phase 1.5.
+# Exit: 0 if any candidate ≥ --min-score, 1 if none (caller can choose to
+# build new). Never aborts on missing inputs — always emits a result file so
+# the agent can decide.
+
+require 'json'
+require 'yaml'
+require 'net/http'
+require 'uri'
+require 'optparse'
+
+# Default limit 50: perf testing (2026-05-22) showed the picker's top-score
+# saturates by ~25 DMs in this org, and the per-DM cost elbows hard after 50
+# (0.065s/DM → 0.25s/DM — likely Sigma falls off a cached-spec hot path).
+# limit=50 finishes in ~3s; limit=200 took 40s with no score improvement.
+opts = { limit: 50, min_score: 0.6 }
+OptionParser.new do |p|
+  p.on('--workbook-signature P') { |v| opts[:sig]      = v }
+  p.on('--out P')                { |v| opts[:out]      = v }
+  p.on('--limit N', Integer)     { |v| opts[:limit]    = v }
+  p.on('--min-score F', Float)   { |v| opts[:min_score]= v }
+  p.on('--force-new')            { |_| opts[:force_new]= true }
+end.parse!
+%i[sig out].each { |k| abort "missing --#{k}" unless opts[k] }
+
+BASE = ENV.fetch('SIGMA_BASE_URL')
+TOK  = ENV.fetch('SIGMA_API_TOKEN')
+
+def http_get(path)
+  uri = URI("#{BASE}#{path}")
+  req = Net::HTTP::Get.new(uri)
+  req['Authorization'] = "Bearer #{TOK}"
+  req['Accept'] = 'application/json'
+  Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+end
+
+sig = JSON.parse(File.read(opts[:sig]))
+warn "workbook: #{sig['tableau_workbook'] || '(unnamed)'}"
+warn "  warehouse_tables:   #{sig['warehouse_tables']&.size || 0}"
+warn "  referenced_columns: #{sig['referenced_columns']&.size || 0}"
+
+# Force-new short-circuit: emit a no-match result and exit 1.
+if opts[:force_new]
+  File.write(opts[:out], JSON.pretty_generate({
+    'recommended_dm_id' => nil,
+    'score' => 0.0,
+    'rationale' => '--force-new: bypassed DM-reuse scan',
+    'candidates' => []
+  }))
+  warn "force-new mode — wrote empty match"
+  exit 1
+end
+
+# 1. List existing data models.
+all_dms = []
+page = nil
+loop do
+  qs = "limit=100"
+  qs += "&page=#{page}" if page
+  r = http_get("/v2/dataModels?#{qs}")
+  break unless r.code.to_i == 200
+  data = JSON.parse(r.body)
+  rows = data['entries'] || data['dataModels'] || []
+  break if rows.empty?
+  all_dms.concat(rows)
+  break if all_dms.size >= opts[:limit]
+  page = data['nextPage']
+  break if page.nil? || page.empty?
+end
+warn "scanning #{[all_dms.size, opts[:limit]].min} of #{all_dms.size} data models"
+
+# 2. Fetch each DM's spec and extract its signature (tables + columns + metrics).
+def normalize_fqn(s)
+  return nil if s.nil? || s.empty?
+  parts = s.to_s.split('.').reject(&:empty?).map(&:upcase)
+  parts.join('.')
+end
+
+def normalize_col(s)
+  s.to_s.upcase.gsub(/[^A-Z0-9]/, '')
+end
+
+# Fetch all DM specs in parallel (10 threads). Some DMs return non-200
+# (archived, permission-restricted, broken refs) — log and continue. Single
+# transient 5xx errors are retried once.
+dm_specs = {}
+dm_failures = []
+require 'thread'
+mu = Mutex.new
+queue = Queue.new
+all_dms.take(opts[:limit]).each { |dm| queue << dm }
+threads = 5.times.map do
+  Thread.new do
+    until queue.empty?
+      dm = queue.pop(true) rescue nil
+      break unless dm
+      dm_id = dm['dataModelId'] || dm['id']
+      next unless dm_id
+      r = nil
+      # Retry on 429 (Cloudflare burst limit) with exponential backoff. The
+      # /v2/dataModels endpoint commonly 429s at >5 concurrent across
+      # tj-wells-1989 — see beads-sigma-cn5.
+      4.times do |attempt|
+        r = http_get("/v2/dataModels/#{dm_id}/spec")
+        code = r.code.to_i
+        break if code == 200 || (code != 429 && code < 500)
+        sleep (0.5 * (2 ** attempt))  # 0.5s, 1s, 2s, 4s
+      end
+      if r.code.to_i != 200
+        mu.synchronize { dm_failures << { name: dm['name'], id: dm_id, code: r.code, body_head: r.body[0..80] } }
+        next
+      end
+      spec = begin
+        JSON.parse(r.body)
+      rescue JSON::ParserError
+        YAML.safe_load(r.body, permitted_classes: [Date, Time])
+      end
+      mu.synchronize { dm_specs[dm_id] = spec }
+    end
+  end
+end
+threads.each(&:join)
+warn "fetched #{dm_specs.size} DM specs (#{dm_failures.size} failed)"
+dm_failures.first(5).each { |f| warn "  failure: #{f[:code]} #{f[:name]} — #{f[:body_head]}" }
+
+dm_signatures = []
+all_dms.take(opts[:limit]).each do |dm|
+  dm_id = dm['dataModelId'] || dm['id']
+  spec = dm_specs[dm_id]
+  next unless spec
+
+  tables = []
+  columns = []
+  metrics = []
+  column_captions = {}  # normalized → original, so output can be human-readable
+
+  # Walk every element. Sigma DM specs nest elements under pages[*].elements
+  # (NOT top-level `elements` — that's a workbook-only convention). Fall back
+  # to top-level for robustness in case schema changes.
+  all_elements = spec['elements'] || (spec['pages'] || []).flat_map { |p| p['elements'] || [] }
+  all_elements.each do |el|
+    src = el['source'] || {}
+    case src['kind']
+    when 'warehouse-table', 'table'
+      # source like { kind: warehouse-table, connectionId, path: "DB.SCHEMA.TABLE" }
+      fqn = src['path'] || [src['database'], src['schema'], src['name']].compact.join('.')
+      tables << normalize_fqn(fqn) if fqn && !fqn.empty?
+    when 'sql'
+      # Custom SQL — surface a sentinel so the agent knows; not directly comparable
+      tables << 'CUSTOM_SQL'
+    end
+    (el['columns'] || []).each do |c|
+      colname = c['name'] || (c['formula'].to_s.match(/\[.*?([^\/\]]+)\]/) || [])[1]
+      if colname && !colname.empty?
+        norm = normalize_col(colname)
+        columns << norm
+        column_captions[norm] ||= colname
+      end
+    end
+    (el['metrics'] || []).each do |m|
+      metrics << "#{m['name']}/#{m['aggregation'] || m['derivation']}"
+    end
+  end
+
+  dm_signatures << {
+    dm_id: dm_id,
+    dm_name: dm['name'],
+    tables: tables.uniq.compact,
+    columns: columns.uniq.compact,
+    column_captions: column_captions,
+    metrics: metrics.uniq.compact,
+    raw_element_count: all_elements.size
+  }
+end
+
+# 3. Score each DM.
+tableau_tables  = (sig['warehouse_tables']   || []).map { |t| normalize_fqn(t) }.compact
+# Keep both forms: normalized for matching, original for human-readable output.
+tableau_columns_orig = (sig['referenced_columns'] || [])
+tableau_columns      = tableau_columns_orig.map { |c| normalize_col(c) }
+tableau_col_caption  = tableau_columns.zip(tableau_columns_orig).to_h
+tableau_measure_keys = (sig['measures'] || []).map { |m| "#{normalize_col(m['col'])}/#{m['derivation']}" }
+
+candidates = dm_signatures.map do |dm|
+  # Table match: 1.0 if Tableau tables ⊆ DM tables. 0.5 if partial. 0 if disjoint.
+  shared_tables = (tableau_tables & dm[:tables])
+  table_match =
+    if tableau_tables.empty?
+      0.0
+    elsif shared_tables.size == tableau_tables.size
+      1.0
+    elsif shared_tables.any?
+      0.5 + 0.5 * (shared_tables.size.to_f / tableau_tables.size)
+    else
+      0.0
+    end
+
+  # Column match: % of Tableau-referenced columns present in DM.
+  shared_cols = (tableau_columns & dm[:columns])
+  col_match =
+    tableau_columns.empty? ? 0.0 : shared_cols.size.to_f / tableau_columns.size
+
+  # Metric overlap (small weight).
+  shared_metrics = (tableau_measure_keys & dm[:metrics])
+  metric_match =
+    tableau_measure_keys.empty? ? 0.0 : shared_metrics.size.to_f / tableau_measure_keys.size
+
+  # Weighting rationale: column overlap is the most reliable signal —
+  # a DM's source table FQN can vary (raw warehouse table vs view vs joined
+  # element) but the column set must be a superset of what the workbook
+  # references for reuse to be safe. Table-match is a soft tiebreaker.
+  score = 0.2 * table_match + 0.7 * col_match + 0.1 * metric_match
+
+  # Extras the workbook would inherit. Surface original captions (not the
+  # normalized form) so the user-facing report is readable.
+  extra_cols_norm = dm[:columns] - tableau_columns
+  caption_of = ->(norm) { dm[:column_captions][norm] || norm }
+  {
+    'dm_id'             => dm[:dm_id],
+    'dm_name'           => dm[:dm_name],
+    'score'             => score.round(3),
+    'table_match'       => table_match.round(2),
+    'column_match'      => col_match.round(2),
+    'metric_match'      => metric_match.round(2),
+    'shared_tables'     => shared_tables,
+    'missing_tables'    => tableau_tables - dm[:tables],
+    'shared_columns'    => shared_cols.map(&caption_of),
+    'missing_columns'   => (tableau_columns - dm[:columns]).map { |c| tableau_col_caption[c] || c },
+    'extra_columns'     => extra_cols_norm.size,
+    'extra_columns_sample' => extra_cols_norm.first(5).map(&caption_of),
+    'raw_element_count' => dm[:raw_element_count]
+  }
+end.sort_by { |c| -c['score'] }
+
+best = candidates.first
+result = {
+  'workbook_signature_path' => opts[:sig],
+  'scanned_dm_count'        => candidates.size,
+  'recommended_dm_id'       => (best && best['score'] >= opts[:min_score]) ? best['dm_id'] : nil,
+  'score'                   => best ? best['score'] : 0.0,
+  'rationale'               => if best.nil?
+                                  'no DMs in org'
+                                elsif best['score'] >= 0.85
+                                  "auto-reuse candidate (#{best['shared_columns'].size}/#{tableau_columns.size} cols, #{best['shared_tables'].size}/#{tableau_tables.size} tables)"
+                                elsif best['score'] >= opts[:min_score]
+                                  "ambiguous match — ASK USER before reusing"
+                                else
+                                  'no candidate above min-score; build a new DM'
+                                end,
+  'warning'                 => (best && best['extra_columns'] > 0) ? "Reusing inherits #{best['extra_columns']} extra columns (sample: #{best['extra_columns_sample'].join(', ')})" : nil,
+  'candidates'              => candidates.first(5)
+}.compact
+
+File.write(opts[:out], JSON.pretty_generate(result))
+warn ""
+warn "wrote #{opts[:out]}"
+warn "best score: #{result['score']}  →  #{result['rationale']}"
+exit result['recommended_dm_id'].nil? ? 1 : 0
