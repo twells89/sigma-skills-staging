@@ -624,12 +624,16 @@ layout.each do |dash|
                      ({ 'kind' => 'number', 'formatString' => ',.0f' })
       }
       kind = 'combo-chart' unless %w[pie-chart donut-chart].include?(kind)
-      # Sigma's spec API does NOT persist true dual-axis (separate right-hand
-      # scale) — verified 2026-05-22 against UI-built workbook readback. A
-      # combo-chart with two measures and one shared yAxis is the closest we
-      # can emit; the right-hand axis must be configured manually in the
-      # Sigma editor post-conversion. See feedback_sigma_dual_axis_ui_only.md.
-      warnings << "'#{cap}' detected as dual-axis (synchronized=true or 2+ measures) — emitted as combo-chart with shared yAxis. SIGMA SPEC API DOES NOT PERSIST RIGHT-HAND AXIS SCALE — configure the secondary axis manually in the Sigma editor (UI-only feature)."
+      # Sigma combo-chart dual-axis IS persisted in the spec — the secondary
+      # axis is implied by yAxis.columnIds entries in object form
+      # (`{columnId, type}`) vs bare-string form. Bare strings go to the
+      # primary (left) axis; object-form entries go to the secondary (right)
+      # axis with the specified mark type. Verified 2026-05-22 against
+      # UI-built workbook readback (workbookUrlId 5xKqmuAXGooHxRgFrdk6VY).
+      # The right axis is auto-scaled by default; custom right-axis scale
+      # configuration (log/min/max/zero) is unverified — yAxis.format only
+      # governs the left axis.
+      warnings << "'#{cap}' detected as dual-axis (synchronized=true or 2+ measures) — emitted as combo-chart with secondary measure on right axis (yAxis.columnIds object form). Right axis is auto-scaled; if Tableau had a custom right-axis range, configure manually in the Sigma editor."
     end
 
     element = {
