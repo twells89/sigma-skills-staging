@@ -636,12 +636,58 @@ layout.each do |dash|
     }
     element['columns'] << extra_meas_col if extra_meas_col
 
-    # Reference lines / bands / trendlines from Tableau — surface so the agent
-    # adds them by hand in Sigma's chart editor. Auto-emission of referenceMarks
-    # is tracked in beads-sigma-7ak.
-    if z['ref_marks'] && !z['ref_marks'].empty?
-      kinds = z['ref_marks'].map { |m| m['kind'] }.tally.map { |k, n| "#{n}× #{k}" }.join(', ')
-      warnings << "'#{cap}' has Tableau reference marks (#{kinds}) — Sigma supports referenceMarks on chart elements; add manually post-publish (or see beads-sigma-7ak)"
+    # Reference lines / bands / trendlines from Tableau → Sigma `refMarks`.
+    # Verified shape (from a UI-built workbook readback, 2026-05-21):
+    #   refMarks:
+    #     - type: line | band
+    #       axis: series | series2 | axis
+    #       value:
+    #         { type: constant, value: <number> }     # constant threshold
+    #         { type: formula,  formula: "<expr>" }   # any Sigma formula
+    #       label:
+    #         { visibility: shown|hidden, text?: "..." }
+    #
+    # Docs (charts.md) suggested bare numbers / strings for `value` but the
+    # live API only accepts the wrapped object form. `value.type: column` is
+    # also rejected — use `formula` with a column ref instead.
+    ref_emit, ref_skip = [], []
+    if z['ref_marks'] && !z['ref_marks'].empty? && %w[bar-chart line-chart area-chart combo-chart scatter-chart].include?(kind)
+      meas_name = meas_col_obj['name']
+      tab_to_sigma_agg = { 'average' => 'Avg', 'median' => 'Median', 'max' => 'Max', 'min' => 'Min', 'sum' => 'Sum', 'count' => 'Count' }
+      z['ref_marks'].each do |rm|
+        case rm['kind']
+        when 'line'
+          # Skip band-styled lines (fill/percentage bands) — they need the band shape, not line.
+          if rm['band_values'] || rm['fill_below'] == 'true' || rm['fill_above'] == 'true' || rm['percentage_bands'] == 'true'
+            ref_skip << rm
+            next
+          end
+          fagg = tab_to_sigma_agg[rm['formula']]
+          if fagg
+            label_text = rm['label_type'] == 'custom' ? rm['label'] : "#{fagg} #{meas_name}"
+            ref_emit << {
+              'type'  => 'line',
+              'axis'  => 'series',
+              'value' => { 'type' => 'formula', 'formula' => "#{fagg}([Master/#{meas_name}])" },
+              'label' => { 'visibility' => 'shown', 'text' => label_text }.compact
+            }
+          else
+            ref_skip << rm
+          end
+        when 'band', 'distribution', 'trendline'
+          # Bands need the {type:band} variant which we haven't verified; trendlines
+          # are a separate chart field whose shape isn't UI-roundtripped here yet.
+          ref_skip << rm
+        end
+      end
+      element['refMarks'] = ref_emit unless ref_emit.empty?
+      if !ref_skip.empty?
+        skip_kinds = ref_skip.map { |r| r['kind'] }.tally.map { |k, n| "#{n}× #{k}" }.join(', ')
+        warnings << "'#{cap}' has #{ref_skip.size} Tableau reference mark(s) not auto-emitted (#{skip_kinds}) — bands/distributions/trendlines need manual review (beads-sigma-7ak / -2th)"
+      end
+      if !ref_emit.empty?
+        warnings << "'#{cap}' auto-emitted #{ref_emit.size} Sigma refMarks from Tableau reference marks — verify visual fidelity"
+      end
     end
 
     if kind == 'pie-chart' || kind == 'donut-chart'

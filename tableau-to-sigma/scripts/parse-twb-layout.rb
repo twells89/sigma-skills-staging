@@ -246,19 +246,52 @@ xml.elements.each('//worksheet') do |ws|
   # measure-name shelves, not combo charts.
   dual_axis = axis_synced
 
-  # Per-worksheet reference lines / bands. Each <formula> is the calc that
-  # produces the line value (e.g., total / avg / median / constant). The full
-  # nuance (band fill, label format) is not extracted — the agent picks it up
-  # post-conversion. We surface enough to know reference marks ARE present so a
-  # warning fires per chart.
-  ref_marks = []
-  ws.elements.each('.//formatted-text') do |_ft|
-    # No-op: <formatted-text> often appears in tooltips, not ref-lines. Filter via parent.
+  # Per-worksheet reference lines / bands / distributions / trendlines.
+  # Surface enough metadata for build-charts-from-signals.rb to emit Sigma
+  # refMarks / trendlines blocks per the new chart spec (2026-05-21):
+  #
+  #   - formula:      "average" | "median" | "max" | "min" | "sum" | "count" | "constant" | "attr" | ...
+  #   - axis_column:  Tableau axis-column ref (column the line is anchored to)
+  #   - value_column: column the formula evaluates against (often same as axis-column)
+  #   - label:        custom label text (with <Value> template) or nil
+  #   - label_type:   "custom" | "none" | "computation" | ...
+  #   - scope:        "per-table" | "per-pane" | "per-cell"
+  #   - band_values:  array of percentage thresholds for percentage-bands
+  #   - fill_above / fill_below / percentage_bands / symmetric: band styling flags
+  def extract_ref_line_attrs(node, kind)
+    a = node.attributes
+    info = {
+      'kind'         => kind,
+      'formula'      => a['formula'],
+      'axis_column'  => a['axis-column'],
+      'value_column' => a['value-column'],
+      'label'        => a['label'],
+      'label_type'   => a['label-type'],
+      'scope'        => a['scope']
+    }
+    info['fill_above']        = a['fill-above']        if a['fill-above']
+    info['fill_below']        = a['fill-below']        if a['fill-below']
+    info['percentage_bands']  = a['percentage-bands']  if a['percentage-bands']
+    info['symmetric']         = a['symmetric']         if a['symmetric']
+    info['probability']       = a['probability']       if a['probability']
+    band_vals = node.elements.to_a('.//reference-line-value').map { |v| v.attributes['percentage'] }.compact
+    info['band_values'] = band_vals unless band_vals.empty?
+    info.compact
   end
-  ws.elements.each('.//reference-line') { |_| ref_marks << { 'kind' => 'line' } }
-  ws.elements.each('.//reference-band') { |_| ref_marks << { 'kind' => 'band' } }
-  ws.elements.each('.//reference-distribution') { |_| ref_marks << { 'kind' => 'distribution' } }
-  ws.elements.each('.//trendline-model') { |_| ref_marks << { 'kind' => 'trendline' } }
+
+  ref_marks = []
+  ws.elements.each('.//reference-line')        { |n| ref_marks << extract_ref_line_attrs(n, 'line') }
+  ws.elements.each('.//reference-band')        { |n| ref_marks << extract_ref_line_attrs(n, 'band') }
+  ws.elements.each('.//reference-distribution'){ |n| ref_marks << extract_ref_line_attrs(n, 'distribution') }
+  ws.elements.each('.//trendline-model') do |n|
+    a = n.attributes
+    ref_marks << {
+      'kind'    => 'trendline',
+      'model'   => a['model-type'] || a['model'] || 'linear',
+      'field_x' => a['field-x'],
+      'field_y' => a['field-y']
+    }.compact
+  end
 
   # Encoding channels (color / size / detail / shape / label / tooltip).
   # Color is the key one for multi-series approximations (Sales by Segment etc).

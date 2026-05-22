@@ -467,6 +467,36 @@ Uses `"kind": "scatter-chart"`. `xAxis` takes a single column ID; `yAxis` is an 
 
 Single-measure yAxis (`"yAxis": {"columnIds": ["s-profit"]}`) is also valid — same array shape, one entry.
 
+### Reference marks (`refMarks`)
+
+Cartesian charts (`bar-chart`, `line-chart`, `area-chart`, `combo-chart`, `scatter-chart`) accept a `refMarks` array for reference lines. Verified live shape (from a UI-built workbook readback 2026-05-22):
+
+```json
+"refMarks": [
+  {
+    "type": "line",
+    "axis": "series",
+    "value": { "type": "constant", "value": 500 },
+    "label": { "visibility": "shown", "text": "Target" }
+  },
+  {
+    "type": "line",
+    "axis": "series",
+    "value": { "type": "formula", "formula": "Avg([T/Gross])" },
+    "label": { "visibility": "shown", "text": "Avg gross" }
+  }
+]
+```
+
+Key facts:
+- **`value` is a wrapped object, not a bare number.** Upstream `sigma-workbooks` charts.md shows `value: 1000` — that shape is rejected by the live API. Use `{ "type": "constant", "value": <number> }` or `{ "type": "formula", "formula": "<expr>" }`.
+- `value.type: "column"` (with `columnId`) is also rejected — wrap the column in a `formula` instead.
+- `axis` is `"series"` for the measure axis (Y), `"series2"` for combo-chart's secondary axis, `"axis"` for the X axis.
+- `label.visibility` is `"shown"` or `"hidden"`. `label.text` is optional — Sigma renders a sensible default when absent.
+- For `type: "band"` and the trendline shape — wait for engineering to confirm via another UI-built readback (see `beads-sigma-7ak` / `beads-sigma-2th`).
+
+`tableau-to-sigma`'s `build-charts-from-signals.rb` auto-emits Tableau `<reference-line>` elements with formula in `{average, median, max, min, sum, count}` as Sigma `refMarks` with formula values. Bands, distributions, percentage-bands, and trendlines are surfaced as WARN for manual editor wiring.
+
 ### Map elements
 
 Sigma supports two map kinds via spec: **`region-map`** (choropleth — fills named geographic regions) and **`point-map`** (lat/long bubbles or symbols).
