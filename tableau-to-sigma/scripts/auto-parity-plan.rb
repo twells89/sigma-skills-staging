@@ -117,29 +117,49 @@ sigma_charts.each do |el|
   plan_entries << entry
 end
 
-# Optional: pre-fetch actuals via Sigma REST workbook query endpoint
+# Optional: pre-fetch actuals via Sigma REST workbook query endpoint.
+# Parallel-fire with 5 threads + Cloudflare-429 exponential backoff (same
+# envelope as find-or-pick-dm.rb / verify-workbook.rb). beads-sigma-94e.
+# Measured pattern: 5 sequential queries × ~20s each = ~100s; parallel
+# should bring this to ~25-30s (bounded by slowest single query).
 unless opts[:no_fetch]
   if ENV['SIGMA_API_TOKEN'] && ENV['SIGMA_BASE_URL'] && opts[:wb_id]
-    plan_entries.each do |entry|
-      next unless entry['sql_template']
-      uri = URI("#{ENV['SIGMA_BASE_URL']}/v2/workbooks/#{opts[:wb_id]}/query")
-      req = Net::HTTP::Post.new(uri,
-              'Authorization' => "Bearer #{ENV['SIGMA_API_TOKEN']}",
-              'Accept'        => 'application/json',
-              'Content-Type'  => 'application/json')
-      req.body = { sql: entry['sql_template'] }.to_json
-      begin
-        res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
-        if res.is_a?(Net::HTTPSuccess)
-          parsed = JSON.parse(res.body) rescue {}
-          if parsed['rows']
-            entry['actual'] = { 'rows' => parsed['rows'] }
+    require 'thread'
+    queue = Queue.new
+    plan_entries.each { |e| queue << e if e['sql_template'] }
+
+    threads = 5.times.map do
+      Thread.new do
+        until queue.empty?
+          entry = queue.pop(true) rescue nil
+          break unless entry
+          uri = URI("#{ENV['SIGMA_BASE_URL']}/v2/workbooks/#{opts[:wb_id]}/query")
+          4.times do |attempt|
+            req = Net::HTTP::Post.new(uri,
+                    'Authorization' => "Bearer #{ENV['SIGMA_API_TOKEN']}",
+                    'Accept'        => 'application/json',
+                    'Content-Type'  => 'application/json')
+            req.body = { sql: entry['sql_template'] }.to_json
+            begin
+              res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+              code = res.code.to_i
+              if res.is_a?(Net::HTTPSuccess)
+                parsed = JSON.parse(res.body) rescue {}
+                entry['actual'] = { 'rows' => parsed['rows'] } if parsed['rows']
+                break
+              elsif code == 429 || code >= 500
+                sleep 0.5 * (2 ** attempt)   # 0.5, 1, 2, 4s
+              else
+                break
+              end
+            rescue StandardError
+              break  # silent — actuals can be added manually
+            end
           end
         end
-      rescue StandardError
-        # silent — actuals can be added manually
       end
     end
+    threads.each(&:join)
   end
 end
 

@@ -854,10 +854,10 @@ PUT preserves existing element IDs. Only newly-added elements get new IDs.
 ### 5f. Compile-check every element (MANDATORY)
 
 ```bash
-bash scripts/verify-workbook.sh <workbookId>
+ruby scripts/verify-workbook.rb <workbookId>
 ```
 
-POST is permissive — it accepts specs whose column formulas don't actually resolve at query time. Those failures surface as string literals in the compiled SQL (`'Unknown column "[X]"'` / `'Circular column reference to [X]'`), and the UI renders the element as empty. `post-and-readback.rb`'s column-type guard catches **some** of these (columns whose type resolves as `error`), but not all. `verify-workbook.sh` asks the server's compiler directly via `GET /v2/workbooks/{id}/elements/{eid}/query` and greps the markers — catches everything the spec-level validator misses.
+POST is permissive — it accepts specs whose column formulas don't actually resolve at query time. Those failures surface as string literals in the compiled SQL (`'Unknown column "[X]"'` / `'Circular column reference to [X]'`), and the UI renders the element as empty. `post-and-readback.rb`'s column-type guard catches **some** of these (columns whose type resolves as `error`), but not all. `verify-workbook.rb` asks the server's compiler directly via `GET /v2/workbooks/{id}/elements/{eid}/query` and greps the markers — catches everything the spec-level validator misses. **Parallel-fetches all elements** (5 threads + 429 backoff) — ~1.3s for an 11-element workbook vs ~4s for the legacy `verify-workbook.sh`.
 
 Exit codes:
 - `0` — every queryable element compiles clean

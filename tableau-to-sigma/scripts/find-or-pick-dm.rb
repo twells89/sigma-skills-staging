@@ -49,6 +49,10 @@ OptionParser.new do |p|
   p.on('--limit N', Integer)     { |v| opts[:limit]    = v }
   p.on('--min-score F', Float)   { |v| opts[:min_score]= v }
   p.on('--force-new')            { |_| opts[:force_new]= true }
+  p.on('--auto-pick',
+       'Auto-recommend without UX prompt when top score >= --auto-pick-threshold AND no other candidate within --auto-pick-tie-window of it. Sets `auto_picked: true` on the result so the caller can WARN about inherited columns.') { |_| opts[:auto_pick] = true }
+  p.on('--auto-pick-threshold F', Float, 'Min score for auto-pick (default 0.55).')                  { |v| opts[:auto_pick_threshold] = v }
+  p.on('--auto-pick-tie-window F', Float, 'Gap from top score within which other candidates count as a tie that disables auto-pick (default 0.05).') { |v| opts[:auto_pick_tie_window] = v }
 end.parse!
 %i[sig out].each { |k| abort "missing --#{k}" unless opts[k] }
 
@@ -262,20 +266,43 @@ candidates = dm_signatures.map do |dm|
 end.sort_by { |c| -c['score'] }
 
 best = candidates.first
+second = candidates[1]
+
+# Auto-pick gate: only fires when (a) --auto-pick flag is set, (b) top score
+# clears the auto-pick threshold, and (c) the next candidate is at least
+# auto_pick_tie_window below the top. The tie check protects against silently
+# picking the wrong one of two very-close candidates (e.g., a duplicate DM).
+auto_pick_threshold  = opts[:auto_pick_threshold]  || 0.55
+auto_pick_tie_window = opts[:auto_pick_tie_window] || 0.05
+tie_with_second      = best && second && (best['score'] - second['score']) < auto_pick_tie_window
+auto_picked          = opts[:auto_pick] && best && best['score'] >= auto_pick_threshold && !tie_with_second
+
+# Standard recommend path keeps the old semantics.
+recommended_via_std  = best && best['score'] >= opts[:min_score]
+recommended_dm_id    = (auto_picked || recommended_via_std) ? best['dm_id'] : nil
+
+rationale =
+  if best.nil?
+    'no DMs in org'
+  elsif auto_picked
+    "AUTO-PICKED at score #{best['score']} (>= #{auto_pick_threshold}, no tie within #{auto_pick_tie_window}). #{best['shared_columns'].size}/#{tableau_columns.size} cols matched. Caller must WARN about #{best['extra_columns']} inherited columns."
+  elsif best['score'] >= 0.85
+    "auto-reuse candidate (#{best['shared_columns'].size}/#{tableau_columns.size} cols, #{best['shared_tables'].size}/#{tableau_tables.size} tables)"
+  elsif opts[:auto_pick] && best['score'] >= auto_pick_threshold && tie_with_second
+    "would auto-pick but second candidate at #{second['score']} is within #{auto_pick_tie_window} — TIE — falling back to ASK USER"
+  elsif best['score'] >= opts[:min_score]
+    'ambiguous match — ASK USER before reusing'
+  else
+    'no candidate above min-score; build a new DM'
+  end
+
 result = {
   'workbook_signature_path' => opts[:sig],
   'scanned_dm_count'        => candidates.size,
-  'recommended_dm_id'       => (best && best['score'] >= opts[:min_score]) ? best['dm_id'] : nil,
+  'recommended_dm_id'       => recommended_dm_id,
+  'auto_picked'             => auto_picked,
   'score'                   => best ? best['score'] : 0.0,
-  'rationale'               => if best.nil?
-                                  'no DMs in org'
-                                elsif best['score'] >= 0.85
-                                  "auto-reuse candidate (#{best['shared_columns'].size}/#{tableau_columns.size} cols, #{best['shared_tables'].size}/#{tableau_tables.size} tables)"
-                                elsif best['score'] >= opts[:min_score]
-                                  "ambiguous match — ASK USER before reusing"
-                                else
-                                  'no candidate above min-score; build a new DM'
-                                end,
+  'rationale'               => rationale,
   'warning'                 => (best && best['extra_columns'] > 0) ? "Reusing inherits #{best['extra_columns']} extra columns (sample: #{best['extra_columns_sample'].join(', ')})" : nil,
   'candidates'              => candidates.first(5)
 }.compact

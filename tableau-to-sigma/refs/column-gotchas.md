@@ -19,7 +19,7 @@ Examples observed: `DATE` → `Date`, `UNIT PRICE` → `Unit Price`, `ORDER_ID` 
 
 **Practical impact for tableau-to-sigma:** the skill emits raw warehouse refs like `[ORDER_FACT/ORDER_ID]` and they work because of this auto-fix. **Don't fight it** — emit the raw warehouse name, let Sigma normalize. The readback will show you the canonical friendly name if you ever need to write a cross-element ref or controlId.
 
-> **The auto-fix doesn't cover everything.** Some edge cases still produce `Unknown column "[X]"` strings in the compiled SQL — invisible at POST time. Always run `scripts/verify-workbook.sh <workbookId>` after PUT to catch the residue. See Phase 5f in SKILL.md.
+> **The auto-fix doesn't cover everything.** Some edge cases still produce `Unknown column "[X]"` strings in the compiled SQL — invisible at POST time. Always run `scripts/verify-workbook.rb <workbookId>` after PUT to catch the residue. See Phase 5f in SKILL.md.
 
 **Alternate verification: `mcp__sigma-mcp-v2__describe`.** When you want to inspect a single element's compiled column types + resolved formulas without running the bash script, `describe` with `type: workbook-element` returns DDL like `"col-id" number -- "Friendly Name" | Formula: <resolved formula>`. Columns whose type comes back as `error` are the silent-failure case the auto-normalizer didn't fix. Useful during iterative spec authoring.
 
