@@ -54,6 +54,7 @@ which calc translation, which layout) — not orchestration.
 | `scripts/put-layout.rb` | Apply a layout XML to an existing workbook (strips read-only fields) |
 | `scripts/auto-parity-plan.rb` | Phase 6a: auto-build a parity plan by matching Sigma chart elements to Tableau view CSVs (with `--rename` for renamed tiles). Output → `/tmp/<name>/parity-plan.json` wrapped as `{ extract, charts: [...] }` |
 | `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
+| `scripts/export-chart-png.rb` | Phase 6d (visual): export PNG screenshots of every chart in the converted Sigma workbook via `/v2/workbooks/{wb}/export` → `/v2/query/{q}/download`. Catches visual regressions CSV value parity can miss (silently-dropped log scale, missing data labels, wrong chart kind, palette drift). Output: per-element PNGs + `_manifest.json`. Pair with the Tableau MCP `get-view-image` to side-by-side compare source vs target. |
 | `scripts/lib/layout.rb` | Layout-XML helpers (`gc`, `le`, `page_xml`, `assemble`) — `require`'d by per-workbook layout configs |
 
 ---
@@ -940,6 +941,28 @@ even if it disagrees with what's printed above the bars in Tableau.
 `mcp__sigma-mcp-v2__query` with `type="workbook"` appends synthetic columns of the form
 `--metric-["<colId>"]` whose values look like `Column "X.--metric-[...]" does not exist.`.
 Harmless — your explicitly-SELECTed columns return correct values alongside the noise.
+
+### 6f. Visual verification (PNG screenshots)
+
+CSV value parity confirms the *data* matches. It does NOT catch visual regressions: a log-scale axis that silently fails to render, missing data labels, a stacked-vs-grouped bar mix-up, palette drift. For full conversion fidelity, also export PNGs of every chart in the Sigma workbook and side-by-side them with the Tableau source images.
+
+```bash
+ruby scripts/export-chart-png.rb \
+  --workbook <workbookId> \
+  --out-dir /tmp/<name>/screenshots/ \
+  --width 1400 --height 700
+```
+
+Output: one PNG per chart-shaped element, plus a `_manifest.json` mapping element ID → file path, status, and bytes. Pair with the Tableau MCP `get-view-image` (or your own `.twb` view screenshots) for source-vs-target diffs.
+
+The script uses Sigma's `POST /v2/workbooks/{wb}/export` (returns `queryId`) followed by `GET /v2/query/{q}/download` (PNG bytes, ~10–12s typical). All charts export in parallel; the script polls each queryId until ready. Element kinds covered: bar/line/area/combo/scatter/pie/donut, kpi-chart, region-map, point-map, pivot-table, table. Tooltip and other UI-only features (see [[feedback-sigma-trellis-ui-only]], [[feedback-sigma-tooltip-ui-only]]) won't appear in the export because they don't render through the spec API.
+
+When to escalate to a visual check rather than just CSV parity:
+- The Tableau source had log-scale axes, custom min/max, or non-trivial number formats (`-66l`)
+- The chart had data labels turned on (`-cst`)
+- The chart had reference lines/bands/trendlines (`-7ak`, `-2th`)
+- The conversion uses dual-axis combo (`-d73`) — verify the right-hand series is line-shaped, not all bars
+- Any time you're uncertain whether a feature round-tripped — visual diff is the highest-confidence final check
 
 ---
 
