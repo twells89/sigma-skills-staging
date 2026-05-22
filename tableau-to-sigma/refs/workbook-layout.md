@@ -441,11 +441,11 @@ entry to render that series as a line instead:
     {"id": "c-orders",  "formula": "Count([Master/OrderId])", "name": "Orders"}
   ],
   "xAxis": {"columnId": "c-channel"},
-  "yAxis": {"columnIds": ["c-rev", "c-orders"]}
+  "yAxis": {"columnIds": ["c-rev", {"columnId": "c-orders", "type": "line"}]}
 }
 ```
 
-> **Combo-chart per-series type (`bar` vs `line`) is unverified under the new axis shape (2026-05-21 breaking change).** Under the old shape, per-series `type` lived on each `yAxis` array entry. The new `yAxis: {columnIds: [...]}` has no per-entry slot. The canonical place for per-series type is now to be determined — check `jq '.components.schemas.ComboChart' /tmp/sigma-api.json`. Until verified, emit the columns and let the chart editor handle the per-series type post-publish.
+Combo-chart `yAxis.columnIds` is a **mixed array** — bare strings default to bar; objects `{ "columnId": "...", "type": "line" }` override the series type. Verified against the live API 2026-05-21.
 
 ### Scatter chart
 
@@ -595,10 +595,10 @@ the chart editor after publish.
 
 **Series `color` on `yAxis` entries is silently accepted but not persisted.** PUT succeeds without error but GET strips the field. Expected shape for when this is wired up:
 ```json
-"yAxis": {"columnIds": ["col-revenue", "col-orders"]}
+"yAxis": {"columnIds": ["col-revenue", {"columnId": "col-orders", "type": "line"}]}
 ```
 
-Under the old `yAxis: [{id, color, type}]` array-of-objects shape, per-series color/type were attempted as per-entry fields but PUT-stripped on round-trip. The new `yAxis: {columnIds: [...]}` has no per-entry slot. Per-series color and per-series chart type for combo-chart need a different (still-TBD) field — likely a series-config block keyed by `columnId`. Until verified, set series color via the chart editor post-publish.
+Per-series chart type for combo-chart goes in the `yAxis.columnIds` entry as `{"columnId": "...", "type": "line"}` (verified 2026-05-21). Per-series color is still chart-editor-only; the new docs note `seriesDataLabel` exists for combo-chart per-shape label customization — check `jq '.components.schemas.SeriesDataLabel' /tmp/sigma-api.json` for the shape if you need it.
 
 ## Element kinds supported
 

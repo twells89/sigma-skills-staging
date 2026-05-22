@@ -662,8 +662,15 @@ layout.each do |dash|
         x_axis['sort'] = { 'by' => meas_col_obj['id'], 'direction' => sigma_dir }
       end
       element['xAxis'] = x_axis
+      # Combo-chart: yAxis.columnIds is a mixed array — bare strings default to
+      # bar; { columnId, type: 'line' } objects override the series type.
+      # For non-combo: just bare strings.
       y_column_ids = [meas_col_obj['id']]
-      y_column_ids << extra_meas_col['id'] if extra_meas_col
+      if extra_meas_col
+        y_column_ids << (kind == 'combo-chart' ?
+          { 'columnId' => extra_meas_col['id'], 'type' => 'line' } :
+          extra_meas_col['id'])
+      end
       element['yAxis'] = { 'columnIds' => y_column_ids }
     end
 
