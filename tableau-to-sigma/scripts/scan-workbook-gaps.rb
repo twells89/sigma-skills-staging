@@ -53,6 +53,8 @@ INVENTORY = [
     status: :auto, blurb: 'Custom SQL becomes a Sigma data-model element with source.kind="sql".' },
   { name: 'Hyper / Tableau extract',                   pat: /<connection\s[^>]*\bclass='hyper'|<extract\s/,
     status: :hint, blurb: 'Workbook has a .hyper extract — Sigma uses live warehouse data. Phase 6 runs in --extract-mode (structural compare) instead of strict-value.' },
+  { name: 'Cross-extract drift (live warehouse newer than extract)', pat: /<connection\s[^>]*\bclass='hyper'|<extract\s/,
+    status: :manual, blurb: "Tableau extract data range typically lags the live warehouse by months/years (extract has 2023-2024, live warehouse has 2024-2027). Chart actuals WILL diverge on date axes — this is expected, not a converter bug. Tier as YELLOW with error_summary 'extract-vs-live drift'; document the extract refresh date alongside the live warehouse range." },
   { name: 'Table-calc INDEX/LOOKUP/TOTAL/RANK/ZN/IIF', pat: /\b(INDEX\(\)|LOOKUP\(|TOTAL\(|RANK\b|RANK_DENSE|RANK_PERCENTILE|\bZN\(|\bIIF\(|\bCOUNTD\()/,
     status: :auto, blurb: 'Auto-translated to Sigma RowNumber/Lag/Lead/Rank/Coalesce/If/CountDistinct.' },
   { name: 'Negative number format (parens)',           pat: /;\s*\([^)]*\)/,

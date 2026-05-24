@@ -1194,6 +1194,8 @@ When the Tableau workbook (or its datasource) has `hasExtracts: true`, the view 
 
 If the customer expects Tableau-extract numbers to match Sigma-live numbers exactly, the answer is to refresh the Tableau extract before exporting CSVs OR to point Sigma at the same snapshot via a saved query. Otherwise live-vs-extract divergence is structural, not a parity bug.
 
+> **Cross-extract drift parity rule.** If the workbook uses a Tableau extract (`hasExtracts: true` on the workbook OR its datasource), values WILL diverge from live warehouse data on time-dimension axes — extracts typically lag the warehouse by months or years (e.g. extract last refreshed in 2024 vs live Snowflake data through 2027). **Parity divergence in this case is expected, not a converter bug.** Tier the affected charts YELLOW with `error_summary: "extract-vs-live drift"`. `scan-workbook-gaps.rb` flags this as a `manual: Cross-extract drift` gap during Phase 0 so the agent sets expectations up front.
+
 ### 6e. Triage divergences (strict mode)
 
 | Symptom | Likely cause |
