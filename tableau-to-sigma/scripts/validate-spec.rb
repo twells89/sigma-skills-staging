@@ -137,6 +137,27 @@ spec.fetch('pages', []).each do |page|
       end
     end
 
+    # --- Color-channel shape — cartesian + map charts use {by, column}, NOT {id}.
+    # Pie/donut use {id}. Caught 2 of Superstore's HTTP 400s (area + region-map).
+    if %w[bar-chart line-chart area-chart combo-chart scatter-chart region-map point-map].include?(kind)
+      if (color = el['color']).is_a?(Hash) && color['id'] && !color['by'] && !color['column']
+        errors << "#{name}: #{kind} color uses pie/donut shape {id: ...} — must be {by: \"category\"|\"scale\", column: \"...\"} for cartesian + map charts (API rejects with `Invalid value: object`)"
+      end
+    end
+
+    # --- Axis sort direction — must be "ascending"/"descending", NOT "asc"/"desc".
+    # Caught 1 of Superstore's HTTP 400s.
+    %w[xAxis yAxis].each do |axis_key|
+      ax = el[axis_key]
+      ax = ax.first if ax.is_a?(Array) && ax.first.is_a?(Hash)
+      next unless ax.is_a?(Hash)
+      next unless (sort = ax['sort']).is_a?(Hash)
+      dir = sort['direction']
+      if %w[asc desc].include?(dir)
+        errors << "#{name}: #{axis_key}.sort.direction \"#{dir}\" — must be \"ascending\" or \"descending\" (API rejects abbreviations)"
+      end
+    end
+
     if %w[bar-chart line-chart area-chart combo-chart scatter-chart].include?(kind)
       errors << "#{name}: use yAxis not measures for #{kind}" if el['measures']
       errors << "#{name}: #{kind} missing yAxis" unless el['yAxis']
@@ -156,6 +177,24 @@ spec.fetch('pages', []).each do |page|
     if kind == 'pivot-table'
       errors << "#{name}: pivot-table must use rowsBy/columnsBy" if el['rows'] || el['columnGroups']
       errors << "#{name}: pivot-table without rowsBy renders only a grand-total row" if (el['rowsBy'] || []).empty?
+      # Wrong-field-name: agents often write `valuesBy` because rowsBy/columnsBy
+      # exist. The right field is bare `values`. Caught 1 of Superstore's HTTP 400s.
+      if el['valuesBy'] && !el['values']
+        errors << "#{name}: pivot-table field is `values` (bare string array), not `valuesBy` — rename `valuesBy` → `values`"
+      end
+      # Month-name string dimension on a pivot sorts alphabetically (Apr / Aug /
+      # Dec / Feb...). Catch the common MonthName(...) formula on a rowsBy /
+      # columnsBy column. Suggest Month(...) (returns 1-12) or a pre-computed
+      # Month Num column.
+      pivot_dim_ids = (el['rowsBy'].to_a + el['columnsBy'].to_a)
+                      .select { |x| x.is_a?(Hash) }.map { |x| x['id'] }.compact.to_set
+      cols.each do |col|
+        next unless pivot_dim_ids.include?(col['id'])
+        f = col['formula'].to_s
+        if f =~ /\bMonthName\s*\(/i || f =~ /\bDayName\s*\(/i
+          errors << "#{name}.#{col['name']}: pivot-table dim uses MonthName/DayName (string) — sorts alphabetically (Apr/Aug/Dec/Feb...). Use Month(...) (1-12) / Weekday(...) (1-7) for chronological order, then format the label downstream."
+        end
+      end
       # Shape: values is a flat string-array of column IDs; rowsBy/columnsBy are {id: "..."} object arrays.
       # Mixing these up costs multiple POST iterations because the API rejects with a generic Invalid array message.
       if (vals = el['values']).is_a?(Array)
