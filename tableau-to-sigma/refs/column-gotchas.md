@@ -201,6 +201,31 @@ matches.
 > **Always confirm by inspecting the CSV before picking a formula.** Tableau worksheet titles
 > ("Monthly Revenue Trend") don't tell you which form is in use; the CSV does.
 
+## Integer columns as boolean predicates in `If(...)` fail at render
+
+Sigma's SQL compiler accepts `If([Is Returned], 1, 0)` when `[Is Returned]` is a
+Snowflake `NUMBER(1,0)` (bit-like) column — `verify-workbook.rb` reports the
+chart compiles **clean** because the column type comes back as `number`, not
+`error`. But at render time Sigma throws `Invalid Query: Argument 1 invalid`
+and the chart blanks out.
+
+**Fix — rewrite as an explicit comparison:**
+
+```json
+{"formula": "If([Is Returned] = 1, 1, 0)"}
+```
+
+Apply to any integer/bit column used as the first argument of `If()`. The same
+pattern breaks `Switch([Some Int Col], ...)` — wrap in an explicit comparison
+or `Text()` cast as needed.
+
+**Detection — verify-workbook does NOT catch this.** Sigma reports the formula
+as compiling to a valid `number` type during PUT readback. Only Phase 6f's
+`POST /v2/workbooks/{wb}/export` + PNG inspection catches the render-time
+failure (the chart exports as an empty plot area). Always run Phase 6f when an
+`If()` predicate is an integer column. Verified 2026-05-24 against OCT's
+`Is Returned` column on `TJ.PUBLIC.SUPERSTORE_ORDERS`.
+
 ## YAML response from spec endpoints
 
 `POST /v2/dataModels/spec` and `POST /v2/workbooks/spec` return **YAML**, not JSON.
