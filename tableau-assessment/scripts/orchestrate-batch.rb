@@ -247,6 +247,42 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
     - Fetch chart actuals via `mcp__sigma-mcp-v2__query` in one parallel batch.
     - Source `phase-timer.sh` and write phase-timings.json to your working dir.
 
+    >>>>>> SPEC-SHAPE GOTCHAS — pre-warning <<<<<<
+
+    These seven shapes keep getting relearned at runtime across audit batches.
+    Bake them into your spec from the first POST attempt — do NOT discover
+    them by HTTP 400.
+
+    - bar/line/area/scatter/combo `yAxis: { columnIds: [<id>, ...] }` —
+      a single object whose `columnIds` is an array. NOT a bare array
+      (`yAxis: [<id>]`) and NOT `yAxis: { columnId: ... }`.
+    - chart `color: { by: "category" | "scale", column: <id> }`. NOT
+      `{ columnId: <id> }`. `by` is required; `column` (singular) names the
+      column ID.
+    - `region-map` geography: `region: { id: <col-id>, regionType: "us-state" }`.
+      NOT `geography: ...`. Valid regionTypes: `us-state`, `us-county`,
+      `us-zipcode` (NOT `us-zip`), `us-cbsa` (NOT `us-msa`), `country`.
+    - sort direction: `direction: "ascending" | "descending"` — full words.
+      `asc` / `desc` are silently dropped and the chart renders unsorted.
+    - DM relationships: `keys: [{ columnA: <id>, columnB: <id> }, ...]`.
+      NOT `joinColumns: [...]`. The keys live on the source element, not the
+      target.
+    - Lookup formulas reference **column DISPLAY names**, not column IDs:
+      `Lookup([Other_DM/Customer Name], [Master/Customer Key], [Other_DM/Customer Key])`.
+      Element-name then slash then human-readable column name (the `name`
+      field, never the `id` field). Cross-element refs inside a DM use
+      `[BaseElement/REL_NAME/Field]`.
+    - pivot-table value/dim shapes are NOT symmetric:
+        values:    [<bare-id-string>, ...]          # array of strings
+        rowsBy:    [{ id: <col-id> }, ...]          # array of objects
+        columnsBy: [{ id: <col-id> }, ...]          # array of objects
+      Mixing these (`values: [{id: ...}]` or `rowsBy: ["..."]`) silently
+      renders an empty pivot. Verified 2026-05-24.
+    - pivot-table / table `conditionalFormats[].columnIds` — NOT `columns`.
+      The first POST in audit-run-1 (NASA agent) failed because the
+      staging workbook-layout.md showed `columns`; the live API requires
+      `columnIds`. Verified 2026-05-24.
+
     DELIVERABLES on completion — APPEND ONE LINE to `#{batch_results_path}`
     as JSON (newline-delimited; tolerate races with file locking):
       { workbookId, cluster_id: "#{sub['cluster_id']}", role: "#{reuse ? 'follower' : 'leader'}",
