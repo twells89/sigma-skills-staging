@@ -45,11 +45,35 @@ OptionParser.new do |p|
   p.on('--concurrent N', Integer)  { |v| opts[:concurrent] = v }
   p.on('--limit N',      Integer)  { |v| opts[:limit]      = v }
   p.on('--workbook-ids IDS')       { |v| opts[:wb_ids] = v.split(',') }
+  # --ds-override <path-to.json>
+  # JSON shape:
+  #   { "<cluster_id>": {
+  #       "warehouse_tables": ["TJ.PUBLIC.NASA_GISS_LOTI", ...],
+  #       "table_columns":    { "TJ.PUBLIC.NASA_GISS_LOTI": ["YEAR", ...] },
+  #       "build_4_panel_dashboard": true,
+  #       "note": "human-readable why-this-override note for the subagent"
+  #     },
+  #     "<cluster_id_2>": { ... } }
+  # Used to fix clusters whose .twb-extracted "tables" are Tableau extract
+  # tokens (`EXTRACT.EXTRACT`, `*#CSV`) instead of real warehouse tables.
+  # Auto-detection of bogus tokens is OUT OF SCOPE — humans pass overrides
+  # via this flag based on assessment-readout review.
+  p.on('--ds-override PATH',
+       'JSON map cluster_id -> {warehouse_tables, table_columns, note} ' \
+       'overriding .twb-extracted tables for that cluster.') { |v| opts[:ds_override] = v }
 end.parse!
 %i[plan out].each { |k| abort "missing --#{k}" unless opts[k] }
 
 FileUtils.mkdir_p(opts[:out])
 plan = JSON.parse(File.read(opts[:plan]))
+
+# Load DS overrides up-front so cluster-leader briefs reference real tables.
+overrides = {}
+if opts[:ds_override]
+  abort "ds-override file not found: #{opts[:ds_override]}" unless File.exist?(opts[:ds_override])
+  overrides = JSON.parse(File.read(opts[:ds_override]))
+  abort '--ds-override must be a JSON object keyed by cluster_id' unless overrides.is_a?(Hash)
+end
 
 # Select workbooks for this batch — explicit IDs if given, else use the
 # suggested_batch from the plan (top N by score, already filtered to
@@ -117,12 +141,39 @@ end
 # Brief generator. The conversation-layer feeds this string into the `prompt:`
 # of an Agent() call. Brief is self-contained — subagent doesn't see the
 # outer session's history.
-def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir)
+# Per-cluster warehouse-tables, with optional CLI override applied. See
+# --ds-override flag — humans pass a JSON map of `cluster_id` →
+# `{ warehouse_tables: [...], table_columns: {...}, build_4_panel_dashboard: bool, note: "..." }`
+# to correct clusters whose .twb-extracted "tables" are Tableau extract
+# tokens (e.g. `EXTRACT.EXTRACT`, `*#CSV`) instead of real Snowflake tables.
+def effective_warehouse_tables(cluster, overrides)
+  ov = overrides[cluster['cluster_id']]
+  return cluster['shared_warehouse_tables'] unless ov && ov['warehouse_tables']
+  ov['warehouse_tables']
+end
+
+def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, overrides = {})
   wb = sub['workbook']
   reuse = sub['reuse_leader']
   png_count = cached_png_count(wb['name'], out_dir)
   png_count_str = png_count ? "approximately #{png_count}" : 'one per dashboard sheet'
   wb_dir_hint = wb['name'].to_s.gsub(/\W+/, '-').downcase
+  override = overrides[sub['cluster_id']] || {}
+  shared_tables = effective_warehouse_tables(cluster, overrides)
+  override_block =
+    if override.any?
+      <<~OV
+        DS OVERRIDE (operator-supplied) — DO NOT use the .twb-extracted tables.
+        Use these instead for all DM sourcing and parity work:
+          warehouse_tables: #{(override['warehouse_tables'] || []).inspect}
+        #{override['table_columns'] ? "  table_columns:    #{override['table_columns'].to_json}" : ''}
+        #{override['build_4_panel_dashboard'] ? '  build_4_panel_dashboard: true' : ''}
+        #{override['note'] ? "  note: #{override['note']}" : ''}
+
+      OV
+    else
+      ''
+    end
   <<~BRIEF
     Convert one Tableau workbook to Sigma using the tableau-to-sigma skill.
 
@@ -133,7 +184,7 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir)
 
     SKILL: ~/.claude/skills/tableau-to-sigma/  (read SKILL.md fully)
 
-    #{reuse ? <<~REUSE : <<~LEAD}
+    #{override_block}#{reuse ? <<~REUSE : <<~LEAD}
       DM REUSE — your cluster leader has already built/picked the DM. Read
       `#{leader_dm_id_path}` for `{ dataModelId, fact_element_id, denorm_plan_path }`.
       Skip Phase 2 + 3 entirely. In Phase 4, source your workbook's master
@@ -146,7 +197,7 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir)
       (a) find a reusable DM in this org via Phase 1.5 picker, then run
           Phase 1.5b inspect-dm-shape.rb on it, OR
       (b) build a new DM (Phases 2-4) sourcing from these shared warehouse
-          tables: #{cluster['shared_warehouse_tables'].inspect}
+          tables: #{shared_tables.inspect}
       Once your DM is determined, WRITE `#{leader_dm_id_path}` with
       `{ dataModelId, fact_element_id, denorm_plan_path }` so followers can
       reuse it. If you ran inspect-dm-shape.rb, that's the denorm_plan_path.
@@ -244,7 +295,7 @@ schedule = waves.map do |wave|
         'workbookId'       => sub['workbook']['workbookId'],
         'workbook_name'    => sub['workbook']['name'],
         'leader_dm_id_path'=> leader_dm_id_path,
-        'agent_brief'      => agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, opts[:out])
+        'agent_brief'      => agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, opts[:out], overrides)
       }
     end
   }
@@ -303,6 +354,13 @@ puts "  clusters:  #{clusters.size}"
 puts "  workbooks: #{selected.size}"
 schedule.each do |w|
   puts "  wave #{w['wave']} (#{w['kind']}): #{w['subagent_count']} subagents @ concurrency=#{w['concurrency']}"
+  # Per-subagent line — emit the actual role pulled from the subagent entry,
+  # not an empty placeholder. Previously the loop emitted `<name> ()` because
+  # `role` was sourced from an empty variable instead of the wave kind /
+  # subagent entry.
+  w['subagents'].each do |sa|
+    puts "    - #{sa['workbook_name']} (#{sa['role']}) [cluster #{sa['cluster_id']}]"
+  end
 end
 puts ""
 puts "To execute (from the conversation-layer agent):"
