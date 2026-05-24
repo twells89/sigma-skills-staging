@@ -199,8 +199,19 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
       (b) build a new DM (Phases 2-4) sourcing from these shared warehouse
           tables: #{shared_tables.inspect}
       Once your DM is determined, WRITE `#{leader_dm_id_path}` with
-      `{ dataModelId, fact_element_id, denorm_plan_path }` so followers can
-      reuse it. If you ran inspect-dm-shape.rb, that's the denorm_plan_path.
+      `{ dataModelId, fact_element_id, fact_element_name, denorm_plan_path }`
+      so followers can reuse it. If you ran inspect-dm-shape.rb, that's the
+      denorm_plan_path.
+
+      **`fact_element_name` MUST be the live name on the DM**, not whatever
+      you originally wrote in your spec. After POSTing the DM (or after
+      Phase 1.5 picks one), you MUST introspect via:
+        GET /v2/dataModels/<dataModelId>/spec
+      and read the actual `name` attribute on your chosen fact element.
+      Audit-run-1 (Orders cluster) had a leader write `fact_element_name: "Fact"`
+      when the live element was `ORDER_FACT` — its follower had to GET the
+      leader's workbook spec to recover, costing ~2 min. Don't repeat that:
+      the GET-and-record step is cheap and mandatory.
     LEAD
 
     >>>>>> CRITICAL — VISUAL FIDELITY REQUIREMENT <<<<<<
