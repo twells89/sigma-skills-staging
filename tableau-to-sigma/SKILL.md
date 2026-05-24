@@ -390,6 +390,52 @@ to reference. Example: a Tableau "Customer Value Tier" calc that buckets
 `Lifetime Revenue` must be re-derived in Sigma from `LIFETIME_REVENUE`, not
 pulled from a same-named `LOYALTY_TIER` warehouse column.
 
+### 1e.1. Warehouse-table source rejected? Fall back to Custom SQL
+
+> **Verified 2026-05-24** against the `tj-wells-1989` org during audit-run-1.
+> Two agents (Superstore, NASA) hit `Source not found: warehouse table
+> 'TJ.PUBLIC.XXX' on connection 'YYY'` POSTing a DM element whose
+> `source.kind: "warehouse-table"` pointed at a table that physically existed
+> in the warehouse and was queryable via `mcp__sigma-mcp-v2__query`. This is
+> a **Sigma static-catalog visibility** issue: the `warehouse-table` source
+> path requires the table to be indexed in Sigma's internal catalog, which
+> does NOT auto-refresh after every warehouse-side landing (VDS write, dbt
+> run, manual CREATE TABLE). There is currently no public API to force a
+> catalog refresh; the UI's "Refresh schema" action on the connection page
+> is the only mechanism, and you usually can't drive it from the conversion
+> agent.
+
+The fallback is to source the same table via Custom SQL:
+
+```json
+{
+  "id": "el-orders",
+  "kind": "table",
+  "name": "Orders",
+  "source": {
+    "kind": "sql",
+    "connectionId": "<connection-id>",
+    "statement": "SELECT * FROM TJ.PUBLIC.NASA_GISS_LOTI"
+  },
+  "columns": [
+    { "id": "c-year", "name": "Year", "formula": "[Custom SQL/YEAR]" },
+    { "id": "c-temp", "name": "Temp Anomaly", "formula": "[Custom SQL/TEMP_ANOMALY]" }
+  ]
+}
+```
+
+This works because Custom SQL bypasses the catalog entirely — the connection
+just executes the statement and Sigma reads whatever columns come back. The
+trade-offs vs `warehouse-table` are:
+
+- column-level lineage is hidden (Sigma sees one opaque SQL statement)
+- per-column governance / CLS doesn't auto-apply
+- the warehouse-side query optimizer treats it as a sub-select
+
+For a customer-facing conversion these trade-offs are acceptable; for a
+"production" DM build, ask the customer to refresh the Sigma connection's
+schema in the UI and retry with `warehouse-table`.
+
 ### 1f. Extract Custom SQL (PAT mode)
 
 If the source workbook uses Custom SQL — either as the entire datasource or
