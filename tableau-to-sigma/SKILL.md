@@ -48,6 +48,9 @@ which calc translation, which layout) — not orchestration.
 | `scripts/estimate-cost.rb` | Predict input/output token cost from workbook + datasource metadata |
 | `scripts/fetch-view-data.rb` | Parse pre-fetched view CSVs into a signals manifest (distinct values, date min/max, agg hints) |
 | `scripts/discover-warehouse-columns.rb` | Parallel-fetch Sigma column metadata for N table inodeIds |
+| `scripts/probe-custom-sql-columns.rb` | **Phase 1e.1:** when discover-columns 404s (catalog miss), probe column names + types via a one-shot Custom-SQL probe workbook that SELECTs INFORMATION_SCHEMA, exports CSV, and self-destructs. ~6s end-to-end. Saves ~120s on every Custom-SQL fallback vs. POST-fail-cleanup column-name guessing. |
+| `scripts/find-prior-cache.rb` | **Phase 1d-cache (Phase -1):** detect cached Tableau-discovery + Sigma-conversion artifacts from prior `audit-run-*` or `converter-test` runs so re-conversions skip discovery (~3 min saved). |
+| `scripts/remap-wb-spec-to-dm-ids.rb` | When a DM is re-POSTed and element IDs churn, remaps a cached `wb-spec.json` to the new IDs via name-based matching. Optional `--rename` for renamed elements. |
 | `scripts/extract-calc-fields.rb` | Pull every Tableau CALCULATION field (with formula) + translation notes |
 | `scripts/validate-spec.rb` | DM or workbook spec validator. Accepts `--type` and `--dm-context` |
 | `scripts/post-and-readback.rb` | POST a DM or workbook spec, parse YAML response, GET back the spec, emit element ID map. Also runs a universal **column-type guard** afterward: any column whose formula resolved to type `error` aborts the script with exit 2 and the failing formula. Catches silent-error columns the validator doesn't pattern-match (typo refs, `IsIn`, unsupported functions) without waiting for Phase 6. |
@@ -286,6 +289,30 @@ mcp__tableau__get-workbook   workbookId="<luid>"
 
 Returns the list of views (sheets) with their `id` and `name`. Record all view IDs.
 
+### 1d-cache. Reuse prior conversion artifacts when present (PHASE -1)
+
+Before re-running tableau-discover / fetch-view-data / parse-twb-layout, check
+for cached artifacts from a previous run. The standalone Workforce conversion
+on 2026-05-22 found cached audit-run-1 artifacts in
+`/tmp/audit-run-1/workforce/` (views CSVs, view PNGs, signature, dm-spec,
+wb-spec, dashboard layout meta) — re-running discovery cost ~3 minutes that
+could have been zero.
+
+```bash
+ruby scripts/find-prior-cache.rb --name <workbook-slug> --out /tmp/<name>/prior-cache.json
+```
+
+The script searches `/tmp/audit-run-*/<name>/`, `/tmp/converter-test/<name>/`,
+and `/tmp/<name>/` for: views CSVs, views PNGs, `workbook-content.twb`,
+gaps-report, dashboard-layout JSON, get-workbook.json, dm-spec.json /
+wb-spec.json (and their ID maps), and the workbook signature. Output is a
+JSON map of artifact name → absolute path (or null).
+
+**Use the cached artifacts as-is** when they exist and the workbook hasn't
+changed — copy them into your working directory (or symlink) and skip the
+corresponding fetch step. The DM/wb specs become your reference for ID
+mapping after a re-POST (see `scripts/remap-wb-spec-to-dm-ids.rb`).
+
 ### 1d. Retrieve view data and images
 
 Two different fetches with very different cost profiles. **Don't conflate them.**
@@ -368,6 +395,17 @@ Does **not** support via the spec API: bullet chart, gantt.
 
 **Trellis (small multiples) is supported in Sigma but configured UI-only.** Build the chart with the right dimensions via spec, then trellis it manually post-publish.
 
+> **Log-scale axes round-trip through the spec.** `parse-twb-layout.rb` extracts
+> `axis_formats[].scale: "log"` from each worksheet's `<axes>` block, and
+> `build-charts-from-signals.rb` emits it as
+> `element.yAxis.format.scale = { type: "log", domain: {min, max} }` whenever
+> `range_type == "fixed"`. **If you hand-write the workbook spec instead of
+> running build-charts-from-signals.rb, you MUST copy this manually** —
+> otherwise the chart silently degrades to linear scale (OCT lost the Monthly
+> Trend log axis this way on 2026-05-24). Always grep
+> `dashboard-layout-meta.json` for `"scale": "log"` before declaring Phase 5
+> done.
+
 Control types supported: `list`, `date-range`, `text`, `text-area`, `segmented`, `number`, `number-range`, `slider`, `range-slider`, `top-n`.
 See `refs/workbook-layout.md` for full control element spec patterns.
 
@@ -427,6 +465,27 @@ The fallback is to source the same table via Custom SQL:
 This works because Custom SQL bypasses the catalog entirely — the connection
 just executes the statement and Sigma reads whatever columns come back. The
 trade-offs vs `warehouse-table` are:
+
+> **Don't guess column names.** Sigma's spec API does not expose the columns
+> of a SQL element until you've already declared them in the spec, which is a
+> chicken-and-egg problem during the fallback. Run
+> `scripts/probe-custom-sql-columns.rb` to resolve real column names + types
+> via an INFORMATION_SCHEMA query through a one-shot probe workbook (auto-
+> created, exported as CSV, deleted; ~6s end-to-end):
+>
+> ```bash
+> ruby scripts/probe-custom-sql-columns.rb \
+>   --connection-id <id> \
+>   --table-path DB.SCHEMA.TABLE \
+>   [--dialect snowflake|postgres|bigquery|redshift|sqlserver] \
+>   --out /tmp/<name>/probe-columns.json
+> ```
+>
+> Validated 2026-05-24 against TJ.PUBLIC.SUPERSTORE_ORDERS — 19 columns
+> resolved in 7s. **Saves ~120s on every Custom SQL fallback** vs.
+> POST-fail-cleanup-retrying on column-name permutations (CUSTOMER_ID vs
+> CUST_ID vs ID vs RECORD_ID…). Don't skip this step.
+
 
 - column-level lineage is hidden (Sigma sees one opaque SQL statement)
 - per-column governance / CLS doesn't auto-apply
@@ -650,6 +709,22 @@ Write the spec to `/tmp/<name>/dm-spec.json`. Full schema is in
 
 1. **Endpoint**: `POST /v2/dataModels/spec` — NOT `/v2/workbooks/spec`.
 2. **`folderId` is required.** Find it via `GET /v2/files?typeFilters=workbook` — `parentId` on any of your workbooks.
+3. **Top-level shape uses `pages: [{elements: [...]}]`, NOT a bare `elements: [...]` at root.** The API rejects root-level `elements` with `pages: Invalid array: undefined`. Even if your DM only has one logical page (typical), still wrap the elements under a single page:
+   ```json
+   {
+     "name": "Orders",
+     "folderId": "<folder>",
+     "schemaVersion": 1,
+     "pages": [
+       {
+         "id": "p-data",
+         "name": "Data",
+         "elements": [ { /* warehouse-table or sql element */ } ]
+       }
+     ]
+   }
+   ```
+   This is the same shape `refs/data-model-spec.md` documents; the abbreviated examples below show only the element body — wrap them in `pages: [{elements: [...]}]` before POSTing.
 3. **Column name special characters** — read `refs/column-gotchas.md`. Rename any column whose `name` contains `/` ("Country/Region" → `"Country"`, "State/Province" → `"State"`).
 4. **Element name = formula prefix**. The `name` field on a DM element (e.g. `"Orders"`) becomes the prefix in all workbook formulas that reference it: `[Orders/Sales]`. Choose clean, stable names.
 5. **Relationships go on the source element**, not the target. See `refs/data-model-spec.md`.
@@ -849,6 +924,18 @@ Spec skeleton (two pages, master on `Data`, all charts on `Orders Overview`):
       "elements": [
         { "id": "txt-title", "kind": "text", "body": "# Orders Dashboard" },
         {
+          "id": "el-ctl-date",
+          "kind": "control",
+          "controlId": "ctl-date",
+          "name": "Order Date",
+          "controlType": "date-range",
+          "selectionMode": "ranges",
+          "source": { "kind": "source" },
+          "mode": "between",
+          "filters": [{ "source": { "kind": "table", "elementId": "master" }, "columnId": "m-order-date" }],
+          "includeNulls": "when-no-value-is-selected"
+        },
+        {
           "id": "el-kpi-sales",
           "kind": "kpi-chart",
           "source": { "kind": "table", "elementId": "master" },
@@ -867,6 +954,32 @@ Rules:
 - Charts and controls source the master with `"elementId": "master"` regardless of which page they live on — cross-page references are fully supported.
 - Chart-column formulas use the master table's `name` as prefix (`[Master/Sales]`).
 - Layout XML must produce **one `<Page>` tag per page**, including a tiny full-width `<LayoutElement elementId="master" .../>` inside the Data page's `<Page>`.
+
+> **Control element skeleton — every field is required.** First POSTs commonly
+> fail with `Invalid kind: "control"` because one of these is missing. The
+> shape above (the `el-ctl-date` example) is the minimum the API accepts:
+>
+> - `kind: "control"` and a distinct `id` + `controlId` (they share a
+>   namespace — use `id: "el-ctl-X"`, `controlId: "ctl-X"` to avoid the
+>   `Duplicate id` error).
+> - `controlType` — one of: `list`, `date-range`, `text`, `text-area`,
+>   `segmented`, `number`, `number-range`, `slider`, `range-slider`, `top-n`.
+> - `selectionMode` — typically `ranges` (date-range), `single` (segmented /
+>   list), `multiple` (list with checkboxes).
+> - `source: { kind: "source" }` — yes, the literal string `"source"`. This
+>   tells Sigma the control is its own source (not bound to a table column for
+>   its option set).
+> - `mode` — `between` for date-range, `current` for relative-date, `include`
+>   for list, `=` / `<` / `>` etc. for number.
+> - `filters: [{ source: { kind: "table", elementId: <id> }, columnId: <id> }]`
+>   — wires the control to the master-table column(s) it filters. Repeatable
+>   to filter multiple charts.
+> - `includeNulls: "when-no-value-is-selected"` — sane default; otherwise rows
+>   with NULL on the filtered column drop out of every chart whenever the
+>   control is unset.
+>
+> Full surface (range-slider, segmented options, top-n) in
+> `~/sigma-skills/sigma-workbooks/reference/specification/controls.md`.
 
 > **Master-table column scope.** Default: pull every column you've already denormalized
 > in the DM into the master with passthrough formulas. The master is cheap; amending it
@@ -918,6 +1031,19 @@ ruby scripts/post-and-readback.rb --type workbook \
 
 Write a per-workbook layout config that `require`s the helper library. Never hand-write
 layout XML.
+
+> **PUT /v2/workbooks/{id}/spec wipes the top-level `layout` string.** If you
+> re-PUT the workbook spec after a formula fix (or any other spec edit), the
+> existing layout is **erased** and the workbook reverts to a single
+> auto-stacked column. Two ways to avoid the round trip:
+> 1. **Preferred:** re-emit the layout XML in the same PUT body — set
+>    `spec.layout` to the assembled XML string before PUTting.
+> 2. Or PUT layout separately AFTER spec via `scripts/put-layout.rb`. That
+>    script GETs the spec, replaces just the layout field, and PUTs back. Cost:
+>    one extra round trip (~5-15s) and an export to confirm.
+>
+> The OCT standalone conversion lost 18s on this round trip; document the
+> pattern up front.
 
 ```ruby
 # /tmp/<name>/build-layout.rb
