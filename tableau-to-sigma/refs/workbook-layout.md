@@ -1191,27 +1191,9 @@ Sum(If([p_date_dimension] = "Month", [Sales], Null))
 }
 ```
 
-### slider — single value with bounds
+### slider / range-slider — DO NOT use these `controlType` values
 
-```json
-{
-  "kind": "control", "controlId": "slider-discount", "name": "Max Discount",
-  "controlType": "slider", "low": 0, "high": 100, "mode": "<=", "value": 0,
-  "includeNulls": "when-no-value-is-selected",
-  "filters": [{"source": {"kind": "table", "elementId": "<element-id>"}, "columnId": "<col-id>"}]
-}
-```
-
-### range-slider — range with two handles
-
-```json
-{
-  "kind": "control", "controlId": "range-slider-sales", "name": "Sales Range",
-  "controlType": "range-slider", "low": 0, "high": 100, "max": 100,
-  "includeNulls": "when-no-value-is-selected",
-  "filters": [{"source": {"kind": "warehouse-table", "connectionId": "<id>", "path": [...]}, "columnId": "SALES"}]
-}
-```
+> **Verified 2026-05-24 against sigma-skill-recon tests #2-3.** POST with `controlType: slider` or `controlType: range-slider` is rejected with HTTP 400 `Invalid kind: "control"`. **These types do not exist.** Build sliders as a `number-range` control with `mode: between` and a two-element `values` array. See `~/sigma-skills/sigma-workbooks/reference/specification/controls.md` (Slider section) for the canonical pattern, and note that `values` on `number-range` does not reliably round-trip — it reads back as null on GET even though the published workbook respects it.
 
 ### top-n — filter to top or bottom N items
 
