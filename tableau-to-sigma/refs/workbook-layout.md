@@ -837,6 +837,8 @@ Use `rowsBy`, `columnsBy`, and `values`. **Do NOT use `rows` or `columnGroups`**
 - `rowsBy`: array of **objects** `{"id": "col-id"}` — row groupings (left axis)
 - `columnsBy`: array of **objects** `{"id": "col-id"}` — column pivots (top axis)
 
+> **`columnsBy[].sort` is NOT supported.** PUT returns HTTP 400 `sort shape not supported on columnsBy`. Sigma orders pivot columns by the natural order of the underlying column values: alphabetical for strings, numeric for numbers, chronological for dates / integers used as a date-of-year key. To control column order, pre-compute an integer sort key column (e.g. `Month([Master/Order Date])` returns 1-12 and sorts chronologically) and use that as the `columnsBy` field instead of a string. Today's Superstore lesson: `MonthName()` (string) sorted alphabetically (April, August, December, …) until swapped to `Month()` (integer) which sorted Jan→Dec. Verified 2026-05-24.
+
 ```json
 {
   "kind": "pivot-table",
