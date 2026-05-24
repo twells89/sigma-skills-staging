@@ -97,12 +97,32 @@ follower_subs = clusters.flat_map do |c|
 end
 waves << { 'wave' => 1, 'kind' => 'followers', 'subagents' => follower_subs } if follower_subs.any?
 
+# Best-effort PNG count from a cached views dir at /tmp/<wb-name>/views/*.png.
+# Returns nil if we can't introspect — the brief then falls back to a fetch
+# instruction instead of a hardcoded count.
+def cached_png_count(wb_name, out_dir)
+  candidates = [
+    File.join('/tmp', wb_name.to_s.gsub(/\W+/, '-').downcase, 'views'),
+    File.join(out_dir.to_s, wb_name.to_s.gsub(/\W+/, '-').downcase, 'views-png'),
+    File.join(out_dir.to_s, wb_name.to_s.gsub(/\W+/, '-').downcase, 'views')
+  ]
+  candidates.each do |d|
+    next unless File.directory?(d)
+    pngs = Dir.glob(File.join(d, '*.png'))
+    return pngs.size unless pngs.empty?
+  end
+  nil
+end
+
 # Brief generator. The conversation-layer feeds this string into the `prompt:`
 # of an Agent() call. Brief is self-contained — subagent doesn't see the
 # outer session's history.
-def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path)
+def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir)
   wb = sub['workbook']
   reuse = sub['reuse_leader']
+  png_count = cached_png_count(wb['name'], out_dir)
+  png_count_str = png_count ? "approximately #{png_count}" : 'one per dashboard sheet'
+  wb_dir_hint = wb['name'].to_s.gsub(/\W+/, '-').downcase
   <<~BRIEF
     Convert one Tableau workbook to Sigma using the tableau-to-sigma skill.
 
@@ -132,6 +152,43 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path)
       reuse it. If you ran inspect-dm-shape.rb, that's the denorm_plan_path.
     LEAD
 
+    >>>>>> CRITICAL — VISUAL FIDELITY REQUIREMENT <<<<<<
+
+    You MUST treat the source dashboard PNGs as ground truth — CSV column
+    parity alone has shipped customer-visible visual regressions (heatmaps
+    rendered as bar charts, log scales silently dropped, missing annotations).
+
+    BEFORE writing any workbook spec:
+    1. Read every per-sheet PNG at `<out-dir>/<wb-dir>/views-png/*.png`
+       OR `/tmp/#{wb_dir_hint}/views/*.png` via the Read tool. Expected
+       count: #{png_count_str}. If the directory is empty, fall back to
+       `mcp__tableau__get-view-image` per view (one solo request at a time —
+       parallel requests 401).
+    2. For each PNG, decide: chart kind, dual-axis vs single, annotations,
+       data labels, axis scale (log vs linear), reference lines, palette.
+
+    AFTER workbook PUT, BEFORE declaring GREEN:
+    3. POST `/v2/workbooks/{wb}/export` with body
+       `{pageId, format: {type: "png", pixelWidth: 1920, pixelHeight: 1500}}`,
+       then poll `GET /v2/query/{q}/download` until content-type is image/png.
+       Save the bytes to `<out-dir>/<wb-dir>/sigma-render.png`.
+    4. Read `sigma-render.png` via the Read tool and visually compare it
+       to each source PNG you read in step 1. Document any divergence in
+       the result line as `error_summary` and downgrade to YELLOW (or RED
+       if a tile is missing entirely).
+    5. The result line MUST include `screenshot_path: "<absolute path>"`.
+       GREEN tier is INVALID without a non-null screenshot_path.
+
+    SUBSTITUTIONS for unsupported Tableau chart types (when source PNG
+    shows one of these, render the listed Sigma equivalent and note the
+    substitution in error_summary):
+      - treemap                       → donut-chart
+      - heatmap (1D color matrix)     → pivot-table with rowsBy + columnsBy +
+                                        divergent backgroundScale on values
+      - point-map without lat/long    → bar / region-map (by region code)
+      - packed-bubble                 → bar-chart (sized by measure)
+      - density / contour             → scatter-plot with binning
+
     PERF
     - Fire all `mcp__tableau__get-view-data` calls in ONE parallel batch.
     - Use `find-or-pick-dm.rb --auto-pick` to skip the UX prompt.
@@ -146,12 +203,17 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path)
         parity_tier: "GREEN" | "YELLOW" | "RED",
         column_errors: <int>, verify_status: "clean" | "fail",
         charts_pass: <int>, charts_total: <int>,
+        screenshot_path: "<absolute path to sigma-render.png>" | null,
         duration_s: <float>, error_summary: <string|null> }
 
     PARITY TIER RULES
     - GREEN: column_errors==0 AND verify=="clean" AND charts_pass==charts_total
-    - YELLOW: column_errors==0 AND verify=="clean" AND charts_pass<charts_total
-    - RED: any column_error OR verify=="fail" OR POST failure
+             AND screenshot_path != null AND you Read-back the Sigma PNG and
+             confirmed visual parity with the source dashboard PNG(s)
+    - YELLOW: workbook posted clean BUT charts_pass<charts_total OR visual
+              divergence noted in error_summary
+    - RED: any column_error OR verify=="fail" OR POST failure OR
+           screenshot_path is null (couldn't render the Sigma workbook)
 
     CONTINUE-ON-FAILURE — if you hit a hard blocker (POST rejects, column-type
     error you can't resolve in 2 retry attempts, etc.), file a beads ticket
@@ -182,7 +244,7 @@ schedule = waves.map do |wave|
         'workbookId'       => sub['workbook']['workbookId'],
         'workbook_name'    => sub['workbook']['name'],
         'leader_dm_id_path'=> leader_dm_id_path,
-        'agent_brief'      => agent_brief(sub, cluster, batch_results_path, leader_dm_id_path)
+        'agent_brief'      => agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, opts[:out])
       }
     end
   }
