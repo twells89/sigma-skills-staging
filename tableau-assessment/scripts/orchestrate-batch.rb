@@ -229,18 +229,37 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
        parallel requests 401).
     2. For each PNG, decide: chart kind, dual-axis vs single, annotations,
        data labels, axis scale (log vs linear), reference lines, palette.
+    3. **LAYOUT COMPOSITION** — the dashboard PNG (named like
+       `Dashboard*`, `*Overview*`, or whichever zone is the largest /
+       multi-element) tells you the GRID. Count its columns and rows of
+       tiles. Read the .twb zone tree at `<out-dir>/twbs/<luid>.twb` or
+       use `scripts/parse-twb-layout.rb` for per-tile `x_pct, y_pct,
+       w_pct, h_pct` — translate those into 24-column / multi-row
+       `<LayoutElement>` positions. A 3-column × 2-row source dashboard
+       MUST become a 3-column × 2-row Sigma layout, NOT a single-column
+       stack. Single-column layouts are the most common visual regression
+       across audit batches — every chart at `gridColumn="1 / 13"` is
+       almost always wrong unless the source PNG also stacks vertically.
 
     AFTER workbook PUT, BEFORE declaring GREEN:
-    3. POST `/v2/workbooks/{wb}/export` with body
+    4. POST `/v2/workbooks/{wb}/export` with body
        `{pageId, format: {type: "png", pixelWidth: 1920, pixelHeight: 1500}}`,
        then poll `GET /v2/query/{q}/download` until content-type is image/png.
        Save the bytes to `<out-dir>/<wb-dir>/sigma-render.png`.
-    4. Read `sigma-render.png` via the Read tool and visually compare it
-       to each source PNG you read in step 1. Document any divergence in
-       the result line as `error_summary` and downgrade to YELLOW (or RED
-       if a tile is missing entirely).
-    5. The result line MUST include `screenshot_path: "<absolute path>"`.
-       GREEN tier is INVALID without a non-null screenshot_path.
+    5. Read `sigma-render.png` via the Read tool and visually compare it
+       to each source PNG you read in step 1. The comparison MUST check
+       both (a) per-chart fidelity (chart kind, axis values, color, labels)
+       AND (b) **whole-dashboard composition** — does the Sigma render
+       have the same number of tile columns and rows as the source
+       dashboard PNG? If the source is a 3×2 grid and Sigma renders a
+       single tall column with the right half empty, that's a layout
+       failure — downgrade to YELLOW with `error_summary` noting the
+       grid mismatch, even if every individual chart value matches.
+       If a tile is missing entirely, RED. If proportions/positions
+       diverge by more than ~25% of grid width, YELLOW.
+    6. The result line MUST include `screenshot_path: "<absolute path>"`.
+       GREEN tier is INVALID without a non-null screenshot_path AND
+       composition match.
 
     SUBSTITUTIONS for unsupported Tableau chart types (when source PNG
     shows one of these, render the listed Sigma equivalent and note the
