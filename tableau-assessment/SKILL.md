@@ -10,6 +10,17 @@ workbook-content REST endpoint (PAT). Emits a markdown readout + JSON inventory
 the user can hand to a Sigma rep, a Hakkoda engagement, or directly to the
 `tableau-to-sigma` skill for conversion of the shortlisted workbooks.
 
+> **Warehouse-agnostic.** This skill (and the downstream `tableau-to-sigma`
+> conversion skill) makes no assumption about which warehouse Sigma is reading
+> from — BigQuery, Databricks, Snowflake, Postgres, SQL Server, Redshift,
+> Synapse, and Oracle are all treated the same way at the Sigma API layer
+> (connections → tables → columns → query). Worked examples in this skill use
+> Snowflake because that's where the dev / audit fixtures live, but the
+> Sigma-side patterns transfer to any supported warehouse. The only
+> warehouse-specific surface is the optional `--snowflake-conn` reconciliation
+> flag on `migration-plan.rb` (see "Multi-warehouse considerations" below for
+> the equivalent on other warehouses).
+
 ---
 
 ## Privacy posture (READ FIRST, surface to the customer)
@@ -520,6 +531,55 @@ Run Option C, then on completion run Option B. The orchestrator picks workbooks 
 ### Option E — Just write the readout
 
 End the assessment. User will pick this up later.
+
+---
+
+## Multi-warehouse considerations
+
+Sigma reads from many warehouses. The Tableau-side discovery in this skill
+is warehouse-neutral (Tableau Cloud's Admin Insights doesn't care where the
+underlying warehouse lives). The Sigma-side reconciliation and downstream
+conversion path can be steered per warehouse:
+
+| Stage | Snowflake | BigQuery | Databricks | Postgres / SQL Server / Redshift |
+|---|---|---|---|---|
+| Already-landed-table check (`migration-plan.rb`) | `--snowflake-conn <name>` shells out to `snow sql --connection ...` against `INFORMATION_SCHEMA.TABLES`. | Use `--warehouse-cli bq` (see "Extending the warehouse CLI" below) — run `bq query --use_legacy_sql=false 'SELECT table_name FROM <proj>.<ds>.INFORMATION_SCHEMA.TABLES'`. | Use `--warehouse-cli databricks` — `databricks sql query` against `information_schema.tables`. | `--warehouse-cli psql` / `sqlcmd` / `psql` against `information_schema.tables` (Postgres-shaped — Redshift uses `pg_table_def`). |
+| Column discovery for DM build | `mcp__sigma-mcp-v2__describe` on a connection table, OR `scripts/discover-warehouse-columns.rb` (Sigma REST). **Both warehouse-agnostic.** | Same — Sigma's `/v2/connections/tables/<inodeId>/columns` works the same. | Same. | Same. |
+| `recommended_path: vds-to-snowflake` value | Default: assumes Snowflake landing. | Substitute "BigQuery" / "Databricks" / etc. in the customer-facing readout. The internal token can stay `vds-to-snowflake` for now (renaming touches downstream consumers); prefer a customer-friendly `target_warehouse` field in `migration-plan.json` next iteration. | Same. | Same. |
+| Custom SQL DM elements | Snowflake dialect by default — UPPERCASE aliases match Snowflake identifier casing. | BigQuery: use backticked names, watch for case sensitivity (it's case-sensitive on table names but not on column names by default). | Databricks: lowercase identifiers; quote with backticks. | Postgres / Redshift: lowercase identifiers by default; quote with double quotes. |
+
+### Extending the warehouse CLI
+
+`migration-plan.rb`'s `fetch_landed_tables(snow_conn, target_schema)` shells
+out to `snow sql` to enumerate already-landed tables. To support other
+warehouses, follow the same shape:
+
+```ruby
+def fetch_landed_tables_bq(project, dataset)
+  q = "SELECT table_name FROM `#{project}.#{dataset}.INFORMATION_SCHEMA.TABLES`"
+  out = `bq query --use_legacy_sql=false --format=json #{q.shellescape}`
+  return Set.new unless $?.success?
+  JSON.parse(out).map { |r| r['table_name'].to_s.upcase }.to_set
+rescue StandardError
+  Set.new
+end
+```
+
+The function contract is: return a `Set<String>` of bare table names in
+uppercase. Drop it in as a new branch off `--warehouse-cli` and the
+downstream `recommended_path: vds-already-landed` reconciliation works
+unchanged.
+
+### Snowflake-flavored examples
+
+Every worked example in this SKILL.md (the `TJ.PUBLIC.*` fixture tables,
+the `snow sql` reconciliation, the `--snowflake-conn` flag, the
+`tableau-vds-to-snowflake` sibling skill) uses Snowflake because that's
+where the development corpus and audit-run fixtures live. The Sigma-side
+calls (`/v2/connections`, `/v2/connections/tables/<inodeId>/columns`,
+`mcp__sigma-mcp-v2__query`) are warehouse-agnostic, so a customer running
+the same assessment against a BigQuery / Databricks / Postgres Tableau
+deployment gets the same readout structure.
 
 ---
 

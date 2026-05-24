@@ -145,7 +145,8 @@ end
 # --ds-override flag — humans pass a JSON map of `cluster_id` →
 # `{ warehouse_tables: [...], table_columns: {...}, build_4_panel_dashboard: bool, note: "..." }`
 # to correct clusters whose .twb-extracted "tables" are Tableau extract
-# tokens (e.g. `EXTRACT.EXTRACT`, `*#CSV`) instead of real Snowflake tables.
+# tokens (e.g. `EXTRACT.EXTRACT`, `*#CSV`) instead of real warehouse tables
+# (Snowflake / BigQuery / Databricks / Postgres / etc.).
 def effective_warehouse_tables(cluster, overrides)
   ov = overrides[cluster['cluster_id']]
   return cluster['shared_warehouse_tables'] unless ov && ov['warehouse_tables']

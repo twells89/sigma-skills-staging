@@ -22,18 +22,28 @@
 # `recommended_path` values:
 #   "tableau-to-sigma"          → workbook ready for conversion
 #   "tableau-to-sigma-with-scout" → conversion needs gap-scout iterations first
-#   "vds-to-snowflake"          → datasource should land in Snowflake before workbook conversion
+#   "vds-to-snowflake"          → datasource should land in a warehouse before workbook conversion.
+#                                  (Token kept for backwards-compat with downstream consumers;
+#                                   the recommendation generalises to BigQuery / Databricks /
+#                                   Postgres / etc. — the readout names the target_warehouse.)
 #   "retire"                    → unused (accesses==0); recommend not migrating
 #   "blocked"                   → known unsupported features; needs manual rework
 #
 # Usage: ruby scripts/migration-plan.rb --out /tmp/assessment-<site>
+#
+# Multi-warehouse note: this script's optional reconciliation against an
+# "already-landed" warehouse table uses Snowflake's `snow sql` CLI by default
+# via --snowflake-conn. For BigQuery / Databricks / Postgres / etc., the same
+# pattern works — see "Multi-warehouse considerations" in SKILL.md for the
+# `--warehouse-cli {snow|bq|databricks|psql}` extension shape. Only Snowflake
+# is wired in this script; other warehouses are documented but unimplemented.
 
 require 'json'
 require 'optparse'
 require 'set'
 require 'rexml/document'
 
-opts = { similarity: 0.5, target_schema: 'TJ.PUBLIC' }
+opts = { similarity: 0.5, target_schema: 'TJ.PUBLIC', warehouse_cli: 'snow' }
 OptionParser.new do |p|
   p.on('--out DIR')                 { |v| opts[:out] = v }
   p.on('--similarity F', Float,
@@ -41,10 +51,22 @@ OptionParser.new do |p|
   p.on('--snowflake-conn NAME',
        'Snow CLI connection name. When set, query INFORMATION_SCHEMA for ' \
        'tables already landed in --target-schema and downgrade matching ' \
-       'datasources from vds-to-snowflake to vds-already-landed.') { |v| opts[:snow_conn] = v }
+       'datasources from vds-to-snowflake to vds-already-landed. ' \
+       'Equivalent flags for other warehouses are documented but unimplemented ' \
+       '(see --warehouse-cli).') { |v| opts[:snow_conn] = v }
   p.on('--target-schema SCHEMA',
-       'Snowflake CATALOG.SCHEMA to check for already-landed VDS tables ' \
-       '(default TJ.PUBLIC). Used together with --snowflake-conn.') { |v| opts[:target_schema] = v }
+       'CATALOG.SCHEMA (Snowflake) / project.dataset (BigQuery) / ' \
+       'catalog.schema (Databricks) / database.schema (Postgres) to check ' \
+       'for already-landed tables (default TJ.PUBLIC). Used together with ' \
+       '--snowflake-conn or --warehouse-cli.') { |v| opts[:target_schema] = v }
+  p.on('--warehouse-cli MODE',
+       %w[snow bq databricks psql],
+       'Warehouse CLI driver for the already-landed reconciliation: ' \
+       'snow (Snowflake; default and only currently implemented), ' \
+       'bq (BigQuery), databricks (Databricks SQL), psql (Postgres / ' \
+       'Redshift). Non-snow modes warn and skip the check — see SKILL.md ' \
+       '"Multi-warehouse considerations" for the function signature ' \
+       'to drop in.') { |v| opts[:warehouse_cli] = v }
 end.parse!
 abort('--out required') unless opts[:out]
 
@@ -58,9 +80,17 @@ end
 
 # One-shot list of already-landed tables in the target schema. Returns a Set
 # of bare table names (no catalog/schema prefix). Empty Set on any failure
-# so the script remains best-effort.
-def fetch_landed_tables(snow_conn, target_schema)
+# so the script remains best-effort. Only the `snow` (Snowflake) branch is
+# implemented; non-snow modes return an empty set with a stderr warning so
+# the rest of the plan still composes.
+def fetch_landed_tables(snow_conn, target_schema, warehouse_cli = 'snow')
   return Set.new unless snow_conn
+  unless warehouse_cli == 'snow'
+    warn "--warehouse-cli=#{warehouse_cli} is documented but not implemented; " \
+         "see SKILL.md 'Multi-warehouse considerations' for the function shape. " \
+         "Skipping already-landed reconciliation."
+    return Set.new
+  end
   catalog, schema = target_schema.to_s.split('.', 2)
   return Set.new unless catalog && schema
   # Fully-qualify INFORMATION_SCHEMA — snow CLI sessions often have no
@@ -163,7 +193,7 @@ end
 # When --snowflake-conn is provided, enumerate already-landed tables ONCE and
 # downgrade any vds-to-snowflake row whose derived table name is already
 # present. Backwards-compatible: empty Set means no reconciliation runs.
-landed_tables = fetch_landed_tables(opts[:snow_conn], opts[:target_schema])
+landed_tables = fetch_landed_tables(opts[:snow_conn], opts[:target_schema], opts[:warehouse_cli])
 already_landed_count = 0
 
 datasource_entries = (data_srcs['sources'] || []).map do |s|
