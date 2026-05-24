@@ -27,6 +27,7 @@ require 'csv'
 require 'optparse'
 require 'net/http'
 require 'uri'
+require 'set'
 
 opts = { renames: {} }
 OptionParser.new do |p|
@@ -34,6 +35,11 @@ OptionParser.new do |p|
   p.on('--workbook-spec PATH')   { |v| opts[:wb]  = v }
   p.on('--out PATH')             { |v| opts[:out] = v }
   p.on('--workbook-id ID')       { |v| opts[:wb_id] = v }
+  p.on('--master-id ID',
+       'Override the master-element ID prefix. Repeatable. ' \
+       'Default: auto-detect every element where source.kind=="table" and ' \
+       'elementId starts with "master" (handles multi-master specs like ' \
+       'master-absences / master-employees / master-time).') { |v| (opts[:master_ids] ||= []) << v }
   p.on('--rename PAIR')          { |v| from, to = v.split('=', 2); opts[:renames][from] = to }
   p.on('--no-fetch')             {     opts[:no_fetch] = true }
 end.parse!
@@ -56,10 +62,48 @@ view_by_name = views.each_with_object({}) { |v, h| h[v['name']] = v }
 
 # Load Sigma side
 spec = JSON.parse(File.read(opts[:wb]))
+
+# Build the set of master-element-IDs we should treat as "the master" for
+# chart matching. Either explicit via --master-id (repeatable) OR auto-detect
+# from the spec: any element with kind=="table" + visibleAsSource==false +
+# source.kind=="data-model" is a master. This handles multi-master workbooks
+# (e.g. workforce uses master-absences / master-employees / master-time, one
+# per Tableau worksheet sourcing different facts) — the previous hardcoded
+# `elementId == 'master'` check returned zero matches and an incomprehensible
+# "fire 0 queries" message.
+master_ids =
+  if opts[:master_ids] && !opts[:master_ids].empty?
+    opts[:master_ids]
+  else
+    detected = []
+    spec['pages'].each do |pg|
+      pg['elements'].each do |e|
+        if e['kind'] == 'table' &&
+           e['visibleAsSource'] == false &&
+           e.dig('source', 'kind') == 'data-model'
+          detected << e['id']
+        end
+      end
+    end
+    # Legacy fallback for specs that pre-date the master/visibleAsSource shape:
+    # any element whose ID literally starts with `master`.
+    if detected.empty?
+      spec['pages'].each do |pg|
+        pg['elements'].each do |e|
+          detected << e['id'] if e['id'].to_s.start_with?('master')
+        end
+      end
+    end
+    detected.uniq
+  end
+abort("auto-parity-plan.rb: no master element(s) detected; pass --master-id explicitly") if master_ids.empty?
+warn "matching charts that source from master element(s): #{master_ids.join(', ')}"
+
+master_id_set = master_ids.to_set
 sigma_charts = []
 spec['pages'].each do |pg|
   pg['elements'].each do |e|
-    next unless e['source'] && e['source']['elementId'] == 'master'
+    next unless e['source'] && master_id_set.include?(e['source']['elementId'])
     sigma_charts << e
   end
 end
