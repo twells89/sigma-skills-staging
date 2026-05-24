@@ -258,6 +258,12 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
     - Run `verify-workbook.rb`, NOT the deprecated .sh.
     - Fetch chart actuals via `mcp__sigma-mcp-v2__query` in one parallel batch.
     - Source `phase-timer.sh` and write phase-timings.json to your working dir.
+    - Column discovery: use `scripts/discover-columns.rb --connection-id <id>
+      --table-path <db>.<schema>.<table>` (Sigma REST, warehouse-agnostic),
+      NOT a warehouse-specific CLI like `snow sql DESCRIBE TABLE`. The same
+      script works against any Sigma-supported warehouse (Snowflake, BigQuery,
+      Databricks, Postgres, etc.). If it 404s, the table isn't in Sigma's
+      catalog — fall back to Custom SQL per SKILL.md Phase 1e.1.
 
     >>>>>> SPEC-SHAPE GOTCHAS — pre-warning <<<<<<
 

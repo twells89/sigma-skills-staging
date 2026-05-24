@@ -37,21 +37,24 @@ Do it once in the data model; all downstream workbook formulas inherit the clean
 
 ## Tableau display names ≠ warehouse column names
 
-Tableau stores a human-readable "display name" that is almost never the actual Snowflake column name.
+Tableau stores a human-readable "display name" that is almost never the actual warehouse column name. The exact transform varies by warehouse:
 
-| Tableau display | Snowflake column |
-|---|---|
-| Sub-Category | SUB_CATEGORY |
-| Country/Region | COUNTRY_REGION |
-| Order Date | ORDER_DATE |
-| Customer Name | CUSTOMER_NAME |
+| Tableau display | Snowflake (UPPER_SNAKE) | BigQuery / Databricks / Postgres (lower_snake) | Case-preserving connectors (camelCase) |
+|---|---|---|---|
+| Sub-Category | SUB_CATEGORY | sub_category | subCategory |
+| Country/Region | COUNTRY_REGION | country_region | countryRegion |
+| Order Date | ORDER_DATE | order_date | orderDate |
+| Customer Name | CUSTOMER_NAME | customer_name | customerName |
 
-**Rule:** Always fetch actual column names from the Sigma connection API:
+**Rule:** Always fetch actual column names from the Sigma connection API — it's uniform across warehouses:
+
 ```bash
 curl -s -H "Authorization: Bearer $SIGMA_API_TOKEN" \
-  "$SIGMA_BASE_URL/v2/connections/tables/<urlId>/columns" \
+  "$SIGMA_BASE_URL/v2/connections/tables/<inodeId>/columns" \
   | jq '[.entries[] | {name, dataType}]'
 ```
+
+Or use the wrapper `scripts/discover-columns.rb --connection-id <id> --table-path <db>.<schema>.<table>` which resolves the inodeId for you and works the same against any warehouse Sigma supports.
 
 Never infer warehouse column names from Tableau display names.
 
@@ -81,7 +84,7 @@ Note: `[Sales]` not `[ORDERS/Sales]` — within the same element, bare refs work
 
 ## Integer date keys (YYYYMMDD format)
 
-Snowflake warehouses commonly store dates as integers in `YYYYMMDD` format (e.g., `20240115`).
+Warehouses commonly store dates as integers in `YYYYMMDD` format (e.g., `20240115`) — a Snowflake habit, but it shows up in BigQuery, Databricks, Postgres, and SQL Server schemas too.
 Sigma line charts treat these as plain numbers — the axis shows integer values instead of dates
 and the trend renders incorrectly.
 

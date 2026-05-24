@@ -525,14 +525,60 @@ Measured 2026-05-22 against the same Tableau workbook in two consecutive convers
 > **Skip Phase 2 entirely if Phase 1.5 recommended a DM you reused.**
 
 Tableau display names ("Sub-Category", "Country/Region") are NOT the same as
-Snowflake warehouse column names ("SUB_CATEGORY", "COUNTRY_REGION"). Using the
-wrong names produces "dependency not found" errors at publish time.
+warehouse column names ("SUB_CATEGORY", "COUNTRY_REGION" in Snowflake;
+`sub_category` / `country_region` in lowercase-by-default Postgres / Databricks;
+`subCategory` / `countryRegion` in case-preserved BigQuery). Using the
+display name as the warehouse name produces "dependency not found" errors at
+publish time.
+
+**Warehouse-agnostic discovery — use Sigma's REST API or MCP**, NOT the
+warehouse-specific CLI (`snow sql DESCRIBE TABLE`, `bq show`, `databricks
+catalogs`, etc.):
+
+```bash
+# 1. Find the connection ID (any warehouse — Snowflake / BigQuery / Databricks / etc.)
+curl -sH "Authorization: Bearer $SIGMA_API_TOKEN" \
+  "$SIGMA_BASE_URL/v2/connections" | jq '.entries[] | {id, name, type}'
+
+# 2. Find the table inodeId (Sigma indexes warehouse tables in its catalog)
+curl -sH "Authorization: Bearer $SIGMA_API_TOKEN" \
+  "$SIGMA_BASE_URL/v2/connections/<connectionId>/tables" | jq '.entries[] | {inodeId, path}'
+
+# 3. List columns — PER feedback_sigma_columns_api_endpoint, the endpoint is
+#    /v2/connections/tables/<inodeId>/columns (no connectionId in the path).
+curl -sH "Authorization: Bearer $SIGMA_API_TOKEN" \
+  "$SIGMA_BASE_URL/v2/connections/tables/<inodeId>/columns" | jq '.entries[] | {name, type}'
+```
+
+Or the equivalent MCP tools (preferred when available):
+- `mcp__sigma-mcp-v2__describe` on a connection table → returns column names + types
+- `mcp__sigma-mcp-v2__search` with `entityTypes=["table"]` to find inodeIds by name
+
+The provided helper script wraps the REST call with parallel fan-out and the
+"response key is `entries`, not `columns`" gotcha pre-handled. It works
+against any Sigma connection regardless of underlying warehouse:
 
 ```bash
 eval "$(scripts/get-token.sh)" && \
 ruby scripts/discover-warehouse-columns.rb /tmp/<name>/columns \
   <inodeId1> <inodeId2> ...
 ```
+
+Convenience: for a single table by `<db>.<schema>.<table>` path (instead of
+inodeId), use `discover-columns.rb` — it does the inode lookup automatically
+and emits a JSON column list:
+
+```bash
+ruby scripts/discover-columns.rb --connection-id <id> \
+  --table-path TJ.PUBLIC.ORDERS --out /tmp/<name>/orders-cols.json
+# (or any warehouse path: my_project.my_dataset.orders, main.public.orders, etc.)
+```
+
+If `discover-columns.rb` returns 404 — meaning the table physically exists in
+the warehouse but is not in Sigma's static catalog — the fallback is to source
+via Custom SQL (see Phase 1e.1 "Warehouse-table source rejected? Fall back to
+Custom SQL"). There is no public API today to force a Sigma catalog refresh;
+only the UI's "Refresh schema" action on the connection page can do that.
 
 The script:
 - runs all column-fetches in parallel,
