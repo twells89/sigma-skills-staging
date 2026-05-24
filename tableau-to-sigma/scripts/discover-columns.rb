@@ -48,10 +48,15 @@ end.parse!
 BASE = ENV.fetch('SIGMA_BASE_URL') { abort 'set SIGMA_BASE_URL' }
 TOK  = ENV.fetch('SIGMA_API_TOKEN') { abort 'set SIGMA_API_TOKEN' }
 
-def get(path)
+def http(method, path, body = nil)
   uri = URI("#{BASE}#{path}")
-  req = Net::HTTP::Get.new(uri)
+  req = method == :post ? Net::HTTP::Post.new(uri) : Net::HTTP::Get.new(uri)
   req['Authorization'] = "Bearer #{TOK}"
+  req['Accept'] = 'application/json'
+  if body
+    req['Content-Type'] = 'application/json'
+    req.body = body
+  end
   res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }
   [res.code.to_i, res.body]
 end
@@ -59,18 +64,13 @@ end
 path_parts = opts[:path].split('.', 3)
 abort "table-path must be DB.SCHEMA.TABLE (got #{opts[:path].inspect})" unless path_parts.size == 3
 
-# 1. Find inodeId by enumerating tables on the connection and matching path.
-status, body = get("/v2/connections/#{opts[:conn]}/tables")
-abort "tables list failed: HTTP #{status}\n#{body}" unless status == 200
-tables = (JSON.parse(body)['entries'] || [])
+# 1. Resolve the table to an inodeId via POST /v2/connection/{conn}/lookup
+#    with body { "path": ["DB","SCHEMA","TABLE"] }.
+#    (NOT GET /v2/connections/{conn}/tables — that endpoint does not exist.)
+status, body = http(:post, "/v2/connection/#{opts[:conn]}/lookup",
+                    JSON.generate('path' => path_parts))
 
-match = tables.find do |t|
-  # path may be either an array or "DB/SCHEMA/TABLE" — normalize both.
-  t_path = t['path'].is_a?(Array) ? t['path'] : t['path'].to_s.split('/')
-  t_path.map { |p| p.to_s.upcase } == path_parts.map(&:upcase)
-end
-
-unless match
+if status == 404
   warn "Table #{opts[:path]} not found in Sigma's catalog for connection #{opts[:conn]}."
   warn 'This usually means the table physically exists in the warehouse but'
   warn "Sigma's static catalog hasn't been re-indexed since it was created."
@@ -78,15 +78,23 @@ unless match
   warn "  source: { kind: 'sql', connectionId: '#{opts[:conn]}', statement: 'SELECT * FROM #{opts[:path]}' }"
   exit 4
 end
+abort "lookup failed: HTTP #{status}\n#{body}" unless status == 200
 
-inode = match['inodeId']
+lookup = JSON.parse(body)
+inode = lookup['inodeId'] or abort "lookup returned no inodeId: #{body}"
+unless lookup['kind'] == 'table'
+  abort "path resolved to a #{lookup['kind']}, not a table (got #{lookup.inspect})"
+end
 
 # 2. List columns at /v2/connections/tables/<inodeId>/columns (per
 #    feedback_sigma_columns_api_endpoint — connectionId NOT in the path).
-status, body = get("/v2/connections/tables/#{inode}/columns")
+status, body = http(:get, "/v2/connections/tables/#{inode}/columns")
 abort "columns list failed: HTTP #{status}\n#{body}" unless status == 200
 cols = (JSON.parse(body)['entries'] || []).map do |c|
-  { 'name' => c['name'], 'type' => c['type'] }
+  # type may come back as a nested object { type: <warehouse-type> }; flatten to a string
+  t = c['type']
+  t = t['type'] if t.is_a?(Hash) && t['type']
+  { 'name' => c['name'], 'type' => t.to_s }
 end
 
 result = {
