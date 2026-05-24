@@ -111,6 +111,30 @@ def categorize(content)
   results.select { |r| r[:count] > 0 }
 end
 
+# Detect point-map worksheets that declare geo-role latitude/longitude on a
+# column but where the underlying datasource's column-instance set doesn't
+# include both. In practice this surfaces as: a Tableau sheet with `<mark
+# class='Circle'/>` and a `<column geo_role='latitude'>` calc, but the warehouse
+# table has no LAT/LON columns and the calc was a `MAKEPOINT(...)` derivation
+# the conversion skill doesn't translate yet. The chart silently degrades to a
+# bar (the build-charts default fallback when geo channels can't be wired) and
+# users only notice in Phase 6f.
+def detect_point_map_geo_role_gaps(content)
+  has_lat = content =~ /geo_role='latitude'/i
+  has_lon = content =~ /geo_role='longitude'/i
+  has_circle_mark = content =~ /<mark class='(Circle|Shape)'/
+  return [] unless has_circle_mark
+  # If lat XOR lon is present, point-map cannot render — emit a manual gap.
+  return [] if has_lat && has_lon
+  return [] unless has_lat || has_lon
+  [{
+    name:   'Point-map missing lat/long column',
+    status: :manual,
+    count:  1,
+    blurb:  'Tableau declares geo_role=latitude or =longitude but not both. Sigma point-map needs both lat and lon — the chart will silently degrade to a bar. Add the missing column to the warehouse / DM, or accept the bar substitution.'
+  }]
+end
+
 def render_md(wb_name, summary, results)
   by_status = results.group_by { |r| r[:status] }
   md = String.new
@@ -189,6 +213,7 @@ def main
   }
 
   results = categorize(content)
+  results.concat(detect_point_map_geo_role_gaps(content))
   md_path = out
   json_path = out.sub(/\.md$/, '.json')
 
