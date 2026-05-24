@@ -33,13 +33,52 @@ require 'optparse'
 require 'set'
 require 'rexml/document'
 
-opts = { similarity: 0.5 }
+opts = { similarity: 0.5, target_schema: 'TJ.PUBLIC' }
 OptionParser.new do |p|
   p.on('--out DIR')                 { |v| opts[:out] = v }
   p.on('--similarity F', Float,
        'Jaccard threshold for DM clustering (default 0.5)') { |v| opts[:similarity] = v }
+  p.on('--snowflake-conn NAME',
+       'Snow CLI connection name. When set, query INFORMATION_SCHEMA for ' \
+       'tables already landed in --target-schema and downgrade matching ' \
+       'datasources from vds-to-snowflake to vds-already-landed.') { |v| opts[:snow_conn] = v }
+  p.on('--target-schema SCHEMA',
+       'Snowflake CATALOG.SCHEMA to check for already-landed VDS tables ' \
+       '(default TJ.PUBLIC). Used together with --snowflake-conn.') { |v| opts[:target_schema] = v }
 end.parse!
 abort('--out required') unless opts[:out]
+
+# Sanitize a Tableau datasource name to its conventional landed table name:
+# UPPER_SNAKE_CASE, alnum + underscores only, leading digits underscored.
+def landed_table_name(ds_name)
+  s = ds_name.to_s.upcase.gsub(/[^A-Z0-9]+/, '_').gsub(/^_+|_+$/, '')
+  s = "_#{s}" if s =~ /^[0-9]/
+  s
+end
+
+# One-shot list of already-landed tables in the target schema. Returns a Set
+# of bare table names (no catalog/schema prefix). Empty Set on any failure
+# so the script remains best-effort.
+def fetch_landed_tables(snow_conn, target_schema)
+  return Set.new unless snow_conn
+  catalog, schema = target_schema.to_s.split('.', 2)
+  return Set.new unless catalog && schema
+  # Fully-qualify INFORMATION_SCHEMA — snow CLI sessions often have no
+  # default database, so a bare INFORMATION_SCHEMA.TABLES errors with 090105.
+  q = "SELECT TABLE_NAME FROM #{catalog.upcase}.INFORMATION_SCHEMA.TABLES " \
+      "WHERE TABLE_SCHEMA='#{schema.upcase}' AND TABLE_CATALOG='#{catalog.upcase}'"
+  out = `snow sql --connection #{snow_conn.shellescape} -q #{q.shellescape} --format json 2>/dev/null`
+  return Set.new unless $?.success? && !out.strip.empty?
+  begin
+    rows = JSON.parse(out)
+    rows = rows['data'] if rows.is_a?(Hash) && rows['data']
+    rows.is_a?(Array) ? rows.map { |r| (r['TABLE_NAME'] || r['table_name']).to_s.upcase }.to_set : Set.new
+  rescue StandardError
+    Set.new
+  end
+end
+
+require 'shellwords'
 
 shortlist_path  = File.join(opts[:out], 'shortlist.json')
 ds_path         = File.join(opts[:out], 'data-sources.json')
@@ -121,6 +160,12 @@ workbook_entries = shortlist.map do |w|
 end
 
 # --- datasource side ---
+# When --snowflake-conn is provided, enumerate already-landed tables ONCE and
+# downgrade any vds-to-snowflake row whose derived table name is already
+# present. Backwards-compatible: empty Set means no reconciliation runs.
+landed_tables = fetch_landed_tables(opts[:snow_conn], opts[:target_schema])
+already_landed_count = 0
+
 datasource_entries = (data_srcs['sources'] || []).map do |s|
   v = s['verdict']
   recommended_path =
@@ -130,13 +175,26 @@ datasource_entries = (data_srcs['sources'] || []).map do |s|
     when 'verify-network', 'verify-db', 'verify-modeling' then 'verify-then-migrate'
     else 'verify-then-migrate'
     end
-  {
+
+  entry = {
     'id'                => s['datasourceId'] || s['id'],
     'name'              => s['name'],
     'verdict'           => v,
     'recommended_path'  => recommended_path,
     'reason'            => s['reason'] || s['action']
   }
+
+  if recommended_path == 'vds-to-snowflake' && !landed_tables.empty?
+    derived = landed_table_name(s['name'])
+    if landed_tables.include?(derived)
+      already_landed_count += 1
+      entry['recommended_path'] = 'vds-already-landed'
+      entry['landed_table']     = "#{opts[:target_schema]}.#{derived}"
+      entry['reason']           = "Found #{derived} in #{opts[:target_schema]}; skipping VDS re-run"
+    end
+  end
+
+  entry
 end
 
 # --- DM clustering ---
@@ -201,6 +259,7 @@ result = {
     'workbooks_blocked'            => (by_path['blocked']                       || []).size,
     'workbooks_retire'             => (by_path['retire']                        || []).size,
     'datasources_vds_to_snowflake' => datasource_entries.count { |d| d['recommended_path'] == 'vds-to-snowflake' },
+    'datasources_already_landed'   => already_landed_count,
     'datasources_drop_in'          => datasource_entries.count { |d| d['recommended_path'] == 'drop-in' },
     'cluster_count'                => clusters.size,
     'suggested_batch'              => suggested_batch
@@ -217,6 +276,7 @@ puts "  blocked (manual/unhandled): #{result['summary']['workbooks_blocked']}"
 puts "  retire (no usage):          #{result['summary']['workbooks_retire']}"
 puts "datasources: #{datasource_entries.size}"
 puts "  recommend VDS→Snowflake:  #{result['summary']['datasources_vds_to_snowflake']}"
+puts "  already landed (skip):    #{result['summary']['datasources_already_landed']}"
 puts "  drop-in to Sigma:         #{result['summary']['datasources_drop_in']}"
 puts "DM clusters: #{result['summary']['cluster_count']}"
 clusters.each do |c|
