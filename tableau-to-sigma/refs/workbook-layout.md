@@ -651,7 +651,7 @@ Sigma supports two map kinds via spec: **`region-map`** (choropleth — fills na
 | `region` | yes | `{id, regionType}` | `id` is the column ID holding the region key |
 | `label` | optional | array `[{id}, ...]` | Values rendered on each region; usually the measure |
 | `tooltip` | optional | array `[{id}, ...]` | Extra columns shown on hover (e.g., active count, avg salary) |
-| `color` | optional | `{by: "category", column: <colId>}` | Categorical fill — column must be a **different** column from `region.id` (the API rejects reuse with "Column X is referenced from both 'region' and 'color'"). `by: "value"` is rejected — the default value-based heat coloring is automatic when `color` is omitted. |
+| `color` | optional | `{by: "category", column: <colId>}` | Categorical fill (one color per category, NOT a gradient) — column must be a **different** column from `region.id` (the API rejects reuse with "Column X is referenced from both 'region' and 'color'"). `by: "value"` is **rejected** with HTTP 400. With `color` omitted the map renders a uniform fill (NOT auto value-based heat). To get a Tableau-style red→blue divergent gradient heat scale, the customer must configure it in the Sigma editor after publish — it is UI-only today. Verified 2026-05-24 against `tj-wells-1989`. |
 | `size` | — | silently dropped | Choropleths don't size; the API accepts and drops it |
 
 **Valid `regionType` values (verified May 2026 — POST round-trips them):**
