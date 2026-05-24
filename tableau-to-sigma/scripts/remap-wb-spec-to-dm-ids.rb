@@ -40,11 +40,13 @@ end.parse!
 def read_id_map(path)
   raw = JSON.parse(File.read(path))
   els = (raw['pages'] || []).flat_map { |p| (p['elements'] || []) }
-  els.each_with_object({}) { |e, h| h[e['name']] = e['id'] if e['name'] && e['id'] }
+  by_name = els.each_with_object({}) { |e, h| h[e['name']] = e['id'] if e['name'] && e['id'] }
+  [by_name, raw['dataModelId']]
 end
 
-old_by_name = read_id_map(opts[:old])
-new_by_name = read_id_map(opts[:new])
+old_by_name, old_dm_id = read_id_map(opts[:old])
+new_by_name, new_dm_id = read_id_map(opts[:new])
+abort 'new dm-ids file missing top-level dataModelId' unless new_dm_id
 
 # Build old-id → new-id map. For each element in the OLD map, find its name,
 # apply rename if present, look up in NEW map.
@@ -63,16 +65,26 @@ abort 'no remappings produced — check id-map files' if id_remap.empty?
 
 spec = JSON.parse(File.read(opts[:spec]))
 
-# 1. Rewrite master-element `source.elementId` references.
+# 1. Rewrite master-element `source.elementId` AND `source.dataModelId`.
+#    DM re-POST reassigns BOTH the dataModelId (new DM created) and the
+#    element IDs inside it. Missing the dataModelId rewrite leaves orphan
+#    references that POST 4xx with "data model not found".
 n_src = 0
+n_dm  = 0
 (spec['pages'] || []).each do |pg|
   (pg['elements'] || []).each do |el|
     src = el['source']
     next unless src.is_a?(Hash)
-    eid = src['elementId']
-    next unless eid && id_remap.key?(eid)
-    src['elementId'] = id_remap[eid]
-    n_src += 1
+    if (eid = src['elementId']) && id_remap.key?(eid)
+      src['elementId'] = id_remap[eid]
+      n_src += 1
+    end
+    if (dm = src['dataModelId']) && (dm == old_dm_id || id_remap.values.include?(src['elementId']))
+      if src['dataModelId'] != new_dm_id
+        src['dataModelId'] = new_dm_id
+        n_dm += 1
+      end
+    end
   end
 end
 
@@ -102,5 +114,6 @@ end
 
 File.write(opts[:out], JSON.pretty_generate(spec))
 warn "rewrote #{n_src} source.elementId refs"
+warn "rewrote #{n_dm} source.dataModelId refs (old #{old_dm_id || '(unset)'} → new #{new_dm_id})"
 warn "rewrote #{n_formula} formula prefix refs" if opts[:renames].any?
 warn "wrote #{opts[:out]}"
