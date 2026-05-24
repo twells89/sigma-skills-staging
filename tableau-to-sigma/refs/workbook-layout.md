@@ -852,7 +852,15 @@ Use `rowsBy`, `columnsBy`, and `values`. **Do NOT use `rows` or `columnGroups`**
 }
 ```
 
-**`conditionalFormats`** — Conditional formatting on pivot-table columns. Two supported types:
+**`conditionalFormats`** — Conditional formatting on pivot-table / table columns. Two supported types.
+
+> **Verified 2026-05-24 against `tj-wells-1989` org during audit-run-2.** The
+> field that holds the column IDs is **`columnIds`**, NOT `columns`. The first
+> POST in audit-run-1 (NASA agent) failed with HTTP 400 `Invalid request` when
+> using `columns`; the second succeeded with `columnIds` and round-trips
+> cleanly through GET. This file previously documented `columns` — it was
+> wrong. The graduated `sigma-workbooks/reference/specification/tables.md`
+> already uses `columnIds`; staging is now consistent.
 
 `dataBars` — renders colored bars proportional to cell values:
 
@@ -860,7 +868,7 @@ Use `rowsBy`, `columnsBy`, and `values`. **Do NOT use `rows` or `columnGroups`**
 {
   "conditionalFormats": [{
     "type": "dataBars",
-    "columns": ["pcy-sales", "pcy-profit"],
+    "columnIds": ["pcy-sales", "pcy-profit"],
     "scheme": ["#FF9D99", "#A0CBE8"],
     "includeValues": true,
     "includeSubtotals": false
@@ -874,7 +882,7 @@ Use `rowsBy`, `columnsBy`, and `values`. **Do NOT use `rows` or `columnGroups`**
 {
   "conditionalFormats": [{
     "type": "backgroundScale",
-    "columns": ["pcy-margin"],
+    "columnIds": ["pcy-margin"],
     "scheme": ["#8C0D25", "#FFFFFF", "#134B85"],
     "includeValues": true
   }]
