@@ -51,7 +51,7 @@ which calc translation, which layout) — not orchestration.
 | `scripts/probe-custom-sql-columns.rb` | **Phase 1e.1:** when discover-columns 404s (catalog miss), probe column names + types via a one-shot Custom-SQL probe workbook that SELECTs INFORMATION_SCHEMA, exports CSV, and self-destructs. ~6s end-to-end. Saves ~120s on every Custom-SQL fallback vs. POST-fail-cleanup column-name guessing. |
 | `scripts/find-prior-cache.rb` | **Phase 1d-cache (Phase -1):** detect cached Tableau-discovery + Sigma-conversion artifacts from prior `audit-run-*` or `converter-test` runs so re-conversions skip discovery (~3 min saved). |
 | `scripts/remap-wb-spec-to-dm-ids.rb` | When a DM is re-POSTed and element IDs churn, remaps a cached `wb-spec.json` to the new IDs via name-based matching. Optional `--rename` for renamed elements. |
-| `scripts/extract-calc-fields.rb` | Pull every Tableau CALCULATION field (with formula) + translation notes |
+| `scripts/extract-calc-fields.rb` | Phase 1e: pull every Tableau calc field (with formula) via Metadata API (`POST /api/metadata/graphql`); falls back to `.twb` XML when Metadata API is unavailable. Drops VDS dependency. Caches to `<wb-dir>/calc-fields.json`. |
 | `scripts/validate-spec.rb` | DM or workbook spec validator. Accepts `--type` and `--dm-context` |
 | `scripts/post-and-readback.rb` | POST a DM or workbook spec, parse YAML response, GET back the spec, emit element ID map. Also runs a universal **column-type guard** afterward: any column whose formula resolved to type `error` aborts the script with exit 2 and the failing formula. Catches silent-error columns the validator doesn't pattern-match (typo refs, `IsIn`, unsupported functions) without waiting for Phase 6. |
 | `scripts/put-layout.rb` | Apply a layout XML to an existing workbook (strips read-only fields) |
@@ -409,18 +409,86 @@ Does **not** support via the spec API: bullet chart, gantt.
 Control types supported: `list`, `date-range`, `text`, `text-area`, `segmented`, `number`, `number-range`, `slider`, `range-slider`, `top-n`.
 See `refs/workbook-layout.md` for full control element spec patterns.
 
-### 1e. Extract Tableau calc fields
+### 1e. Discover calculated fields (Metadata API + .twb fallback)
+
+Calculated field formulas are required to translate calc cols into Sigma DM
+formula columns. The converter pulls them via the **Tableau Metadata API
+(GraphQL)** as the primary path. Metadata API is independent of VDS — it
+works even when VDS is disabled on the customer's site. **VDS is NOT used for
+calc discovery anymore.**
 
 ```bash
-ruby scripts/extract-calc-fields.rb /tmp/<name>/ds-metadata.json /tmp/<name>/calc-fields.json
+eval "$(scripts/get-tableau-token.sh)"
+ruby scripts/extract-calc-fields.rb \
+  --workbook-luid <luid> \
+  --out /tmp/<name>/calc-fields.json \
+  [--twb /tmp/<name>/workbook-content.twb]   # used if metadata-api fails
 ```
 
-Each calc record carries `name`, `formula`, `default_agg`, `requires_custom_sql`,
-and a `translation_notes` array flagging the common Tableau→Sigma gotchas:
-- `IIF` → `If`
-- `COUNTD` → `CountDistinct`
-- IF/ELSEIF chains ending in literal — **wrap nullable inputs in `Coalesce` to match Tableau ELSE-catches-null semantics** (Tableau collapses NULL into the ELSE branch; Sigma `If(NULL >= ..., ...)` returns NULL)
-- **`requires_custom_sql: true`** for Tableau table calcs (`WINDOW_*`, `RUNNING_*`, `RANK*`, `INDEX`, `FIRST`, `LAST`, `SIZE`, `TOTAL`, `LOOKUP`, `PREVIOUS_VALUE`) and LODs (`{FIXED/INCLUDE/EXCLUDE}`). These CANNOT be Sigma DM calc columns — Sigma's `CountOver` / `SumOver` / `RankOver` / `CumulativeSum` etc. **silently produce `error` type columns** when used in a DM calc column or grouping-table master calc. They MUST be implemented as a Sigma Custom SQL data-model element (`kind: "sql"`). See Phase 3 below for the spec shape.
+The script caches its result to `--out` and reuses it (< 1h old) on subsequent
+runs unless you pass `--refresh`. Downstream phases read from the cache.
+
+**Fallback order (`--source auto` is the default):**
+1. **Metadata API** (`POST /api/metadata/graphql`) — returns formula +
+   dependency graph + role + datatype + aggregation + isHidden.
+2. **`.twb` XML parse** — returns formula only (no resolved field-name
+   dependency graph; `depends_on` is `[]` on this path). LOD formulas are
+   still captured because they live in the `<calculation formula='...'/>`
+   attribute verbatim.
+
+Both produce the same JSON shape so downstream phases don't care which path
+fired. Force a specific source with `--source metadata` or `--source twb`.
+
+Output schema (`calc-fields.json`):
+
+```json
+{
+  "workbook_luid": "...",
+  "workbook_name": "...",
+  "source": "metadata-api" | "twb-xml-fallback",
+  "generated_at": "2026-05-26T...",
+  "n_calcs": 1391,
+  "n_lods": 162,
+  "n_requires_custom_sql": 174,
+  "calcs": [
+    {
+      "name": "Profit Ratio",
+      "datasource": "Orders+",
+      "formula": "SUM([Profit]) / SUM([Sales])",
+      "role": "MEASURE",
+      "data_type": "REAL",
+      "aggregation": null,
+      "is_hidden": false,
+      "is_lod": false,
+      "depends_on": ["Profit", "Sales"],
+      "requires_custom_sql": false,
+      "translation_notes": []
+    }
+  ]
+}
+```
+
+Each calc record carries:
+- `name`, `formula`, `role`, `data_type`, `aggregation`, `is_hidden` — direct from Tableau
+- `is_lod` — `true` for `{FIXED/INCLUDE/EXCLUDE}` expressions
+- `depends_on` — referenced field names (metadata-api path only)
+- `requires_custom_sql` — `true` for Tableau table calcs (`WINDOW_*`,
+  `RUNNING_*`, `RANK*`, `INDEX`, `FIRST`, `LAST`, `SIZE`, `TOTAL`, `LOOKUP`,
+  `PREVIOUS_VALUE`) and LODs. These CANNOT be Sigma DM calc columns —
+  Sigma's `CountOver` / `SumOver` / `RankOver` / `CumulativeSum` etc.
+  **silently produce `error` type columns** in a DM calc column or grouping-
+  table master calc. They MUST be implemented as a Sigma Custom SQL data-
+  model element (`kind: "sql"`). See Phase 3 below for the spec shape.
+- `translation_notes` — common Tableau→Sigma gotchas to apply during the
+  Phase 3 DM build: `IIF`→`If`, `COUNTD`→`CountDistinct`, IF/ELSEIF chains
+  ending in literal need `Coalesce` wraps on nullable inputs (Tableau
+  collapses NULL into ELSE; Sigma `If(NULL >= …, …)` returns NULL), and the
+  full Custom-SQL escalation for window/LOD calcs.
+
+If the workbook has > 1000 calcs on a single page or the GraphQL response
+exceeds ~5 MB, the API may truncate. In that case re-run with
+`--source twb`, which parses the cached `.twb` directly and is bounded only
+by file size.
 
 Translate the calc fields into the DM (Phase 3) using the original Tableau
 formula as the source of truth, NOT the warehouse column the calc happens
