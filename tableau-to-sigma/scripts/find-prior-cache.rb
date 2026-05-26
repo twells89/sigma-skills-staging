@@ -79,8 +79,31 @@ result = {
   'dm_ids'                => first_existing(candidate_dirs, 'dm-ids.json'),
   'wb_ids'                => first_existing(candidate_dirs, 'wb-ids.json'),
   'master_columns'        => first_existing(candidate_dirs, 'master-columns.json'),
-  'workbook_signature'    => first_existing(candidate_dirs, 'workbook-signature.json')
+  'workbook_signature'    => first_existing(candidate_dirs, 'workbook-signature.json'),
+  'calc_fields'           => first_existing(candidate_dirs, 'calc-fields.json')
 }
+
+# --- Calc-fields cache freshness check -----------------------------------
+# Surface a fresh calc-fields.json so subagents skip Phase 1e entirely
+# (extract-calc-fields.rb hit Metadata API + .twb fallback). Stale (> 1h old)
+# is reported but should still be re-fetched.
+if result['calc_fields'] && File.file?(result['calc_fields'])
+  age = Time.now - File.mtime(result['calc_fields'])
+  begin
+    parsed = JSON.parse(File.read(result['calc_fields']))
+    result['calc_fields_meta'] = {
+      'path'         => result['calc_fields'],
+      'age_seconds'  => age.to_i,
+      'fresh'        => age < 3600,
+      'source'       => parsed['source'],
+      'n_calcs'      => parsed['n_calcs'],
+      'n_lods'       => parsed['n_lods'],
+      'workbook_luid' => parsed['workbook_luid']
+    }
+  rescue StandardError
+    result['calc_fields_meta'] = { 'path' => result['calc_fields'], 'age_seconds' => age.to_i, 'parse_error' => true }
+  end
+end
 
 # --- Consistency check: dm-spec vs dm-ids element counts/names -----------
 # OCT's v2 run hit a cached dir where dm-ids.json described a 6-element DM
