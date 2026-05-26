@@ -39,7 +39,12 @@ QUERY = <<~GRAPHQL
           name connectionType
           ... on DatabaseServer { hostName port }
         }
-        fields { name }
+        fields {
+          __typename name
+          ... on CalculatedField {
+            formula isHidden role dataType aggregation
+          }
+        }
       }
     }
     customSQLTables {

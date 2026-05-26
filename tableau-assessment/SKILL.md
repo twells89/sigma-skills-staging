@@ -359,7 +359,16 @@ ruby scripts/fetch-metadata-graph.rb --out /tmp/assessment-<site>
 ```
 
 One POST to `/api/metadata/graphql`. Writes `metadata-graph.json` (~100–250 KB
-for most sites). Requires Site Admin role.
+for most sites; can grow to several MB for sites with thousands of calc fields).
+Requires Site Admin role.
+
+> **Per-workbook calc-field formulas live here.** The
+> `embeddedDatasources.fields` block now includes the `formula`, `isHidden`,
+> `role`, `dataType`, and `aggregation` of every `CalculatedField` — added
+> 2026-05-26 so downstream conversion (`tableau-to-sigma/scripts/extract-calc-fields.rb`)
+> can read calc formulas straight from the assessment dump without re-querying
+> Tableau. This replaces the older VDS-based calc discovery, which fails on
+> sites where VDS is disabled.
 
 ### 4b. Analyze data sources
 
