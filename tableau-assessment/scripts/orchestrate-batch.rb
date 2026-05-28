@@ -335,17 +335,26 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
        (each post-and-readback.rb invocation creates a NEW workbook — POST
        is create-only), run:
        `ruby scripts/cleanup-orphan-workbooks.rb --workdir /tmp/<wb-dir>`
-       to delete the orphans. This MUST run before step 5 or the gate
+       to delete the orphans. This MUST run before step 6 or the gate
        will fail with exit 4. See beads-sigma-38a.
-    5. **MANDATORY FINAL STEP — before writing the result line, run:**
+    5. **Apply the layout** (MANDATORY — beads-sigma-bw3 — CoCo regression
+       where elements rendered as a single-column stack):
+       `ruby scripts/build-dashboard-layout.rb --layout /tmp/<wb-dir>/dashboard-layout.json --wb-ids /tmp/<wb-dir>/wb-ids.json --out /tmp/<wb-dir>/layout.xml`
+       `ruby scripts/put-layout.rb --workbook <id> --layout /tmp/<wb-dir>/layout.xml`
+       Skipping this step means the workbook PUTs without a top-level
+       layout and Sigma renders every tile in a single column — exit 6
+       on the gate. ALSO: KPI tiles (Tableau scorecards — mark=Text with
+       one measure and no dims) now auto-emit as Sigma kpi-chart from
+       parse-twb-layout; verify they appear in the readback before
+       running the layout script.
+    6. **MANDATORY FINAL STEP — before writing the result line, run:**
        `ruby scripts/assert-phase6-ran.rb --tableau /tmp/<wb-dir>`
-       The gate now checks three things: Phase 6 ran, no orphan workbooks
-       remain, and the live workbook has no column with type=error
-       (catches circular refs and runtime errors not surfaced by the
-       initial POST's column-type guard). Exit 0 → write GREEN if all
-       other gates pass. Any non-zero exit → you MUST downgrade to YELLOW
-       (parity skipped/incomplete, orphans uncleaned, runtime errors) or
-       RED (parity failed). Do NOT declare GREEN if assert-phase6-ran.rb
+       The gate checks FOUR things: Phase 6 ran, no orphan workbooks
+       remain, no live column has type=error, and a layout XML is
+       applied. Exit 0 → write GREEN if all other gates pass. Any
+       non-zero exit → you MUST downgrade to YELLOW (parity skipped/
+       incomplete, orphans uncleaned, runtime errors, layout missing)
+       or RED (parity failed). Do NOT declare GREEN if assert-phase6-ran.rb
        did not exit 0. There is no exception.
 
     **If MCP query fails mid-Phase-6 with an auth-related error**, the

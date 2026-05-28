@@ -81,6 +81,7 @@ SIGMA_KIND = {
   'map-point'     => 'point-map',
   'pivot-table'   => 'pivot-table',
   'table'         => 'table',
+  'kpi'           => 'kpi-chart',
   'table-or-text' => 'table',         # legacy parser output — kept for back-compat
   'automatic'     => 'bar-chart',     # fallback; agent verifies against PNG
   'other'         => 'bar-chart'
@@ -615,6 +616,88 @@ def guid_from_text(s)
   m && m[1]
 end
 
+# ---- KPI emission ---------------------------------------------------------
+# Tableau "scorecard" / "big number" tiles — mark=Text or mark=Square with a
+# single measure and no dimensions — translate to a Sigma kpi-chart element.
+# Without this, the chart_kind=kpi worksheet would fall through to the
+# CSV-driven flat-table flow and quietly produce nothing usable.
+# See beads-sigma-bw3.
+def build_kpi_element(z, meta, mmap, opts, warnings)
+  cap = z['caption']
+  el_id = "el-kpi-#{cap.downcase.gsub(/\W+/, '-')[0..38]}".sub(/-$/, '')
+
+  rows_shelf = z['rows_shelf'] || {}
+  cols_shelf = z['cols_shelf'] || {}
+
+  # Find the KPI's measure: first from shelves (preferred — explicit derivation),
+  # then fall back to the worksheet's `measures` array (when the measure is on
+  # the Marks card via Text/Color/Size encoding rather than a shelf).
+  measure_field = nil
+  (rows_shelf['fields'] || []).each { |f| measure_field ||= f if f['role'] == 'measure' }
+  (cols_shelf['fields'] || []).each { |f| measure_field ||= f if f['role'] == 'measure' }
+  if measure_field.nil? && (z['measures'] || []).any?
+    m = z['measures'].first
+    measure_field = {
+      'role'       => 'measure',
+      'derivation' => (m['derivation'] || 'Sum').to_s.downcase,
+      'raw'        => m['column'],
+      'guid'       => guid_from_text(m['column'].to_s)
+    }
+  end
+
+  if measure_field.nil?
+    warnings << "'#{cap}' is flagged as KPI but no measure resolved from shelves or worksheet — skipping"
+    return nil
+  end
+
+  master, _cap = resolve_shelf_field(measure_field, meta, mmap)
+  deriv = measure_field['derivation'].to_s.downcase
+  agg_template = SHELF_AGG_FOR_PREFIX[deriv] || 'Sum'
+  formula =
+    if agg_template.include?('%s')
+      agg_template.sub('%s', "[Master/#{master['name']}]")
+    else
+      "#{agg_template}([Master/#{master['name']}])"
+    end
+
+  measure_col_id = "k-#{el_id}"
+  measure_col = {
+    'id'      => measure_col_id,
+    'name'    => master['name'],
+    'formula' => formula
+  }
+
+  # Format: prefer Tableau format string for this measure, then master-map
+  # format, then heuristic by name.
+  tab_fmt = pick_tableau_format(z['formats'], master['name'])
+  measure_col['format'] = tab_fmt if tab_fmt
+  measure_col['format'] ||= master['format'] if master['format'].is_a?(Hash)
+  measure_col['format'] ||=
+    case master['name'].downcase
+    when /(revenue|profit|cost|sales|amount|spend)/
+      { 'kind' => 'number', 'formatString' => '$,.0f', 'currencySymbol' => '$' }
+    when /(rate|margin|pct|percent|ratio)/
+      { 'kind' => 'number', 'formatString' => ',.1%' }
+    else
+      { 'kind' => 'number', 'formatString' => ',.0f' }
+    end
+
+  element = {
+    'id'      => el_id,
+    'kind'    => 'kpi-chart',
+    'name'    => cap,
+    'source'  => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+    'columns' => [measure_col],
+    'value'   => { 'id' => measure_col_id }
+  }
+
+  # If the Tableau worksheet had Show Mark Labels on (typical for KPIs since
+  # the number IS the chart), we don't need a separate dataLabel — kpi-chart
+  # always renders the value. No-op.
+
+  element
+end
+
 # A workbook may have multiple dashboards; iterate all and concatenate elements.
 # Drop the chart_kind=automatic warnings to stderr so the caller can act on them.
 elements = []
@@ -639,6 +722,20 @@ layout.each do |dash|
         next
       end
       # else: fall through to flat-table flow
+    end
+
+    # KPI fast path: Tableau scorecards (chart_kind=kpi) emit a Sigma kpi-chart
+    # with a single measure as value. Without this, the worksheet would fall
+    # into the CSV-driven 2-column flow which requires headers.length >= 2 and
+    # silently drops single-measure tiles. beads-sigma-bw3.
+    if z['chart_kind'] == 'kpi'
+      kpi_el = build_kpi_element(z, meta, mmap, opts, warnings)
+      if kpi_el
+        elements << kpi_el
+        warnings << "'#{cap}' auto-emitted as Sigma kpi-chart from Tableau scorecard (Text mark + single measure) — verify value formula"
+        next
+      end
+      # else: fall through with the warning already logged
     end
 
     view = view_by_name[cap]

@@ -22,6 +22,8 @@ OptionParser.new do |p|
 end.parse!
 %i[type spec out].each { |k| abort("missing --#{k}") unless opts[k] }
 opts[:workdir] ||= File.dirname(File.expand_path(opts[:spec]))
+require 'fileutils'
+FileUtils.mkdir_p(opts[:workdir])
 
 BASE = ENV.fetch('SIGMA_BASE_URL')
 TOK  = ENV.fetch('SIGMA_API_TOKEN')

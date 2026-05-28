@@ -59,6 +59,7 @@ which calc translation, which layout) — not orchestration.
 | `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
 | `scripts/assert-phase6-ran.rb` | **Conversion hard gate (3 gates)** — exits 0 only when ALL three pass: (1) Phase 6 ran and parity-final.json shows status=PASS at the required rate, (2) no uncleaned orphan workbooks (posted-workbooks.jsonl has ≤1 entry OR cleanup-marker.json shows a successful non-dry-run cleanup), (3) the live workbook's `/columns` endpoint shows no column with `type=error` (catches circular refs / runtime errors introduced after the initial POST's column-type guard). Exits 1 for missing parity sentinel, 2 for parity FAIL / extract-mode-without-flag / charts_total==0, 4 for uncleaned orphans (beads-sigma-38a), 5 for live type=error columns (beads-sigma-38a). Subagent flows MUST call this as their final step. |
 | `scripts/cleanup-orphan-workbooks.rb` | Delete orphan workbooks left by spec-iteration retries. Reads `<workdir>/posted-workbooks.jsonl`, keeps the most-recent ID, deletes the rest via `DELETE /v2/files/{id}`. Writes `cleanup-marker.json` so the hard gate can confirm cleanup ran (and wasn't `--dry-run`). Idempotent (404 on delete is treated as success). See beads-sigma-38a. |
+| `scripts/build-dashboard-layout.rb` | **MANDATORY in Phase 5d** (dashboard-fidelity mode) — auto-build the Sigma layout XML from the parsed Tableau zone tree (`dashboard-layout.json`) + the workbook readback IDs (`wb-ids.json`). Positions each chart at the grid cell derived from its zone's x/y/w/h%. Without this step, the workbook PUTs without a top-level layout and Sigma renders elements as a single-column stack — see `assert-phase6-ran.rb` gate 4 (beads-sigma-bw3). |
 | `scripts/export-chart-png.rb` | Phase 6d (visual): export PNG screenshots of every chart in the converted Sigma workbook via `/v2/workbooks/{wb}/export` → `/v2/query/{q}/download`. Catches visual regressions CSV value parity can miss (silently-dropped log scale, missing data labels, wrong chart kind, palette drift). Output: per-element PNGs + `_manifest.json`. Pair with the Tableau MCP `get-view-image` to side-by-side compare source vs target. |
 | `scripts/find-or-pick-dm.rb` | Phase 1.5: scan existing DMs in the org and recommend reuse when one already covers the workbook's columns. Score = 0.7·column-overlap + 0.2·table-overlap + 0.1·metric-overlap. Parallel-fetches DM specs (~2s for 50 DMs). Output: `dm-match.json` with ranked candidates + recommendation. Non-destructive. Reuse skips Phase 2 + 3 entirely. `--auto-pick` flag (with tie-window safety) skips the user-confirm step when there's a clear winner. |
 | `scripts/inspect-dm-shape.rb` | Phase 1.5b (MANDATORY when reusing): inspect the reused DM's element graph and emit a denormalization plan classifying every column as `fact` (direct ref) or `dim` (needs Lookup). Output: `dm-denorm-plan.json` with the exact Lookup formula per dim column. Eliminates the 2–3 min spec-rework loop when the reused DM has separate dim elements (a non-pre-denormalized DM shape). |
@@ -1098,10 +1099,37 @@ ruby scripts/post-and-readback.rb --type workbook \
 > reassigns IDs. Either way, the readback is the source of truth — use IDs from `wb-ids.json`
 > when wiring layout XML.
 
-### 5d. Build layout XML
+### 5d. Build layout XML (MANDATORY)
 
-Write a per-workbook layout config that `require`s the helper library. Never hand-write
-layout XML.
+> **Skip this step and Sigma renders every tile as a single-column stack** —
+> the CoCo regression (beads-sigma-bw3). `assert-phase6-ran.rb` gate 4
+> rejects any workbook without a non-empty top-level `layout` XML.
+
+**Preferred path — auto-layout from the parsed Tableau zone tree:**
+
+```bash
+ruby scripts/build-dashboard-layout.rb \
+  --layout /tmp/<name>/dashboard-layout.json \
+  --wb-ids /tmp/<name>/wb-ids.json \
+  --out /tmp/<name>/layout.xml
+
+ruby scripts/put-layout.rb \
+  --workbook <workbookId> \
+  --layout /tmp/<name>/layout.xml
+```
+
+`build-dashboard-layout.rb` walks the dashboard's zones, converts each
+zone's `x_pct`/`y_pct`/`w_pct`/`h_pct` into Sigma 24-column grid spans,
+and stretches adjacent tiles to fill empty columns where Tableau had
+legend/filter shelves Sigma doesn't render. This is the dashboard-fidelity
+path — chart positions mirror the source PNG.
+
+**Hand-rolled path — page-per-worksheet OR when zone parsing fails:**
+
+For the few cases where the parser can't produce a usable layout (e.g.,
+workbooks with no `<dashboard>` element, or a layout you want to redesign),
+write a per-workbook layout config that `require`s the helper library.
+Never hand-write layout XML directly.
 
 > **PUT /v2/workbooks/{id}/spec wipes the top-level `layout` string.** If you
 > re-PUT the workbook spec after a formula fix (or any other spec edit), the
@@ -1221,7 +1249,7 @@ ruby scripts/assert-phase6-ran.rb --tableau /tmp/<name>
 # add --allow-extract when running parity in extract-mode
 ```
 
-The gate checks three independent things and rejects on any failure:
+The gate checks four independent things and rejects on any failure:
 
 1. **Phase 6 ran** — `parity-final.json` exists with status=PASS at the
    required rate.
@@ -1236,11 +1264,16 @@ The gate checks three independent things and rejects on any failure:
    in the Sigma UI but slipped past the initial POST's guard because it
    was introduced by a later PUT (layout update, spec edit during error
    recovery).
+4. **Layout applied** — fetches `/v2/workbooks/{id}/spec` and rejects
+   when the top-level `layout` field is empty or has fewer than 2
+   `<LayoutElement>` tags. Catches the CoCo regression where the agent
+   forgot to PUT a layout and Sigma rendered every tile as a
+   single-column stack instead of the dashboard grid.
 
 Exit 0 means the conversion is allowed to declare GREEN. Any other exit
 code means downgrade to YELLOW (parity skipped or incomplete, orphans
-left, runtime errors visible) or RED (parity failed). See beads-sigma-4pm
-and beads-sigma-38a.
+left, runtime errors visible, layout missing) or RED (parity failed).
+See beads-sigma-4pm, beads-sigma-38a, beads-sigma-bw3.
 
 > **POST vs PUT for spec updates.** `POST /v2/workbooks/spec` is
 > create-only. After the first successful POST returns a workbook ID,

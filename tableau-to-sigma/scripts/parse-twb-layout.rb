@@ -456,6 +456,16 @@ xml.elements.each('//worksheet') do |ws|
     (rows_shelf['measure_count'] + cols_shelf['measure_count'] + measures.size) >= 2
   is_crosstab = is_text_mark && (both_have_dims || measure_names_crosstab)
 
+  # KPI signal: Text/Square mark with ZERO dims on both shelves AND ≥1 measure
+  # (on shelves or on the worksheet's Marks card). Tableau "scorecard" /
+  # "big number" tiles match this shape — they're not detail lists, not
+  # crosstabs, just a single aggregated value rendered as text. Maps to
+  # Sigma kpi-chart. beads-sigma-bw3.
+  total_dim_count = rows_shelf['dim_count'] + cols_shelf['dim_count']
+  total_measure_count = rows_shelf['measure_count'] + cols_shelf['measure_count'] + measures.size
+  is_kpi = is_text_mark && !is_crosstab &&
+           total_dim_count == 0 && total_measure_count >= 1
+
   worksheets[name] = {
     mark_class:       mark_class,
     geo_role:         geo_role,
@@ -475,7 +485,8 @@ xml.elements.each('//worksheet') do |ws|
     mark_labels_show: mark_labels_show,
     rows_shelf:       rows_shelf,
     cols_shelf:       cols_shelf,
-    is_crosstab:      is_crosstab
+    is_crosstab:      is_crosstab,
+    is_kpi:           is_kpi
   }
 end
 
@@ -578,8 +589,8 @@ def chart_kind_for(meta)
   when 'area'       then 'area'
   when 'pie'        then 'pie'
   when 'circle'     then 'scatter'                # symbol marks (non-geo) = scatter
-  when 'square'     then (meta[:is_crosstab] ? 'pivot-table' : 'table')
-  when 'text'       then (meta[:is_crosstab] ? 'pivot-table' : 'table')
+  when 'square'     then (meta[:is_crosstab] ? 'pivot-table' : (meta[:is_kpi] ? 'kpi' : 'table'))
+  when 'text'       then (meta[:is_crosstab] ? 'pivot-table' : (meta[:is_kpi] ? 'kpi' : 'table'))
   when 'shape'      then 'scatter'
   when 'automatic'  then 'automatic'              # Tableau's default-pick — verify against PNG
   when ''           then 'other'
@@ -655,6 +666,7 @@ xml.elements.each('//dashboard') do |d|
       'rows_shelf'   => (kind == 'chart' ? ws_meta&.dig(:rows_shelf)    : nil),
       'cols_shelf'   => (kind == 'chart' ? ws_meta&.dig(:cols_shelf)    : nil),
       'is_crosstab'  => (kind == 'chart' ? ws_meta&.dig(:is_crosstab)   : nil),
+      'is_kpi'       => (kind == 'chart' ? ws_meta&.dig(:is_kpi)        : nil),
       # Resolved filter target (filter/parameter zones only)
       'filter_column_caption'  => (kind == 'filter' || kind == 'parameter' ? filter_col_caption  : nil),
       'filter_column_datatype' => (kind == 'filter' || kind == 'parameter' ? filter_col_datatype : nil)
@@ -702,6 +714,7 @@ if dashboards.empty? && !worksheets.empty?
         'rows_shelf'   => ws_meta[:rows_shelf],
         'cols_shelf'   => ws_meta[:cols_shelf],
         'is_crosstab'  => ws_meta[:is_crosstab],
+        'is_kpi'       => ws_meta[:is_kpi],
         'filter_column_caption'  => nil,
         'filter_column_datatype' => nil
       }]

@@ -11,7 +11,9 @@
 #   3. The live workbook's /columns endpoint shows no column with
 #      type=error (catches circular refs / runtime errors introduced
 #      AFTER the initial POST's column-type guard ran)  → beads-sigma-38a
-#   4. (Optional) The workbook is reachable via /v2/workbooks/{id}
+#   4. The workbook has a non-empty layout XML applied (catches the
+#      "elements just listed in a single column" regression where the
+#      agent forgot to PUT a layout)  → beads-sigma-bw3
 #
 # Usage:
 #   ruby scripts/assert-phase6-ran.rb --tableau /tmp/<name> \
@@ -21,6 +23,10 @@
 #     [--skip-column-check]    # skip the live /columns type=error scan
 #     [--skip-orphan-check]    # skip the orphan-workbook scan (for callers
 #                              # that genuinely want multiple workbooks)
+#     [--skip-layout-check]    # skip the layout-applied scan
+#     [--min-layout-elements N] default 2 — single-page bare-element layouts
+#                              # often have just the page wrapper; require this
+#                              # many <LayoutElement> tags
 #
 # Exit codes:
 #   0  every gate passes — conversion is allowed to declare GREEN
@@ -30,6 +36,8 @@
 #   3  parity-final.json malformed
 #   4  orphan workbooks left uncleaned (beads-sigma-38a)
 #   5  live workbook has column(s) with type=error (beads-sigma-38a)
+#   6  live workbook has no layout applied — single-column fallback
+#      (beads-sigma-bw3)
 #
 # Prints a per-gate summary to stdout regardless of exit code.
 
@@ -38,7 +46,7 @@ require 'net/http'
 require 'uri'
 require 'optparse'
 
-opts = { min_pass_rate: 1.0, allow_extract: false }
+opts = { min_pass_rate: 1.0, allow_extract: false, min_layout_elements: 2 }
 OptionParser.new do |p|
   p.on('--tableau DIR')              { |v| opts[:tab] = v }
   p.on('--workbook-id ID')           { |v| opts[:wb] = v }
@@ -46,6 +54,8 @@ OptionParser.new do |p|
   p.on('--allow-extract')            { opts[:allow_extract] = true }
   p.on('--skip-column-check')        { opts[:skip_column] = true }
   p.on('--skip-orphan-check')        { opts[:skip_orphan] = true }
+  p.on('--skip-layout-check')        { opts[:skip_layout] = true }
+  p.on('--min-layout-elements N', Integer) { |v| opts[:min_layout_elements] = v }
 end.parse!
 abort('--tableau required') unless opts[:tab]
 
@@ -95,7 +105,7 @@ if status != 'PASS' || pass_rate < opts[:min_pass_rate]
   exit 2
 end
 
-puts "[OK] gate 1/3: Phase 6 ran cleanly — #{passed}/#{total} charts PASS (mode=#{mode}, status=#{status})"
+puts "[OK] gate 1/4: Phase 6 ran cleanly — #{passed}/#{total} charts PASS (mode=#{mode}, status=#{status})"
 
 # ---------------------------------------------------------------------------
 # Gate 2 — orphan workbooks (beads-sigma-38a)
@@ -108,7 +118,7 @@ unless opts[:skip_orphan]
     if unique_ids.length > 1
       marker_path = File.join(opts[:tab], 'cleanup-marker.json')
       unless File.exist?(marker_path)
-        warn "[FAIL] gate 2/3: #{unique_ids.length} workbooks created during this conversion (orphans not cleaned)."
+        warn "[FAIL] gate 2/4: #{unique_ids.length} workbooks created during this conversion (orphans not cleaned)."
         warn "       posted-workbooks.jsonl entries:"
         unique_ids.each { |id| warn "         - #{id}" }
         warn "       Run: ruby scripts/cleanup-orphan-workbooks.rb --workdir #{opts[:tab]}"
@@ -117,27 +127,27 @@ unless opts[:skip_orphan]
       end
       marker = JSON.parse(File.read(marker_path)) rescue {}
       if marker['failed'] && !marker['failed'].empty?
-        warn "[FAIL] gate 2/3: cleanup-marker.json reports #{marker['failed'].length} failed delete(s)."
+        warn "[FAIL] gate 2/4: cleanup-marker.json reports #{marker['failed'].length} failed delete(s)."
         warn "       Orphan workbooks are still in the customer's My Documents:"
         marker['failed'].each { |f| warn "         - #{f['id']} (HTTP #{f['status']})" }
         exit 4
       end
       if marker['dry_run']
-        warn "[FAIL] gate 2/3: cleanup-marker.json is from a --dry-run; orphans were not actually deleted."
+        warn "[FAIL] gate 2/4: cleanup-marker.json is from a --dry-run; orphans were not actually deleted."
         warn "       Re-run cleanup-orphan-workbooks.rb without --dry-run."
         exit 4
       end
       kept = marker['kept'] || '(unknown)'
       deleted = (marker['deleted'] || []).length
-      puts "[OK] gate 2/3: orphan cleanup ran — kept #{kept}, deleted #{deleted}"
+      puts "[OK] gate 2/4: orphan cleanup ran — kept #{kept}, deleted #{deleted}"
     else
-      puts "[OK] gate 2/3: only one workbook POSTed (#{unique_ids.first}) — no orphan check needed"
+      puts "[OK] gate 2/4: only one workbook POSTed (#{unique_ids.first}) — no orphan check needed"
     end
   else
-    puts "[OK] gate 2/3: posted-workbooks.jsonl missing — assuming no orphans (legacy or external POST flow)"
+    puts "[OK] gate 2/4: posted-workbooks.jsonl missing — assuming no orphans (legacy or external POST flow)"
   end
 else
-  puts "[SKIP] gate 2/3: --skip-orphan-check"
+  puts "[SKIP] gate 2/4: --skip-orphan-check"
 end
 
 # ---------------------------------------------------------------------------
@@ -157,12 +167,12 @@ unless opts[:skip_column]
   end
 
   if wb_id.nil? || wb_id.empty?
-    puts "[SKIP] gate 3/3: no workbook ID resolvable (pass --workbook-id or ensure wb-ids.json exists)"
+    puts "[SKIP] gate 3/4: no workbook ID resolvable (pass --workbook-id or ensure wb-ids.json exists)"
   else
     base = ENV['SIGMA_BASE_URL']
     tok  = ENV['SIGMA_API_TOKEN']
     if base.nil? || base.empty? || tok.nil? || tok.empty?
-      warn "[SKIP] gate 3/3: SIGMA_BASE_URL / SIGMA_API_TOKEN not set — cannot fetch /columns"
+      warn "[SKIP] gate 3/4: SIGMA_BASE_URL / SIGMA_API_TOKEN not set — cannot fetch /columns"
     else
       uri = URI("#{base}/v2/workbooks/#{wb_id}/columns")
       req = Net::HTTP::Get.new(uri)
@@ -174,7 +184,7 @@ unless opts[:skip_column]
         cols = (JSON.parse(res.body)['entries'] rescue []) || []
         error_cols = cols.select { |c| c.dig('type', 'type') == 'error' }
         if error_cols.any?
-          warn "[FAIL] gate 3/3: live workbook #{wb_id} has #{error_cols.length} column(s) with type=error."
+          warn "[FAIL] gate 3/4: live workbook #{wb_id} has #{error_cols.length} column(s) with type=error."
           warn "       These render as visible errors in the Sigma UI (circular ref, unknown column,"
           warn "       unsupported function, etc.). Fix the offending formulas and re-PUT before declaring GREEN."
           error_cols.first(10).each do |c|
@@ -184,14 +194,118 @@ unless opts[:skip_column]
           warn "       See beads-sigma-38a."
           exit 5
         end
-        puts "[OK] gate 3/3: #{cols.length} live columns clean (no type=error)"
+        puts "[OK] gate 3/4: #{cols.length} live columns clean (no type=error)"
       else
-        warn "[SKIP] gate 3/3: GET /v2/workbooks/#{wb_id}/columns returned HTTP #{res.code} — cannot verify"
+        warn "[SKIP] gate 3/4: GET /v2/workbooks/#{wb_id}/columns returned HTTP #{res.code} — cannot verify"
       end
     end
   end
 else
-  puts "[SKIP] gate 3/3: --skip-column-check"
+  puts "[SKIP] gate 3/4: --skip-column-check"
+end
+
+# ---------------------------------------------------------------------------
+# Gate 4 — layout applied (beads-sigma-bw3)
+# Fetches the live workbook spec and confirms a non-empty top-level `layout`
+# XML is set, with at least --min-layout-elements <LayoutElement> tags.
+# Catches the "agent forgot to PUT a layout" regression where elements
+# render as a single-column stack instead of the dashboard grid.
+# ---------------------------------------------------------------------------
+unless opts[:skip_layout]
+  wb_id = opts[:wb]
+  if wb_id.nil?
+    wb_ids_path = File.join(opts[:tab], 'wb-ids.json')
+    if File.exist?(wb_ids_path)
+      wb_ids = JSON.parse(File.read(wb_ids_path)) rescue {}
+      wb_id = wb_ids['workbookId']
+    end
+  end
+
+  if wb_id.nil? || wb_id.empty?
+    puts "[SKIP] gate 4/4: no workbook ID resolvable for layout check"
+  else
+    base = ENV['SIGMA_BASE_URL']
+    tok  = ENV['SIGMA_API_TOKEN']
+    if base.nil? || base.empty? || tok.nil? || tok.empty?
+      warn "[SKIP] gate 4/4: SIGMA_BASE_URL / SIGMA_API_TOKEN not set — cannot fetch spec"
+    else
+      uri = URI("#{base}/v2/workbooks/#{wb_id}/spec")
+      req = Net::HTTP::Get.new(uri)
+      req['Authorization'] = "Bearer #{tok}"
+      req['Accept'] = 'application/json'
+      res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+
+      if res.is_a?(Net::HTTPSuccess)
+        body = res.body.to_s
+        spec =
+          begin
+            JSON.parse(body)
+          rescue JSON::ParserError
+            require 'yaml'
+            require 'date'
+            YAML.safe_load(body, permitted_classes: [Date, Time]) || {}
+          end
+        layout_xml = spec['layout'].to_s
+        elem_count = layout_xml.scan(/<LayoutElement\b/).length
+
+        # Detect the Sigma "auto-generated single-column stack" layout that
+        # the server produces when a workbook is POSTed without a layout.
+        # Signature: every non-Data page has all its elements at the same
+        # gridColumn value (typically "1 / 13" — left half, vertically stacked).
+        # Note: per-page detection — a workbook with one element per content
+        # page is structurally fine (degenerate case, not a stack).
+        non_data_stack_pages = []
+        # Walk one page at a time using the <Page id="..."> blocks
+        layout_xml.scan(/<Page\b[^>]*id="([^"]*)"[^>]*>(.*?)<\/Page>/m).each do |page_id, page_body|
+          next if page_id.to_s.downcase.include?('data')
+          cols_on_page = page_body.scan(/gridColumn="([^"]+)"/).map(&:first).uniq
+          elems_on_page = page_body.scan(/<LayoutElement\b/).length
+          if elems_on_page >= 2 && cols_on_page.length == 1
+            non_data_stack_pages << [page_id, cols_on_page.first, elems_on_page]
+          end
+        end
+
+        if layout_xml.empty?
+          warn "[FAIL] gate 4/4: live workbook #{wb_id} has NO top-level layout XML."
+          warn "       Elements render as a single-column stack instead of the"
+          warn "       dashboard grid. Build a layout and PUT it:"
+          warn "         ruby scripts/build-dashboard-layout.rb \\"
+          warn "           --layout #{opts[:tab]}/dashboard-layout.json \\"
+          warn "           --wb-ids #{opts[:tab]}/wb-ids.json \\"
+          warn "           --out #{opts[:tab]}/layout.xml"
+          warn "         ruby scripts/put-layout.rb --workbook #{wb_id} \\"
+          warn "           --layout #{opts[:tab]}/layout.xml"
+          warn "       See beads-sigma-bw3."
+          exit 6
+        elsif elem_count < opts[:min_layout_elements]
+          warn "[FAIL] gate 4/4: layout XML has only #{elem_count} <LayoutElement> tag(s);"
+          warn "       at least #{opts[:min_layout_elements]} required (one master + ≥1 chart)."
+          warn "       The layout likely covers only the Data page — chart page is unstyled."
+          exit 6
+        elsif non_data_stack_pages.any?
+          warn "[FAIL] gate 4/4: live workbook #{wb_id} has Sigma's auto-generated"
+          warn "       single-column stack layout (multiple elements at the same gridColumn"
+          warn "       on a non-Data page). This is what Sigma defaults to when you POST"
+          warn "       a workbook without a layout — exactly the CoCo regression."
+          non_data_stack_pages.each do |pid, col, n|
+            warn "         page=#{pid.inspect}: #{n} elements all at gridColumn=#{col.inspect}"
+          end
+          warn "       Build a real layout and PUT it:"
+          warn "         ruby scripts/build-dashboard-layout.rb --layout #{opts[:tab]}/dashboard-layout.json \\"
+          warn "           --wb-ids #{opts[:tab]}/wb-ids.json --out #{opts[:tab]}/layout.xml"
+          warn "         ruby scripts/put-layout.rb --workbook #{wb_id} --layout #{opts[:tab]}/layout.xml"
+          warn "       See beads-sigma-bw3."
+          exit 6
+        else
+          puts "[OK] gate 4/4: layout XML applied with #{elem_count} positioned element(s)"
+        end
+      else
+        warn "[SKIP] gate 4/4: GET /v2/workbooks/#{wb_id}/spec returned HTTP #{res.code} — cannot verify"
+      end
+    end
+  end
+else
+  puts "[SKIP] gate 4/4: --skip-layout-check"
 end
 
 puts "[OK] all gates pass — conversion may declare GREEN"
