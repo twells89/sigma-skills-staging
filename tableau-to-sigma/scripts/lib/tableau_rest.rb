@@ -12,6 +12,11 @@ require 'cgi'
 
 module Tableau
   class Error < StandardError; end
+  class AuthError < Error; end
+
+  @token_mutex = Mutex.new
+  @token_override = nil
+  @site_id_override = nil
 
   module_function
 
@@ -20,15 +25,46 @@ module Tableau
   end
 
   def site_id
-    ENV.fetch('TABLEAU_SITE_ID') { raise Error, 'TABLEAU_SITE_ID not set — run get-tableau-token.sh' }
+    @token_mutex.synchronize { @site_id_override } || ENV.fetch('TABLEAU_SITE_ID') { raise Error, 'TABLEAU_SITE_ID not set — run get-tableau-token.sh' }
   end
 
   def auth_token
-    ENV.fetch('TABLEAU_AUTH_TOKEN') { raise Error, 'TABLEAU_AUTH_TOKEN not set — run get-tableau-token.sh' }
+    @token_mutex.synchronize { @token_override } || ENV.fetch('TABLEAU_AUTH_TOKEN') { raise Error, 'TABLEAU_AUTH_TOKEN not set — run get-tableau-token.sh' }
   end
 
   def api_version
     ENV.fetch('TABLEAU_API_VERSION', '3.22')
+  end
+
+  # Re-sign in with the PAT env vars and update the in-memory token. Thread-safe.
+  # Long-running scripts (hours) should call this before Tableau's session times
+  # out (cloud default: 240 min idle, can be much shorter under strict policies).
+  # Single-flight: concurrent callers all wait for one signin and share the result.
+  def refresh_token!
+    @token_mutex.synchronize do
+      return @token_override if @refresh_inflight
+      @refresh_inflight = true
+    end
+    begin
+      name = ENV.fetch('TABLEAU_PAT_NAME')   { raise AuthError, 'TABLEAU_PAT_NAME not set — cannot refresh' }
+      secret = ENV.fetch('TABLEAU_PAT_SECRET'){ raise AuthError, 'TABLEAU_PAT_SECRET not set — cannot refresh' }
+      site_url = ENV.fetch('TABLEAU_SITE_CONTENT_URL') { raise AuthError, 'TABLEAU_SITE_CONTENT_URL not set' }
+      uri = URI.join(server_url, "/api/#{api_version}/auth/signin")
+      req = Net::HTTP::Post.new(uri)
+      req['Content-Type'] = 'application/xml'
+      req['Accept'] = 'application/json'
+      req.body = %(<tsRequest><credentials personalAccessTokenName="#{name}" personalAccessTokenSecret="#{secret}"><site contentUrl="#{site_url}"/></credentials></tsRequest>)
+      res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+      raise AuthError, "signin -> #{res.code} #{res.body}" unless res.is_a?(Net::HTTPSuccess)
+      j = JSON.parse(res.body)
+      @token_mutex.synchronize do
+        @token_override = j.dig('credentials', 'token')
+        @site_id_override = j.dig('credentials', 'site', 'id')
+      end
+      @token_override
+    ensure
+      @token_mutex.synchronize { @refresh_inflight = false }
+    end
   end
 
   def base_path
@@ -37,31 +73,40 @@ module Tableau
 
   # ---- low-level transport -------------------------------------------------
 
-  def request(method, path, body: nil, content_type: 'application/json', accept: 'application/json', binary: false)
+  def request(method, path, body: nil, content_type: 'application/json', accept: 'application/json', binary: false, http: nil)
     uri = URI.join(server_url, path)
-    req = case method
-          when :get  then Net::HTTP::Get.new(uri)
-          when :post then Net::HTTP::Post.new(uri)
-          when :put  then Net::HTTP::Put.new(uri)
-          when :delete then Net::HTTP::Delete.new(uri)
-          else raise ArgumentError, "unsupported method #{method}"
-          end
-    req['X-Tableau-Auth'] = auth_token
-    req['Accept'] = accept
-    if body
-      req['Content-Type'] = content_type
-      req.body = body
-    end
+    attempts = 0
+    loop do
+      attempts += 1
+      req = case method
+            when :get  then Net::HTTP::Get.new(uri)
+            when :post then Net::HTTP::Post.new(uri)
+            when :put  then Net::HTTP::Put.new(uri)
+            when :delete then Net::HTTP::Delete.new(uri)
+            else raise ArgumentError, "unsupported method #{method}"
+            end
+      req['X-Tableau-Auth'] = auth_token
+      req['Accept'] = accept
+      if body
+        req['Content-Type'] = content_type
+        req.body = body
+      end
 
-    Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https', read_timeout: 120) do |http|
-      res = http.request(req)
+      res = if http
+              http.request(req)
+            else
+              Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https', read_timeout: 120) { |h| h.request(req) }
+            end
+      if res.code.to_i == 401 && attempts == 1 && ENV['TABLEAU_PAT_NAME']
+        refresh_token!
+        next
+      end
       unless res.is_a?(Net::HTTPSuccess)
         raise Error, "#{method.upcase} #{path} -> #{res.code} #{res.message}\n#{res.body}"
       end
       return res.body if binary
-      # Only JSON-parse when we explicitly asked for JSON.
       return res.body unless accept == 'application/json'
-      res.body.empty? ? nil : JSON.parse(res.body)
+      return res.body.empty? ? nil : JSON.parse(res.body)
     end
   end
 

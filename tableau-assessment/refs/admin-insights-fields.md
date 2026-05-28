@@ -115,6 +115,7 @@ Expected datasource names: `TS Users`, `TS Events`, `Permissions`,
 | `Data Sources` *(no trailing space)* | `Data Sources ` *(trailing space)* | TS Users — yes really |
 | `View Count` | use TS Events SUM(Number of Events) | TS Events |
 | `Hits` | use TS Events `Event Type=Access` | TS Events |
+| `Is Archived` | **does not exist** on Tableau Cloud Admin Insights Site Content. Use `Top Parent Project Name != "Personal Space"` to drop the per-user sandbox; the REST `/workbooks` endpoint already hides truly deleted/archived items server-side. | Site Content |
 
 ## VizQL session contention
 

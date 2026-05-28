@@ -118,6 +118,32 @@ If only the basic inventory runs (Section 1 below), surface a banner in the read
 
 ---
 
+## Scope filters — usage window + personal sandbox exclusion
+
+Every TS Events / Site Content query in this skill applies two default filters
+so the readout reflects current relevance, not lifetime noise:
+
+| Filter | Default | Why | How to override |
+|---|---|---|---|
+| **Usage window** | `Event Date >= today - 90 days` on every TS Events query | Tableau Cloud's `TS Events` Admin Insights datasource only retains ~90 days anyway, but the filter makes the window **explicit** in the readout and lets you tighten it to 30 days for pilot-picking. Without an explicit `Event Date` filter, "all time" silently means whatever the customer's site retention is. | Set `USAGE_DAYS=30` (or any positive int) in env before running the agent's Admin Insights queries; surface in the readout header as "Usage window: last N days". |
+| **Personal Space exclusion** | `Top Parent Project Name != "Personal Space"` on Site Content workbook/datasource queries | Tableau Cloud's per-user sandbox project is full of one-off / draft / never-shared workbooks. On a 793-dashboard site, this often hides ~30-50% of the count. | Set `INCLUDE_PERSONAL=1` to keep them in the inventory. |
+
+> **There is no `Is Archived` field on Tableau Cloud's Admin Insights Site
+> Content datasource** — verified against `read-metadata` on a live site. The
+> Tableau Cloud REST `/workbooks` endpoint already filters out truly archived
+> /deleted workbooks server-side, so no client filter is needed for that. The
+> "archived" concept the customer might mean is usually either (a) personal
+> sandbox content (handled by the Personal Space exclusion above) or (b)
+> workbooks moved to a project the customer calls "Archive" / "Old" / "Retired"
+> — add those project names to `--exclude-projects` if surfaced.
+
+Compute the relative date in the orchestration shell, e.g.
+`MIN_DATE=$(date -v-90d +%Y-%m-%d)` (BSD/macOS) or
+`MIN_DATE=$(date -d '90 days ago' +%Y-%m-%d)` (GNU/Linux), then substitute into
+the `QUANTITATIVE_DATE` filter shape shown in the queries below.
+
+---
+
 ## Phase 1 — Environment inventory (MCP, always runs)
 
 Even without Admin Insights, the skill can produce a basic environment overview
@@ -228,7 +254,8 @@ cheat sheet. Critical: it's `Event Id`, not `Event LUID`.
     { "fieldCaption": "Count of Distinct Actors", "fieldAlias": "actors" }
   ], "filters": [
     { "field": { "fieldCaption": "Event Type" }, "filterType": "SET", "values": ["Access"] },
-    { "field": { "fieldCaption": "Item Type" }, "filterType": "SET", "values": ["View", "Workbook"] }
+    { "field": { "fieldCaption": "Item Type" }, "filterType": "SET", "values": ["View", "Workbook"] },
+    { "field": { "fieldCaption": "Event Date" }, "filterType": "QUANTITATIVE_DATE", "quantitativeFilterType": "MIN", "minDate": "<today minus USAGE_DAYS (default 90)>" }
   ]}
 }
 ```
@@ -247,11 +274,16 @@ cheat sheet. Critical: it's `Event Id`, not `Event LUID`.
     { "fieldCaption": "Is Data Extract" },
     { "fieldCaption": "Has Refresh Scheduled" },
     { "fieldCaption": "Item Hyperlink" }
-  ], "filters": [{
-    "field": { "fieldCaption": "Item Type" }, "filterType": "SET", "values": ["Workbook"]
-  }]}
+  ], "filters": [
+    { "field": { "fieldCaption": "Item Type" }, "filterType": "SET", "values": ["Workbook"] },
+    { "field": { "fieldCaption": "Top Parent Project Name" }, "filterType": "SET", "exclude": true, "values": ["Personal Space"] }
+  ]}
 }
 ```
+
+> Drop the `Top Parent Project Name` exclusion filter if `INCLUDE_PERSONAL=1`.
+> Add additional project names to the `values` array if the customer has
+> custom "Archive" / "Retired" projects to skip.
 
 Merge the seven outputs into `<out>/inventory.json` following the schema in
 `refs/output-shapes.md`.
@@ -289,7 +321,8 @@ Then the per-user-per-workbook access map (used to compute migration coverage):
     { "fieldCaption": "Number of Events", "function": "SUM", "fieldAlias": "accesses" }
   ], "filters": [
     { "field": { "fieldCaption": "Event Type" }, "filterType": "SET", "values": ["Access"] },
-    { "field": { "fieldCaption": "Item Type" }, "filterType": "SET", "values": ["View", "Workbook"] }
+    { "field": { "fieldCaption": "Item Type" }, "filterType": "SET", "values": ["View", "Workbook"] },
+    { "field": { "fieldCaption": "Event Date" }, "filterType": "QUANTITATIVE_DATE", "quantitativeFilterType": "MIN", "minDate": "<today minus USAGE_DAYS (default 90)>" }
   ]}
 }
 ```
@@ -312,7 +345,36 @@ ruby scripts/fetch-all-twbs.rb --out /tmp/assessment-<site>
 ```
 
 `fetch-all-twbs.rb` lists every workbook via REST, downloads `.twb` content in
-parallel (6-thread cap), and unzips any `.twbx` to extract the inner `.twb`.
+parallel (12-thread default), and unzips any `.twbx` to extract the inner `.twb`.
+
+For **large sites (500+ workbooks)** the script is built to handle the long-run
+failure modes:
+
+- **Resumable.** Files already on disk in `<out>/twbs/` are skipped, so a
+  failed or interrupted run can just re-invoke the same command.
+- **Token auto-refresh.** Background thread re-signs in every 60 min
+  (`--refresh-min N`), and every request retries once after refreshing on a
+  401. Long runs (1000+ workbooks, multi-hour) survive Tableau Cloud session
+  timeout without manual re-auth.
+- **Persistent HTTPS per worker** — measured ~2× speedup vs. the previous
+  fresh-connection-per-request approach.
+- **Adaptive backoff** on 429 / 502 / 503 / 504, up to 4 retries with
+  exponential delay capped at 30 s.
+- **Live ETA** logged every 10 workbooks: `[N/total] R wb/s  eta M minutes`.
+
+Tuning flags:
+```bash
+ruby scripts/fetch-all-twbs.rb --out /tmp/assessment-<site> \
+  --threads 12 \      # raise to 16-24 if customer's Tableau Cloud is fast and not throttling
+  --refresh-min 60 \  # lower to 30 if customer site has strict session policy
+  --limit 50          # for a sanity pass before fetching the whole site
+```
+
+Expected throughput on Tableau Cloud `10ay.online.tableau.com`: ~300 wb/min
+on small workbooks, ~60-120 wb/min on a mixed corpus with several 5MB+
+`.twbx` files. **If you measure < 30 wb/min on a customer's site**, suspect
+network latency or large embedded extracts; lower threads to avoid 429s
+rather than raising them.
 
 ### 3b. Run the gap-scanner against each workbook
 
