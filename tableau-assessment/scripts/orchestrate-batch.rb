@@ -331,17 +331,35 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
        write `/tmp/<wb-dir>/parity-actuals.json`.
     3. Re-run with `--finalize --actuals ...` (Pass 2). This writes
        `/tmp/<wb-dir>/parity-final.json` — the sentinel the hard gate checks.
-    4. **MANDATORY FINAL STEP — before writing the result line, run:**
+    4. **If you POSTed the workbook more than once** during spec iteration
+       (each post-and-readback.rb invocation creates a NEW workbook — POST
+       is create-only), run:
+       `ruby scripts/cleanup-orphan-workbooks.rb --workdir /tmp/<wb-dir>`
+       to delete the orphans. This MUST run before step 5 or the gate
+       will fail with exit 4. See beads-sigma-38a.
+    5. **MANDATORY FINAL STEP — before writing the result line, run:**
        `ruby scripts/assert-phase6-ran.rb --tableau /tmp/<wb-dir>`
-       Exit 0 → write GREEN if all other gates pass. Any non-zero exit →
-       you MUST downgrade to YELLOW (parity skipped/incomplete) or RED
-       (parity failed). Do NOT declare GREEN if assert-phase6-ran.rb did
-       not exit 0. There is no exception.
+       The gate now checks three things: Phase 6 ran, no orphan workbooks
+       remain, and the live workbook has no column with type=error
+       (catches circular refs and runtime errors not surfaced by the
+       initial POST's column-type guard). Exit 0 → write GREEN if all
+       other gates pass. Any non-zero exit → you MUST downgrade to YELLOW
+       (parity skipped/incomplete, orphans uncleaned, runtime errors) or
+       RED (parity failed). Do NOT declare GREEN if assert-phase6-ran.rb
+       did not exit 0. There is no exception.
 
     **If MCP query fails mid-Phase-6 with an auth-related error**, the
     Sigma MCP session has staled. Re-call `mcp__sigma-mcp-v2__begin_session`
     and retry the query. Do NOT skip Phase 6 because of a recoverable
     auth error — that's the 2026-05-22 cluster-follower regression.
+
+    **POST vs PUT for spec updates.** `POST /v2/workbooks/spec` is
+    create-only. After your first successful POST, every spec update
+    MUST be a `PUT /v2/workbooks/{id}/spec` against the same ID. Re-POSTing
+    creates a duplicate workbook in the customer's My Documents — exactly
+    the 2026-05-28 regression that left three workbooks behind. post-and-
+    readback.rb now logs every POST to posted-workbooks.jsonl and prints
+    a loud warning on second+ invocation.
 
     DELIVERABLES on completion — APPEND ONE LINE to `#{batch_results_path}`
     as JSON (newline-delimited; tolerate races with file locking):

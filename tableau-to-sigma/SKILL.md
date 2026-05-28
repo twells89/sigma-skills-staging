@@ -57,7 +57,8 @@ which calc translation, which layout) — not orchestration.
 | `scripts/put-layout.rb` | Apply a layout XML to an existing workbook (strips read-only fields) |
 | `scripts/auto-parity-plan.rb` | Phase 6a: auto-build a parity plan by matching Sigma chart elements to Tableau view CSVs (with `--rename` for renamed tiles). Output → `/tmp/<name>/parity-plan.json` wrapped as `{ extract, charts: [...] }` |
 | `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
-| `scripts/assert-phase6-ran.rb` | **Phase 6 hard gate** — reads `/tmp/<name>/parity-final.json` and exits 0 only when Phase 6 ran AND every chart passed at the required rate (default 100%). Exits 1 when the sentinel is missing (Phase 6 was skipped — the historic subagent-regression case, beads-sigma-4pm), 2 when status≠PASS / pass-rate below threshold / charts_total==0 / extract-mode without `--allow-extract`. Subagent flows MUST call this as their final step before writing the result line. |
+| `scripts/assert-phase6-ran.rb` | **Conversion hard gate (3 gates)** — exits 0 only when ALL three pass: (1) Phase 6 ran and parity-final.json shows status=PASS at the required rate, (2) no uncleaned orphan workbooks (posted-workbooks.jsonl has ≤1 entry OR cleanup-marker.json shows a successful non-dry-run cleanup), (3) the live workbook's `/columns` endpoint shows no column with `type=error` (catches circular refs / runtime errors introduced after the initial POST's column-type guard). Exits 1 for missing parity sentinel, 2 for parity FAIL / extract-mode-without-flag / charts_total==0, 4 for uncleaned orphans (beads-sigma-38a), 5 for live type=error columns (beads-sigma-38a). Subagent flows MUST call this as their final step. |
+| `scripts/cleanup-orphan-workbooks.rb` | Delete orphan workbooks left by spec-iteration retries. Reads `<workdir>/posted-workbooks.jsonl`, keeps the most-recent ID, deletes the rest via `DELETE /v2/files/{id}`. Writes `cleanup-marker.json` so the hard gate can confirm cleanup ran (and wasn't `--dry-run`). Idempotent (404 on delete is treated as success). See beads-sigma-38a. |
 | `scripts/export-chart-png.rb` | Phase 6d (visual): export PNG screenshots of every chart in the converted Sigma workbook via `/v2/workbooks/{wb}/export` → `/v2/query/{q}/download`. Catches visual regressions CSV value parity can miss (silently-dropped log scale, missing data labels, wrong chart kind, palette drift). Output: per-element PNGs + `_manifest.json`. Pair with the Tableau MCP `get-view-image` to side-by-side compare source vs target. |
 | `scripts/find-or-pick-dm.rb` | Phase 1.5: scan existing DMs in the org and recommend reuse when one already covers the workbook's columns. Score = 0.7·column-overlap + 0.2·table-overlap + 0.1·metric-overlap. Parallel-fetches DM specs (~2s for 50 DMs). Output: `dm-match.json` with ranked candidates + recommendation. Non-destructive. Reuse skips Phase 2 + 3 entirely. `--auto-pick` flag (with tie-window safety) skips the user-confirm step when there's a clear winner. |
 | `scripts/inspect-dm-shape.rb` | Phase 1.5b (MANDATORY when reusing): inspect the reused DM's element graph and emit a denormalization plan classifying every column as `fact` (direct ref) or `dim` (needs Lookup). Output: `dm-denorm-plan.json` with the exact Lookup formula per dim column. Eliminates the 2–3 min spec-rework loop when the reused DM has separate dim elements (a non-pre-denormalized DM shape). |
@@ -1207,16 +1208,48 @@ pass/fail summary, writes `/tmp/<name>/parity-final.json`. Exits non-zero
 on divergence. Use this as the default — the per-step path below is for
 debugging.
 
-After it finishes, **always** run:
+After it finishes, **always** run the hard gate:
 
 ```bash
+# If you POSTed multiple workbooks during the conversion (e.g., iterative
+# spec retries), clean up the orphans first — POST is create-only and each
+# retry leaves an orphan in the customer's My Documents:
+ruby scripts/cleanup-orphan-workbooks.rb --workdir /tmp/<name>
+
+# Then run the hard gate:
 ruby scripts/assert-phase6-ran.rb --tableau /tmp/<name>
 # add --allow-extract when running parity in extract-mode
 ```
 
-This is the hard gate. Exit 0 means the conversion is allowed to declare
-GREEN. Any other exit code means downgrade to YELLOW (parity skipped or
-incomplete) or RED (parity failed).
+The gate checks three independent things and rejects on any failure:
+
+1. **Phase 6 ran** — `parity-final.json` exists with status=PASS at the
+   required rate.
+2. **No orphan workbooks** — `posted-workbooks.jsonl` has ≤1 entry, OR
+   `cleanup-marker.json` shows a successful non-dry-run cleanup. This
+   closes the 2026-05-28 regression where a customer ended up with three
+   workbooks (one final + two orphans from iterative POSTs).
+3. **No `type=error` columns on the live workbook** — fetches
+   `/v2/workbooks/{id}/columns` and rejects any column whose type
+   resolved to `error`. Catches circular references, unknown column
+   refs, unsupported functions — anything that renders an error banner
+   in the Sigma UI but slipped past the initial POST's guard because it
+   was introduced by a later PUT (layout update, spec edit during error
+   recovery).
+
+Exit 0 means the conversion is allowed to declare GREEN. Any other exit
+code means downgrade to YELLOW (parity skipped or incomplete, orphans
+left, runtime errors visible) or RED (parity failed). See beads-sigma-4pm
+and beads-sigma-38a.
+
+> **POST vs PUT for spec updates.** `POST /v2/workbooks/spec` is
+> create-only. After the first successful POST returns a workbook ID,
+> every subsequent spec update MUST use `PUT /v2/workbooks/{id}/spec`
+> against that ID. Re-POSTing creates a duplicate workbook in the
+> customer's My Documents — and the gate will fail until you run
+> `cleanup-orphan-workbooks.rb`. `post-and-readback.rb` now prints a
+> loud warning on second+ invocation listing the prior IDs and the
+> exact PUT command to use instead.
 
 `scripts/post-and-readback.rb` now prints a "NEXT STEP — Phase 6" prompt
 with the exact invocation at the end of every workbook POST, so the agent

@@ -10,6 +10,7 @@ require 'uri'
 require 'json'
 require 'yaml'
 require 'date'
+require 'time'
 require 'optparse'
 
 opts = {}
@@ -17,8 +18,10 @@ OptionParser.new do |p|
   p.on('--type T', %w[datamodel workbook]) { |v| opts[:type] = v }
   p.on('--spec P')                         { |v| opts[:spec] = v }
   p.on('--out P')                          { |v| opts[:out]  = v }
+  p.on('--workdir P', 'Per-conversion working dir (default: dir of --spec). Used to track posted workbook IDs across retries.') { |v| opts[:workdir] = v }
 end.parse!
 %i[type spec out].each { |k| abort("missing --#{k}") unless opts[k] }
+opts[:workdir] ||= File.dirname(File.expand_path(opts[:spec]))
 
 BASE = ENV.fetch('SIGMA_BASE_URL')
 TOK  = ENV.fetch('SIGMA_API_TOKEN')
@@ -38,10 +41,52 @@ def http(method, path, body = nil, accept_json: false)
   Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }
 end
 
+# Orphan-prevention pre-check: workbook POSTs are create-only. If this is a
+# second invocation in the same conversion, the previous workbook is being
+# orphaned in the customer's My Documents. WARN loudly and emit the PUT
+# alternative. Tracked at beads-sigma-38a (3-workbook customer regression).
+posted_log = File.join(opts[:workdir], 'posted-workbooks.jsonl') if opts[:type] == 'workbook'
+prior_ids = []
+if posted_log && File.exist?(posted_log)
+  prior_ids = File.readlines(posted_log).map { |l| JSON.parse(l)['id'] rescue nil }.compact
+end
+if prior_ids.any?
+  warn ''
+  warn '============================================================'
+  warn "WARN — orphan workbook risk (beads-sigma-38a)"
+  warn '============================================================'
+  warn "This is invocation ##{prior_ids.size + 1} of post-and-readback for this"
+  warn "conversion. Each POST creates a NEW workbook. Already created:"
+  prior_ids.each { |id| warn "  - #{id}" }
+  warn ''
+  warn 'If you are RETRYING after a spec error, you should be using PUT,'
+  warn 'not POST:'
+  warn ''
+  warn "  curl -X PUT -H \"Authorization: Bearer $SIGMA_API_TOKEN\" \\"
+  warn "    -H 'Content-Type: application/json' \\"
+  warn "    -d @#{opts[:spec]} \\"
+  warn "    \"$SIGMA_BASE_URL/v2/workbooks/#{prior_ids.last}/spec\""
+  warn ''
+  warn "If you genuinely meant to create a parallel workbook, ignore this."
+  warn "Otherwise, run scripts/cleanup-orphan-workbooks.rb --workdir #{opts[:workdir]}"
+  warn "to delete the orphans before declaring done — assert-phase6-ran.rb"
+  warn "will FAIL the gate if uncleaned orphans remain."
+  warn '============================================================'
+  warn ''
+end
+
 resp = http(:post, POST_PATH, File.read(opts[:spec]))
 parsed = YAML.safe_load(resp.body, permitted_classes: [Date, Time])
 oid = parsed[ID_FIELD] or abort("POST failed: #{parsed.inspect}")
 warn "POST ok: #{ID_FIELD}=#{oid}"
+
+# Append the new ID to the per-conversion log. Newline-delimited JSON so
+# multiple processes can append safely (atomic append on POSIX).
+if posted_log
+  File.open(posted_log, 'a') do |f|
+    f.puts(JSON.generate({ 'id' => oid, 'ran_at' => Time.now.utc.iso8601 }))
+  end
+end
 
 # Read back
 spec = JSON.parse(http(:get, format(GET_PATH, oid), accept_json: true).body)
