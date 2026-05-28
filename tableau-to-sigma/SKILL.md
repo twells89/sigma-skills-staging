@@ -57,6 +57,7 @@ which calc translation, which layout) — not orchestration.
 | `scripts/put-layout.rb` | Apply a layout XML to an existing workbook (strips read-only fields) |
 | `scripts/auto-parity-plan.rb` | Phase 6a: auto-build a parity plan by matching Sigma chart elements to Tableau view CSVs (with `--rename` for renamed tiles). Output → `/tmp/<name>/parity-plan.json` wrapped as `{ extract, charts: [...] }` |
 | `scripts/verify-parity.rb` | Phase 6c: diff expected (Tableau) vs actual (Sigma) per chart. `--extract-mode` switches to structural comparison (bucket count + dim set + sort) with value-drift tolerance for hasExtracts=true workbooks |
+| `scripts/assert-phase6-ran.rb` | **Phase 6 hard gate** — reads `/tmp/<name>/parity-final.json` and exits 0 only when Phase 6 ran AND every chart passed at the required rate (default 100%). Exits 1 when the sentinel is missing (Phase 6 was skipped — the historic subagent-regression case, beads-sigma-4pm), 2 when status≠PASS / pass-rate below threshold / charts_total==0 / extract-mode without `--allow-extract`. Subagent flows MUST call this as their final step before writing the result line. |
 | `scripts/export-chart-png.rb` | Phase 6d (visual): export PNG screenshots of every chart in the converted Sigma workbook via `/v2/workbooks/{wb}/export` → `/v2/query/{q}/download`. Catches visual regressions CSV value parity can miss (silently-dropped log scale, missing data labels, wrong chart kind, palette drift). Output: per-element PNGs + `_manifest.json`. Pair with the Tableau MCP `get-view-image` to side-by-side compare source vs target. |
 | `scripts/find-or-pick-dm.rb` | Phase 1.5: scan existing DMs in the org and recommend reuse when one already covers the workbook's columns. Score = 0.7·column-overlap + 0.2·table-overlap + 0.1·metric-overlap. Parallel-fetches DM specs (~2s for 50 DMs). Output: `dm-match.json` with ranked candidates + recommendation. Non-destructive. Reuse skips Phase 2 + 3 entirely. `--auto-pick` flag (with tie-window safety) skips the user-confirm step when there's a clear winner. |
 | `scripts/inspect-dm-shape.rb` | Phase 1.5b (MANDATORY when reusing): inspect the reused DM's element graph and emit a denormalization plan classifying every column as `fact` (direct ref) or `dim` (needs Lookup). Output: `dm-denorm-plan.json` with the exact Lookup formula per dim column. Eliminates the 2–3 min spec-rework loop when the reused DM has separate dim elements (a non-pre-denormalized DM shape). |
@@ -1183,9 +1184,13 @@ This step is mandatory and must run before declaring the conversion done.
 
 ---
 
-## Phase 6 — Verify chart data matches Tableau (MANDATORY)
+## Phase 6 — Verify chart data matches Tableau (MANDATORY — hard-gated)
 
-> **A conversion is not complete until Phase 6 has run and either passed or been explicitly accepted with documented divergences.** PUT returning `success: true` only proves the spec parsed — it tells you nothing about whether each chart shows the right numbers. Two recent customer-visible bugs both reached the customer because Phase 6 was skipped: a window-function calc compiling silently as `error` and a pie chart wired to the wrong dimension.
+> **A conversion is not complete until `scripts/assert-phase6-ran.rb` exits 0.** This is a *hard gate*, not a guideline. `phase6-parity.rb --finalize` writes `/tmp/<name>/parity-final.json` as a sentinel; `assert-phase6-ran.rb` reads it and exits non-zero if Phase 6 was skipped, ran in extract-mode without permission, or failed parity. Subagent flows (cluster followers via `tableau-assessment`) MUST run the assertion as their final step before writing the result line — without it, an agent can silently skip Phase 6 entirely and self-report `charts_pass: 0, charts_total: 0` to slip past the GREEN check. See `beads-sigma-4pm` for the regression that motivated the gate.
+
+> **PUT returning `success: true` is not verification.** It only proves the spec parsed. Two recent customer-visible bugs reached the customer because Phase 6 was skipped: a window-function calc compiling silently as `error` and a pie chart wired to the wrong dimension. Compile-clean from `verify-workbook.rb` is also not parity verification — that only confirms each formula resolves, not that the numbers match.
+
+> **If `mcp__sigma-mcp-v2__query` errors with an auth-related message mid-Phase-6**, the Sigma MCP session has staled. Re-call `mcp__sigma-mcp-v2__begin_session` and retry the query. Do NOT skip Phase 6 because of a recoverable auth error — that's the 2026-05-22 cluster-follower regression.
 
 ### 6 — one-step (preferred)
 
@@ -1201,6 +1206,17 @@ actuals via the workbook elements API, runs the verifier, prints a
 pass/fail summary, writes `/tmp/<name>/parity-final.json`. Exits non-zero
 on divergence. Use this as the default — the per-step path below is for
 debugging.
+
+After it finishes, **always** run:
+
+```bash
+ruby scripts/assert-phase6-ran.rb --tableau /tmp/<name>
+# add --allow-extract when running parity in extract-mode
+```
+
+This is the hard gate. Exit 0 means the conversion is allowed to declare
+GREEN. Any other exit code means downgrade to YELLOW (parity skipped or
+incomplete) or RED (parity failed).
 
 `scripts/post-and-readback.rb` now prints a "NEXT STEP — Phase 6" prompt
 with the exact invocation at the end of every workbook POST, so the agent

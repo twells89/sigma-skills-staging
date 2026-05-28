@@ -320,6 +320,29 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
       staging workbook-layout.md showed `columns`; the live API requires
       `columnIds`. Verified 2026-05-24.
 
+    >>>>>> PHASE 6 IS MANDATORY — HARD GATE <<<<<<
+
+    Phase 6 (parity verification) is the single most commonly-skipped step
+    in subagent runs — beads-sigma-4pm. To prevent silent skips:
+
+    1. Run `ruby scripts/phase6-parity.rb --tableau /tmp/<wb-dir> --workbook-id <id>`
+       (Pass 1 builds the plan).
+    2. Fire the listed MCP queries in ONE parallel batch, collect actuals,
+       write `/tmp/<wb-dir>/parity-actuals.json`.
+    3. Re-run with `--finalize --actuals ...` (Pass 2). This writes
+       `/tmp/<wb-dir>/parity-final.json` — the sentinel the hard gate checks.
+    4. **MANDATORY FINAL STEP — before writing the result line, run:**
+       `ruby scripts/assert-phase6-ran.rb --tableau /tmp/<wb-dir>`
+       Exit 0 → write GREEN if all other gates pass. Any non-zero exit →
+       you MUST downgrade to YELLOW (parity skipped/incomplete) or RED
+       (parity failed). Do NOT declare GREEN if assert-phase6-ran.rb did
+       not exit 0. There is no exception.
+
+    **If MCP query fails mid-Phase-6 with an auth-related error**, the
+    Sigma MCP session has staled. Re-call `mcp__sigma-mcp-v2__begin_session`
+    and retry the query. Do NOT skip Phase 6 because of a recoverable
+    auth error — that's the 2026-05-22 cluster-follower regression.
+
     DELIVERABLES on completion — APPEND ONE LINE to `#{batch_results_path}`
     as JSON (newline-delimited; tolerate races with file locking):
       { workbookId, cluster_id: "#{sub['cluster_id']}", role: "#{reuse ? 'follower' : 'leader'}",
@@ -327,15 +350,20 @@ def agent_brief(sub, cluster, batch_results_path, leader_dm_id_path, out_dir, ov
         parity_tier: "GREEN" | "YELLOW" | "RED",
         column_errors: <int>, verify_status: "clean" | "fail",
         charts_pass: <int>, charts_total: <int>,
+        phase6_assert_exit: <0|1|2|3>,        # MANDATORY — must be present
         screenshot_path: "<absolute path to sigma-render.png>" | null,
         duration_s: <float>, error_summary: <string|null> }
 
     PARITY TIER RULES
-    - GREEN: column_errors==0 AND verify=="clean" AND charts_pass==charts_total
-             AND screenshot_path != null AND you Read-back the Sigma PNG and
-             confirmed visual parity with the source dashboard PNG(s)
-    - YELLOW: workbook posted clean BUT charts_pass<charts_total OR visual
-              divergence noted in error_summary
+    - GREEN: column_errors==0 AND verify=="clean" AND charts_total > 0 AND
+             charts_pass==charts_total AND phase6_assert_exit==0 AND
+             screenshot_path != null AND you Read-back the Sigma PNG and
+             confirmed visual parity with the source dashboard PNG(s).
+             (charts_total==0 is NOT GREEN — that's the historic loophole;
+             assert-phase6-ran.rb already rejects it.)
+    - YELLOW: workbook posted clean BUT (charts_pass<charts_total OR
+              phase6_assert_exit != 0 OR visual divergence noted in
+              error_summary)
     - RED: any column_error OR verify=="fail" OR POST failure OR
            screenshot_path is null (couldn't render the Sigma workbook)
 

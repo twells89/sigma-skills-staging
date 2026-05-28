@@ -32,6 +32,7 @@ require 'uri'
 require 'optparse'
 require 'base64'
 require 'open3'
+require 'time'
 
 opts = { extract_mode: false, extract_tol: 0.30, renames: [], finalize: false }
 OptionParser.new do |p|
@@ -142,4 +143,29 @@ out, err, status = Open3.capture3(*verifier_args)
 puts out
 warn err unless err.empty?
 File.write(opts[:out], out)
+
+# Hard-gate sentinel — parity-final.json. assert-phase6-ran.rb checks this file
+# to confirm Phase 6 actually ran. Without this sentinel, a subagent can skip
+# Phase 6 entirely and still self-report GREEN (the historic loophole that
+# masked the cluster follower regression on 2026-05-22, see beads-sigma-4pm).
+summary_path = File.join(opts[:tab], 'parity-final.json')
+total = plan['charts'].size
+passed_chart_names = out.scan(/^PASS\s+\[[^\]]+\]\s+(.+)$/).flatten
+failed_chart_names = out.scan(/^DIVERGE\s+\[[^\]]+\]\s+(.+)$/).flatten
+summary = {
+  'workbook_id'  => plan.dig('charts', 0, 'workbook_id') ||
+                    (File.exist?(File.join(opts[:tab], 'wb-readback.json')) ?
+                       JSON.parse(File.read(File.join(opts[:tab], 'wb-readback.json')))['workbookId'] : nil),
+  'ran_at'       => Time.now.utc.iso8601,
+  'mode'         => opts[:extract_mode] ? 'extract' : 'strict',
+  'extract_tol'  => opts[:extract_mode] ? opts[:extract_tol] : nil,
+  'charts_total' => total,
+  'charts_pass'  => passed_chart_names.size,
+  'charts_fail'  => failed_chart_names.size,
+  'pass_names'   => passed_chart_names,
+  'fail_names'   => failed_chart_names,
+  'status'       => (status.success? && total > 0 && passed_chart_names.size == total) ? 'PASS' : 'FAIL'
+}
+File.write(summary_path, JSON.pretty_generate(summary))
+warn "wrote #{summary_path} (status=#{summary['status']} #{summary['charts_pass']}/#{summary['charts_total']})"
 exit(status.success? ? 0 : 2)
