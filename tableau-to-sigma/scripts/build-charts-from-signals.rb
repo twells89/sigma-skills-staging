@@ -79,7 +79,9 @@ SIGMA_KIND = {
   'combo'         => 'combo-chart',
   'map-region'    => 'region-map',
   'map-point'     => 'point-map',
-  'table-or-text' => 'table',
+  'pivot-table'   => 'pivot-table',
+  'table'         => 'table',
+  'table-or-text' => 'table',         # legacy parser output — kept for back-compat
   'automatic'     => 'bar-chart',     # fallback; agent verifies against PNG
   'other'         => 'bar-chart'
 }.freeze
@@ -474,6 +476,145 @@ def pick_tableau_format(formats, header)
   nil
 end
 
+# ---- Pivot-table emission --------------------------------------------------
+# Tableau crosstab worksheets (mark=Text or mark=Square with dims on both
+# Rows AND Cols shelves, OR the Measure Names crosstab pattern) translate to
+# a Sigma `pivot-table` element with `rowsBy` / `columnsBy` / `values` arrays,
+# NOT a plain `table`. Without this, parse-twb-layout's `pivot-table` chart_kind
+# would fall through to the default table builder and lose the pivot shape.
+#
+# Resolves shelf fields via the parser's columns_by_guid lookup + the master-
+# column regex map. Returns the element hash, or nil if shelf info is unusable
+# (caller falls back to the standard table/chart flow with a warning).
+SHELF_AGG_FOR_PREFIX = {
+  'sum' => 'Sum', 'avg' => 'Avg', 'min' => 'Min', 'max' => 'Max',
+  'median' => 'Median', 'count' => 'CountIf(IsNotNull(%s))',
+  'countd' => 'CountDistinct', 'cntd' => 'CountDistinct'
+}.freeze
+SHELF_TRUNC_FOR_PREFIX = {
+  'yr' => 'year', 'qr' => 'quarter', 'mn' => 'month',
+  'wk' => 'week', 'dy' => 'day', 'hr' => 'hour'
+}.freeze
+
+def resolve_shelf_field(field, meta, mmap)
+  guid = field['guid']
+  cap_for_field = nil
+  if guid
+    info = (meta['columns_by_guid'] || {})[guid]
+    cap_for_field = info && info['caption']
+  end
+  cap_for_field ||= field['raw'].to_s
+                                 .sub(/^\[[^\]]+\]\./, '')
+                                 .gsub(/^\[|\]$/, '')
+                                 .sub(/^[a-z]+:/i, '')
+                                 .sub(/:[a-z]+$/i, '')
+  m = map_column(cap_for_field, mmap)
+  m ||= { 'id' => "m-#{cap_for_field.downcase.gsub(/\W+/, '-')}", 'name' => cap_for_field }
+  [m, cap_for_field]
+end
+
+def build_pivot_element(z, meta, mmap, opts, warnings)
+  cap = z['caption']
+  el_id = "el-#{cap.downcase.gsub(/\W+/, '-')[0..40]}".sub(/-$/, '')
+  rows_shelf = z['rows_shelf'] || {}
+  cols_shelf = z['cols_shelf'] || {}
+
+  cols_array = []
+  rows_by    = []
+  cols_by    = []
+  values_arr = []
+  seen_ids   = {}
+
+  add_col = lambda do |field, target|
+    m, _cap = resolve_shelf_field(field, meta, mmap)
+    base = "p-#{el_id}-#{target}-#{(m['name'] || 'x').downcase.gsub(/\W+/, '-')}"
+    col_id = base
+    n = 1
+    while seen_ids[col_id]
+      col_id = "#{base}-#{n}"
+      n += 1
+    end
+    seen_ids[col_id] = true
+
+    deriv = field['derivation'].to_s.downcase
+    formula =
+      if field['role'] == 'measure'
+        agg = SHELF_AGG_FOR_PREFIX[deriv] || 'Sum'
+        if agg.include?('%s')
+          agg.sub('%s', "[Master/#{m['name']}]")
+        else
+          "#{agg}([Master/#{m['name']}])"
+        end
+      elsif field['role'] == 'dim' && SHELF_TRUNC_FOR_PREFIX[deriv]
+        %(DateTrunc("#{SHELF_TRUNC_FOR_PREFIX[deriv]}", [Master/#{m['name']}]))
+      else
+        "[Master/#{m['name']}]"
+      end
+
+    col_obj = { 'id' => col_id, 'name' => m['name'], 'formula' => formula }
+    if field['role'] == 'measure'
+      tab_fmt = pick_tableau_format(z['formats'], m['name'])
+      col_obj['format'] = tab_fmt if tab_fmt
+      col_obj['format'] ||= m['format'] if m['format'].is_a?(Hash)
+      col_obj['format'] ||= { 'kind' => 'number', 'formatString' => ',.0f' }
+    elsif SHELF_TRUNC_FOR_PREFIX[deriv]
+      col_obj['format'] = { 'kind' => 'datetime', 'formatString' => '%b %Y' }
+    end
+    cols_array << col_obj
+    case target
+    when :row   then rows_by    << { 'id' => col_id }
+    when :col   then cols_by    << { 'id' => col_id }
+    when :value then values_arr << col_id
+    end
+  end
+
+  (rows_shelf['fields'] || []).each do |f|
+    add_col.call(f, :row)   if f['role'] == 'dim'
+    add_col.call(f, :value) if f['role'] == 'measure'
+  end
+  (cols_shelf['fields'] || []).each do |f|
+    add_col.call(f, :col)   if f['role'] == 'dim'
+    add_col.call(f, :value) if f['role'] == 'measure'
+  end
+
+  # Measure-Names pattern: shelves carry the placeholder but the actual
+  # measures live in z['measures']. Materialize them here.
+  if values_arr.empty? && (z['measures'] || []).any?
+    z['measures'].each do |m|
+      add_col.call({
+        'role'       => 'measure',
+        'derivation' => (m['derivation'] || 'Sum').to_s.downcase,
+        'raw'        => m['column'],
+        'guid'       => guid_from_text(m['column'].to_s)
+      }, :value)
+    end
+  end
+
+  if values_arr.empty? || (rows_by.empty? && cols_by.empty?)
+    warnings << "'#{cap}' is flagged as a Tableau crosstab but shelves did not yield rows+cols+values — falling back to flat table"
+    return nil
+  end
+
+  {
+    'id'        => el_id,
+    'kind'      => 'pivot-table',
+    'name'      => cap,
+    'source'    => { 'kind' => 'table', 'elementId' => opts[:master_id] },
+    'columns'   => cols_array,
+    'values'    => values_arr,
+    'rowsBy'    => rows_by,
+    'columnsBy' => cols_by
+  }
+end
+
+# Minimal GUID-from-text helper for shelf measures whose `column` reads like
+# `[federated.X].[sum:GUID:qk]` or just `[GUID]`. Mirrors the parser helper.
+def guid_from_text(s)
+  return nil if s.nil? || s.empty?
+  m = s.match(/\[(?:[a-z\-]+:)?([0-9a-f\-]{36})(?::[a-z]+)?\]/i)
+  m && m[1]
+end
+
 # A workbook may have multiple dashboards; iterate all and concatenate elements.
 # Drop the chart_kind=automatic warnings to stderr so the caller can act on them.
 elements = []
@@ -484,6 +625,21 @@ layout.each do |dash|
     next unless z['kind'] == 'chart'
     cap = z['caption']
     next if cap.nil? || cap.empty?
+
+    # Pivot-table fast path: Tableau crosstabs (chart_kind=pivot-table from
+    # parse-twb-layout) emit a Sigma pivot-table element with rowsBy/columnsBy/
+    # values derived from shelf info — independent of the view CSV shape.
+    # Falls through to the CSV-driven flat-table path if shelves can't be
+    # resolved cleanly (logged via warnings).
+    if z['chart_kind'] == 'pivot-table'
+      pivot_el = build_pivot_element(z, meta, mmap, opts, warnings)
+      if pivot_el
+        elements << pivot_el
+        warnings << "'#{cap}' auto-emitted as Sigma pivot-table from Tableau crosstab (rows/cols shelves) — verify dim placement"
+        next
+      end
+      # else: fall through to flat-table flow
+    end
 
     view = view_by_name[cap]
     if view.nil?

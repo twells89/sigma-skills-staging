@@ -357,7 +357,8 @@ If `get-view-data` returns 401 for a view, retry that view solo (the contention 
 **Phase 1d checklist — confirm before moving on:**
 
 - [ ] Opened the dashboard PNG and listed every tile, including non-chart tiles (text, filter shelves, legends, image placeholders)
-- [ ] Decided the chart kind of each tile from the image, not just the CSV header (bar / line / pie / donut / kpi / map / table)
+- [ ] Decided the chart kind of each tile from the image, not just the CSV header (bar / line / pie / donut / kpi / map / **pivot-table** / table)
+- [ ] **For any text-mark / crosstab-looking tile, confirmed pivot vs flat:** Tableau dims on BOTH the Rows AND Cols shelves ⇒ Sigma `pivot-table` (with `rowsBy` / `columnsBy` / `values`). Dims on Rows only ⇒ Sigma `table`. `parse-twb-layout.rb` sets `is_crosstab: true` and `chart_kind: pivot-table` automatically when shelves carry dims on both sides — trust that signal over the visual `Square`/`Text` mark which is the same for both.
 - [ ] Noted every text element on the dashboard surface (page title, section headers, free-text annotations)
 - [ ] Noted every dashboard-level filter or parameter control (date range, list, segmented buttons)
 
@@ -374,7 +375,7 @@ Use the dashboard image to understand:
 ruby scripts/parse-twb-layout.rb /tmp/<name>/workbook-content.twb /tmp/<name>/dashboard-layout.json
 ```
 
-It emits a per-dashboard zone list with `caption`, `view_ref`, `x/y/w/h` in percent, **and `chart_kind` extracted from each worksheet's `<mark>` element** (`bar` / `line` / `pie` / `scatter` / `map-region` / `map-point` / `table-or-text` / `automatic` / `other`). This is more reliable than inferring chart type from the view CSV — the CSV headers can't distinguish bar-vs-pie or bar-vs-map. Map every zone in the output to a Sigma element using the tables in `refs/workbook-layout.md` (`Reading the .twb dashboard layout` section).
+It emits a per-dashboard zone list with `caption`, `view_ref`, `x/y/w/h` in percent, **and `chart_kind` extracted from each worksheet's `<mark>` element + Rows/Cols shelves** (`bar` / `line` / `pie` / `scatter` / `map-region` / `map-point` / `pivot-table` / `table` / `automatic` / `other`). For text-mark worksheets, the parser disambiguates `pivot-table` (dims on both shelves — Tableau crosstab) from flat `table` (dims on one shelf — detail list) via the `rows_shelf` / `cols_shelf` summary; `build-charts-from-signals.rb` honors this and emits `rowsBy` / `columnsBy` / `values` for crosstabs. This is more reliable than inferring chart type from the view CSV — the CSV headers can't distinguish bar-vs-pie or pivot-vs-flat-table. Map every zone in the output to a Sigma element using the tables in `refs/workbook-layout.md` (`Reading the .twb dashboard layout` section).
 
 > **Maps:** if `parse-twb-layout.rb` emits `chart_kind: map-region` or `chart_kind: map-point` for any zone, do NOT build a bar chart. Use Sigma's `region-map` / `point-map` element kinds. The Tableau geographic role (`semantic-role` on the column) translates to Sigma's `regionType` via the table in `refs/workbook-layout.md`. Sigma's region types are US-only except for `country` — non-US state/county/ZIP data falls back to a sorted bar chart or, if lat/long is available, a `point-map`.
 

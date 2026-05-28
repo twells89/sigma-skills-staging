@@ -107,7 +107,9 @@ to get a per-zone JSON. Each chart zone surfaces:
 |---|---|---|
 | `caption` | zone `name` attr | element name in the Sigma spec |
 | `x_pct` / `y_pct` / `w_pct` / `h_pct` | zone position | layout XML `gridColumn` / `gridRow` |
-| `chart_kind` | worksheet `<mark class="…">` | Sigma element `kind` (bar / line / pie / region-map / point-map / scatter / table-or-text / automatic) |
+| `chart_kind` | worksheet `<mark class="…">` + Rows/Cols shelves | Sigma element `kind` (bar / line / pie / region-map / point-map / scatter / **pivot-table** / **table** / automatic). Text/Square mark with dims on BOTH shelves ⇒ `pivot-table`; one shelf only ⇒ `table` |
+| `rows_shelf` / `cols_shelf` | worksheet `<rows>` / `<cols>` | Structured shelf summary: `{ fields: [...], dim_count, measure_count, has_measure_names }`. Drives the pivot-table vs flat-table decision. `fields[].role` ∈ `dim` / `measure` / `measure-names`; `fields[].guid` resolves to a column caption via `columns_by_guid` in `<dashboard-layout-meta>.json` |
+| `is_crosstab` | derived | Convenience boolean — true when `chart_kind` came out as `pivot-table` |
 | `sort` | worksheet `<sort>` element | bar/line `xAxis.sort` — **only set the Sigma sort when this is non-null**; if Tableau has no explicit sort, leave the xAxis unsorted so Sigma uses natural order (alphabetical / chronological) |
 | `filters` | worksheet `<filter>` elements | Phase 2.5 candidates. Note: `[Action (Foo)]` filters are dashboard cross-filter actions, not value filters — usually skip these |
 | `aggregations` | `<column-instance derivation="…">` per column | the agent's truth source for measure aggregation. `Sum` is default for measures; `Avg` / `Min` / `Max` / `Median` / `CountD` are explicit overrides → use the matching Sigma aggregator. `Month-Trunc` / `Year-Trunc` / `Day-Trunc` → wrap the column with `DateTrunc("month", …)` etc. in the chart formula |
@@ -140,13 +142,16 @@ This is more reliable than inferring chart type from the view CSV.
 | `area` | `Area` | `area-chart` |
 | `pie` | `Pie` | `pie-chart` |
 | `scatter` | `Circle` / `Shape` | `scatter-chart` |
-| `table-or-text` | `Square` / `Text` | `pivot-table` (heatmap-style) or `table` |
+| `pivot-table` | `Square` / `Text` **with dims on BOTH Rows AND Cols shelves** (or Measure-Names crosstab) | `pivot-table` (emit `rowsBy` / `columnsBy` / `values`) |
+| `table` | `Square` / `Text` with dims on ONE shelf only (flat detail list) | `table` |
 | `map-region` | `Multipolygon` / `Polygon` / `Filled` / `Map` / has `<geometry>` | `region-map` |
 | `map-point` | (has `Latitude` + `Longitude` columns) | `point-map` |
 | `automatic` | `Automatic` | **Verify visually** — Tableau picks the default for the encodings; usually bar but not deterministic |
 | `other` | unknown / unhandled | Open the dashboard PNG and decide manually |
 
 > **`automatic` is not a Sigma kind.** When the parser emits `chart_kind: automatic`, fetch the dashboard view image, look at the tile, and pick the right Sigma kind. Tableau's "Automatic" mark adapts to whatever the worksheet's encodings imply — there's no deterministic mapping.
+
+> **Pivot tables vs flat tables — don't downgrade a crosstab.** A Tableau crosstab (mark `Text` or `Square` with dimensions on BOTH Rows AND Cols shelves) MUST become a Sigma `pivot-table`, not a `table`. The parser decides via `dim_count` on each shelf: ≥1 real dim on both ⇒ `chart_kind: pivot-table`. The Measure-Names pattern (one dim shelf + Measure Names placeholder on the other + ≥2 measures on the worksheet) also resolves to `pivot-table`. A flat Text-mark detail list (dims on Rows only, nothing on Cols) stays as `chart_kind: table`. If you see a Tableau crosstab landing in Sigma as a plain table, the regression is upstream — inspect `rows_shelf` / `cols_shelf` on the zone JSON; the `is_crosstab` flag is the canonical signal.
 
 ### Percent (Tableau .twb) → Sigma 24-col grid
 

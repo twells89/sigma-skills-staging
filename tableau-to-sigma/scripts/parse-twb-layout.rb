@@ -140,11 +140,84 @@ def normalize_filter(f)
   out
 end
 
+# ---- Rows/Cols shelf parsing (pivot-table detection) ----------------------
+# Tableau worksheets carry their shelf state inside <table>:
+#   <rows>[federated.X].[REGION] / [federated.X].[CATEGORY]</rows>
+#   <cols>[federated.X].[yr:ORDER_DATE:ok] / [federated.X].[sum:SALES:qk]</cols>
+# Each field is separated by ` / `. The bracketed spec carries a prefix that
+# tells us role:
+#   `[FIELDNAME]` (no prefix)                 → dim
+#   `[none:GUID:nk]` / `[none:GUID:qk]`       → dim (Tableau's "no aggregation")
+#   `[yr|qr|mn|wk|dy|hr|mi|sc:GUID:ok]`       → date-trunc dim
+#   `[mdy|md|qd|ymd|y|q|m|d|w|h|s:...]`       → date-part dim
+#   `[sum|avg|min|max|count|countd|cntd|median|stdev|stdevp|var|varp|attr|usr:...]`
+#                                              → measure
+#   `[Measure Names]` literal                  → placeholder, skip
+#
+# Detection rule for pivot-table:
+#   - mark in {Text, Square} (necessary)
+#   - rows AND cols each carry ≥1 real dim                       → pivot-table
+#   - OR one shelf has a real dim + the other has Measure Names
+#     plus the worksheet has ≥2 measures                          → pivot-table
+#   - Otherwise (one shelf empty, or both empty)                  → table
+MEASURE_PREFIXES = %w[sum avg min max count countd cntd median stdev stdevp var varp attr usr].freeze
+DATE_TRUNC_PREFIXES = %w[yr qr mn wk dy hr mi sc mdy md qd ymd y q m d w h s].freeze
+
+# Classify a single shelf-field bracketed spec like "none:GUID:qk" or "sum:GUID:qk"
+# or "REGION" (no prefix). Returns [:dim | :measure | :measure_names, derivation_or_nil].
+def classify_shelf_field(field_str)
+  return [:skip, nil] if field_str.nil? || field_str.strip.empty?
+  fs = field_str.strip
+  # Bare "[Measure Names]" or ".[Measure Names]" → placeholder
+  return [:measure_names, nil] if fs =~ /\bMeasure\s*Names\b/i
+  # Extract the inner spec — the last `[...]` segment
+  spec = fs[/\[([^\[\]]*)\]\s*$/, 1] || fs
+  # Aggregation/trunc prefix form: "prefix:GUID:type"
+  if (m = spec.match(/^([a-z]+):.*?:[a-z]+$/i))
+    pref = m[1].downcase
+    return [:measure, pref] if MEASURE_PREFIXES.include?(pref)
+    return [:dim, pref]     if DATE_TRUNC_PREFIXES.include?(pref)
+    return [:dim, pref]     if pref == 'none'
+    return [:dim, pref]     # unknown prefix → conservative dim
+  end
+  # No prefix → dim (e.g. "[REGION]")
+  [:dim, nil]
+end
+
+# Parse a `<rows>` or `<cols>` shelf string into a structured summary.
+def parse_shelf(shelf_str)
+  out = { 'raw' => shelf_str, 'fields' => [], 'dim_count' => 0,
+          'measure_count' => 0, 'has_measure_names' => false }
+  return out if shelf_str.nil? || shelf_str.strip.empty?
+  shelf_str.split('/').each do |f|
+    raw_field = f.strip
+    next if raw_field.empty?
+    role, deriv = classify_shelf_field(raw_field)
+    case role
+    when :dim
+      out['dim_count'] += 1
+      out['fields'] << { 'raw' => raw_field, 'role' => 'dim', 'derivation' => deriv,
+                         'guid' => guid_from_param(raw_field) }
+    when :measure
+      out['measure_count'] += 1
+      out['fields'] << { 'raw' => raw_field, 'role' => 'measure', 'derivation' => deriv,
+                         'guid' => guid_from_param(raw_field) }
+    when :measure_names
+      out['has_measure_names'] = true
+      out['fields'] << { 'raw' => raw_field, 'role' => 'measure-names' }
+    end
+  end
+  out
+end
+
 # Build a lookup of worksheet name → metadata extracted from <worksheet> elements.
 # - mark_class: the <mark class="..."> value (Bar / Line / Pie / Filled / Circle / etc.)
 # - geo_role:   the first geographic semantic-role we find on any column (e.g. "geo:state")
 # - has_lat / has_long: heuristic for point-map detection (column names contain
 #   "latitude" / "longitude")
+# - rows_shelf / cols_shelf: structured summary of dims/measures on each shelf
+# - is_crosstab: convenience flag — true when the worksheet is a Tableau crosstab
+#   (Text/Square mark + dims on both shelves, or Measure Names crosstab)
 worksheets = {}
 xml.elements.each('//worksheet') do |ws|
   name = ws.attributes['name']
@@ -363,6 +436,26 @@ xml.elements.each('//worksheet') do |ws|
     end
   end
 
+  # Rows/Cols shelf parsing for pivot-table detection. Tableau emits these as
+  # sibling elements under <table> in the worksheet. We pick the first match
+  # (worksheets rarely have multiples).
+  rows_node  = ws.elements['.//table/rows'] || ws.elements['.//rows']
+  cols_node  = ws.elements['.//table/cols'] || ws.elements['.//cols']
+  rows_shelf = parse_shelf(rows_node&.text)
+  cols_shelf = parse_shelf(cols_node&.text)
+
+  # Crosstab signal: requires Text/Square mark AND either
+  #   (a) ≥1 real dim on BOTH shelves, or
+  #   (b) one shelf has a real dim + the other carries Measure Names
+  #       (with ≥2 measures on the worksheet)
+  is_text_mark = %w[text square].include?(mark_class.to_s.downcase)
+  both_have_dims = rows_shelf['dim_count'] >= 1 && cols_shelf['dim_count'] >= 1
+  measure_names_crosstab =
+    (rows_shelf['has_measure_names'] || cols_shelf['has_measure_names']) &&
+    (rows_shelf['dim_count'] + cols_shelf['dim_count']) >= 1 &&
+    (rows_shelf['measure_count'] + cols_shelf['measure_count'] + measures.size) >= 2
+  is_crosstab = is_text_mark && (both_have_dims || measure_names_crosstab)
+
   worksheets[name] = {
     mark_class:       mark_class,
     geo_role:         geo_role,
@@ -379,7 +472,10 @@ xml.elements.each('//worksheet') do |ws|
     measures:         measures.uniq { |m| m['column'] },
     ref_marks:        ref_marks,
     axis_formats:     axis_formats,
-    mark_labels_show: mark_labels_show
+    mark_labels_show: mark_labels_show,
+    rows_shelf:       rows_shelf,
+    cols_shelf:       cols_shelf,
+    is_crosstab:      is_crosstab
   }
 end
 
@@ -444,8 +540,14 @@ end
 
 # Translate Tableau mark class + geo signals into a Sigma-relevant chart-kind label.
 # Returns one of:
-#   bar | line | area | pie | scatter | map-region | map-point | table-or-text |
-#   automatic | other
+#   bar | line | area | pie | scatter | map-region | map-point |
+#   pivot-table | table | automatic | other
+#
+# Pivot vs table detection (mark in {Text, Square}):
+#   - Dims on BOTH rows AND cols shelves → "pivot-table" (Tableau crosstab)
+#   - Measure-Names crosstab pattern     → "pivot-table"
+#   - Otherwise                           → "table" (flat detail list)
+# The `is_crosstab` flag set during worksheet parsing carries this decision.
 #
 # Notes:
 #   - "Automatic" is Tableau's default-pick-for-the-encodings. It usually renders
@@ -476,8 +578,8 @@ def chart_kind_for(meta)
   when 'area'       then 'area'
   when 'pie'        then 'pie'
   when 'circle'     then 'scatter'                # symbol marks (non-geo) = scatter
-  when 'square'     then 'table-or-text'          # often heatmap-style table or text table
-  when 'text'       then 'table-or-text'
+  when 'square'     then (meta[:is_crosstab] ? 'pivot-table' : 'table')
+  when 'text'       then (meta[:is_crosstab] ? 'pivot-table' : 'table')
   when 'shape'      then 'scatter'
   when 'automatic'  then 'automatic'              # Tableau's default-pick — verify against PNG
   when ''           then 'other'
@@ -550,6 +652,9 @@ xml.elements.each('//dashboard') do |d|
       'ref_marks'    => (kind == 'chart' ? ws_meta&.dig(:ref_marks)     : nil),
       'axis_formats' => (kind == 'chart' ? ws_meta&.dig(:axis_formats)  : nil),
       'mark_labels_show' => (kind == 'chart' ? ws_meta&.dig(:mark_labels_show) : nil),
+      'rows_shelf'   => (kind == 'chart' ? ws_meta&.dig(:rows_shelf)    : nil),
+      'cols_shelf'   => (kind == 'chart' ? ws_meta&.dig(:cols_shelf)    : nil),
+      'is_crosstab'  => (kind == 'chart' ? ws_meta&.dig(:is_crosstab)   : nil),
       # Resolved filter target (filter/parameter zones only)
       'filter_column_caption'  => (kind == 'filter' || kind == 'parameter' ? filter_col_caption  : nil),
       'filter_column_datatype' => (kind == 'filter' || kind == 'parameter' ? filter_col_datatype : nil)
@@ -594,6 +699,9 @@ if dashboards.empty? && !worksheets.empty?
         'ref_marks'    => ws_meta[:ref_marks],
         'axis_formats' => ws_meta[:axis_formats],
         'mark_labels_show' => ws_meta[:mark_labels_show],
+        'rows_shelf'   => ws_meta[:rows_shelf],
+        'cols_shelf'   => ws_meta[:cols_shelf],
+        'is_crosstab'  => ws_meta[:is_crosstab],
         'filter_column_caption'  => nil,
         'filter_column_datatype' => nil
       }]
