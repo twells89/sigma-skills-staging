@@ -68,14 +68,24 @@ if to_delete.empty?
 end
 
 base = ENV['SIGMA_BASE_URL'] or (warn 'SIGMA_BASE_URL not set'; exit 2)
-tok  = ENV['SIGMA_API_TOKEN'] or (warn 'SIGMA_API_TOKEN not set'; exit 2)
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
 
 def http_delete(base, tok, path)
-  uri = URI("#{base}#{path}")
-  req = Net::HTTP::Delete.new(uri)
-  req['Authorization'] = "Bearer #{tok}"
-  req['Accept']        = 'application/json'
-  Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+  attempts = 0
+  loop do
+    attempts += 1
+    uri = URI("#{base}#{path}")
+    req = Net::HTTP::Delete.new(uri)
+    req['Authorization'] = "Bearer #{Sigma.auth_token}"
+    req['Accept']        = 'application/json'
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+    if res.code.to_i == 401 && attempts == 1 && ENV['SIGMA_CLIENT_ID']
+      Sigma.refresh_token!
+      next
+    end
+    return res
+  end
 end
 
 puts "Keeping:  #{keep_id}"
@@ -99,7 +109,7 @@ end
 deleted = []
 failed  = []
 to_delete.each do |id|
-  r = http_delete(base, tok, "/v2/files/#{id}")
+  r = http_delete(base, nil, "/v2/files/#{id}")
   code = r.code.to_i
   if code.between?(200, 299) || code == 404
     # 404 = already gone; treat as success for idempotency

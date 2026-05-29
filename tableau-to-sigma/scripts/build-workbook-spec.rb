@@ -77,19 +77,10 @@ master_columns =
     cfg['columns'] || abort('master-cols YAML missing `columns:` key')
   else
     # Auto: pull the DM element's column DDL via REST (limited fields — name only)
-    base = ENV.fetch('SIGMA_BASE_URL')
-    tok = ENV['SIGMA_API_TOKEN'] || (
-      cid = ENV.fetch('SIGMA_CLIENT_ID'); cs = ENV.fetch('SIGMA_CLIENT_SECRET')
-      uri = URI("#{base}/v2/auth/token")
-      req = Net::HTTP::Post.new(uri)
-      req['Authorization'] = "Basic #{Base64.strict_encode64("#{cid}:#{cs}")}"
-      req['Content-Type']  = 'application/x-www-form-urlencoded'
-      req.body = 'grant_type=client_credentials'
-      JSON.parse(Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }).fetch('access_token')
-    )
-    uri = URI("#{base}/v2/dataModels/#{dm_id}/spec")
-    req = Net::HTTP::Get.new(uri); req['Authorization'] = "Bearer #{tok}"; req['Accept'] = 'application/json'
-    spec = JSON.parse(Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }.body)
+    # Sigma.request handles initial token fetch + 401-retry-with-refresh.
+    $LOAD_PATH.unshift File.expand_path('lib', __dir__)
+    require 'sigma_rest'
+    spec = Sigma.request(:get, "/v2/dataModels/#{dm_id}/spec")
     el = spec['pages'].flat_map { |p| p['elements'] }.find { |e| e['id'] == dm_el_id }
     abort("DM element #{dm_el_id} not found in spec") unless el
     (el['columns'] || []).map do |c|

@@ -16,14 +16,14 @@ INODES  = ARGV
 abort 'no inodeIds given' if INODES.empty?
 
 BASE = ENV.fetch('SIGMA_BASE_URL')
-TOK  = ENV.fetch('SIGMA_API_TOKEN') { abort 'set SIGMA_API_TOKEN' }
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
 FileUtils.mkdir_p(OUT_DIR)
 
+# Fans out to N inodes in parallel; Sigma.request handles 401-refresh
+# (single-flight mutex so threads don't all refresh at once).
 def get(path)
-  uri = URI("#{BASE}#{path}")
-  req = Net::HTTP::Get.new(uri)
-  req['Authorization'] = "Bearer #{TOK}"
-  Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }.body
+  Sigma.request(:get, path, accept: '*/*')
 end
 
 threads = INODES.map do |inode|

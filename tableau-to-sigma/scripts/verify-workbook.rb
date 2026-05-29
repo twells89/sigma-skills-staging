@@ -22,16 +22,28 @@ require 'json'
 
 WB_ID = ARGV[0] or abort("Usage: #{$PROGRAM_NAME} <workbook-id>\n")
 BASE  = ENV['SIGMA_BASE_URL']  or (warn 'SIGMA_BASE_URL not set'; exit 2)
-TOK   = ENV['SIGMA_API_TOKEN'] or (warn 'SIGMA_API_TOKEN not set'; exit 2)
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
 
 ERROR_MARKERS = /Unknown column "[^"]+"|Circular column reference to \[[^\]]+\]/
 
+# Wrap with automatic 401-retry-after-refresh — tokens last ~1h, parity runs
+# can outlive that on big workbooks.
 def http_get(path)
-  uri = URI("#{BASE}#{path}")
-  req = Net::HTTP::Get.new(uri)
-  req['Authorization'] = "Bearer #{TOK}"
-  req['Accept']        = 'application/json'
-  Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+  attempts = 0
+  loop do
+    attempts += 1
+    uri = URI("#{BASE}#{path}")
+    req = Net::HTTP::Get.new(uri)
+    req['Authorization'] = "Bearer #{Sigma.auth_token}"
+    req['Accept']        = 'application/json'
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+    if res.code.to_i == 401 && attempts == 1 && ENV['SIGMA_CLIENT_ID']
+      Sigma.refresh_token!
+      next
+    end
+    return res
+  end
 end
 
 # 1. List elements (one call, fast)

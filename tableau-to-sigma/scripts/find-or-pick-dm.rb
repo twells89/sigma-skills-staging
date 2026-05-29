@@ -58,14 +58,26 @@ end.parse!
 %i[sig out].each { |k| abort "missing --#{k}" unless opts[k] }
 
 BASE = ENV.fetch('SIGMA_BASE_URL')
-TOK  = ENV.fetch('SIGMA_API_TOKEN')
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
 
+# DM-shortlisting scans many candidates and is called per-follower in cluster
+# orchestration — auto-refresh on 401 to survive long batch runs.
 def http_get(path)
-  uri = URI("#{BASE}#{path}")
-  req = Net::HTTP::Get.new(uri)
-  req['Authorization'] = "Bearer #{TOK}"
-  req['Accept'] = 'application/json'
-  Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+  attempts = 0
+  loop do
+    attempts += 1
+    uri = URI("#{BASE}#{path}")
+    req = Net::HTTP::Get.new(uri)
+    req['Authorization'] = "Bearer #{Sigma.auth_token}"
+    req['Accept'] = 'application/json'
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 30) { |h| h.request(req) }
+    if res.code.to_i == 401 && attempts == 1 && ENV['SIGMA_CLIENT_ID']
+      Sigma.refresh_token!
+      next
+    end
+    return res
+  end
 end
 
 sig = JSON.parse(File.read(opts[:sig]))

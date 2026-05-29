@@ -55,22 +55,14 @@ else
 end
 
 BASE = ENV.fetch('SIGMA_BASE_URL')
-TOK  = ENV['SIGMA_API_TOKEN'] || (
-  cid = ENV.fetch('SIGMA_CLIENT_ID'); cs = ENV.fetch('SIGMA_CLIENT_SECRET')
-  uri = URI("#{BASE}/v2/auth/token")
-  req = Net::HTTP::Post.new(uri)
-  req['Authorization'] = "Basic #{Base64.strict_encode64("#{cid}:#{cs}")}"
-  req['Content-Type']  = 'application/x-www-form-urlencoded'
-  req.body = 'grant_type=client_credentials'
-  JSON.parse(Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }.body).fetch('access_token')
-)
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
 
+# Sigma.request handles initial token fetch + 401-retry-with-refresh
+# transparently. Phase 6 is the longest pass in the pipeline; tokens
+# routinely expire mid-run on big workbooks.
 def http_json(path)
-  uri = URI("#{BASE}#{path}")
-  req = Net::HTTP::Get.new(uri)
-  req['Authorization'] = "Bearer #{TOK}"
-  req['Accept'] = 'application/json'
-  JSON.parse(Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }.body)
+  Sigma.request(:get, path)
 end
 
 plan_path = File.join(opts[:tab], 'parity-plan.json')

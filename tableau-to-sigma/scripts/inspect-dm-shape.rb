@@ -48,17 +48,17 @@ end.parse!
 %i[dm_id out].each { |k| abort "missing --#{k.to_s.tr('_','-')}" unless opts[k] }
 
 BASE = ENV.fetch('SIGMA_BASE_URL')
-TOK  = ENV.fetch('SIGMA_API_TOKEN')
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
 
-uri = URI("#{BASE}/v2/dataModels/#{opts[:dm_id]}/spec")
-req = Net::HTTP::Get.new(uri); req['Authorization'] = "Bearer #{TOK}"; req['Accept'] = 'application/json'
-res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }
-abort "GET spec failed: #{res.code}" unless res.code.to_i == 200
+# Sigma.request auto-refreshes on 401, useful when called repeatedly across a
+# cluster of conversions where the token may expire between follower runs.
 spec = begin
-  JSON.parse(res.body)
-rescue JSON::ParserError
-  YAML.safe_load(res.body, permitted_classes: [Date, Time])
+  Sigma.request(:get, "/v2/dataModels/#{opts[:dm_id]}/spec")
+rescue Sigma::Error => e
+  abort "GET spec failed: #{e.message}"
 end
+spec = YAML.safe_load(spec, permitted_classes: [Date, Time]) if spec.is_a?(String)
 
 elements = (spec['pages'] || []).flat_map { |p| p['elements'] || [] }
 abort 'no elements on DM' if elements.empty?

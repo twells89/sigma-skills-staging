@@ -25,22 +25,38 @@ opts[:workdir] ||= File.dirname(File.expand_path(opts[:spec]))
 require 'fileutils'
 FileUtils.mkdir_p(opts[:workdir])
 
+$LOAD_PATH.unshift File.expand_path('lib', __dir__)
+require 'sigma_rest'
+
 BASE = ENV.fetch('SIGMA_BASE_URL')
-TOK  = ENV.fetch('SIGMA_API_TOKEN')
 
 POST_PATH = opts[:type] == 'datamodel' ? '/v2/dataModels/spec'              : '/v2/workbooks/spec'
 GET_PATH  = opts[:type] == 'datamodel' ? '/v2/dataModels/%s/spec'           : '/v2/workbooks/%s/spec'
 ID_FIELD  = opts[:type] == 'datamodel' ? 'dataModelId'                      : 'workbookId'
 
+# Wraps a single Sigma REST call with automatic 401-retry-after-refresh
+# (tokens last ~1 hour; long conversions outlive a single token). Returns
+# the raw Net::HTTPResponse so existing .body / .is_a?(Net::HTTPSuccess)
+# checks below keep working unchanged.
 def http(method, path, body = nil, accept_json: false)
-  uri = URI("#{BASE}#{path}")
-  req = case method
-        when :post then r = Net::HTTP::Post.new(uri); r.body = body; r['Content-Type'] = 'application/json'; r
-        when :get  then Net::HTTP::Get.new(uri)
-        end
-  req['Authorization'] = "Bearer #{TOK}"
-  req['Accept']        = 'application/json' if accept_json
-  Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }
+  attempts = 0
+  loop do
+    attempts += 1
+    uri = URI("#{BASE}#{path}")
+    req = case method
+          when :post then r = Net::HTTP::Post.new(uri); r.body = body; r['Content-Type'] = 'application/json'; r
+          when :get  then Net::HTTP::Get.new(uri)
+          end
+    req['Authorization'] = "Bearer #{Sigma.auth_token}"
+    req['Accept']        = 'application/json' if accept_json
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, read_timeout: 120) { |h| h.request(req) }
+    if res.code.to_i == 401 && attempts == 1 && ENV['SIGMA_CLIENT_ID']
+      warn '  [auth] Sigma token expired mid-run, refreshing and retrying...'
+      Sigma.refresh_token!
+      next
+    end
+    return res
+  end
 end
 
 # Orphan-prevention pre-check: workbook POSTs are create-only. If this is a
