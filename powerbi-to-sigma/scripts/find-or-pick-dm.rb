@@ -1,0 +1,1 @@
+../../tableau-to-sigma/scripts/find-or-pick-dm.rb

@@ -1,0 +1,1 @@
+../../tableau-to-sigma/scripts/assert-phase6-ran.rb

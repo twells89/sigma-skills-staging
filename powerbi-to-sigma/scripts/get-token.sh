@@ -1,0 +1,1 @@
+../../tableau-to-sigma/scripts/get-token.sh

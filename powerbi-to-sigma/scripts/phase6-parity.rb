@@ -1,0 +1,1 @@
+../../tableau-to-sigma/scripts/phase6-parity.rb
