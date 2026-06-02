@@ -52,6 +52,26 @@ VISUAL_KIND = {
     "map": "bar", "filledMap": "bar", "shapeMap": "bar", "azureMap": "bar",
 }
 
+# PBI bar families: *Bar* visuals render HORIZONTALLY; *Column* visuals render
+# vertically (Sigma's default). Sigma's bar-chart `orientation` field accepts
+# ONLY "horizontal" — vertical is expressed by omitting the field; sending
+# "vertical" is rejected (invalid_request). Verified via /v2/workbooks/{id}/spec
+# PUT round-trip 2026-06-02.
+HBAR_TYPES = {"barChart", "clusteredBarChart", "stackedBarChart",
+              "hundredPercentStackedBarChart"}
+
+# Stacking: PBI clustered -> Sigma "none" (side-by-side), stacked -> "stacked",
+# 100% -> "100". IMPORTANT: emit "none" explicitly — a multi-series Sigma bar
+# defaults to STACKED, so a clustered PBI chart comes out stacked otherwise.
+STACKED_TYPES = {"stackedBarChart", "stackedColumnChart",
+                 "hundredPercentStackedBarChart", "hundredPercentStackedColumnChart"}
+PCT_STACKED_TYPES = {"hundredPercentStackedBarChart", "hundredPercentStackedColumnChart"}
+
+def _stacking(vtype):
+    if vtype in PCT_STACKED_TYPES: return "100"
+    if vtype in STACKED_TYPES: return "stacked"
+    return "none"
+
 
 def _fetch_pbir(ws, report, out_dir):
     """Download a report's PBIR parts into out_dir via Fabric getDefinition."""
@@ -173,6 +193,8 @@ def extract(pbir_dir):
                 "visual_type": vtype,
                 "title": _visual_title(visual),
                 "sigma_kind": VISUAL_KIND.get(vtype, "bar"),
+                "orientation": "horizontal" if vtype in HBAR_TYPES else None,
+                "stacking": _stacking(vtype) if VISUAL_KIND.get(vtype) == "bar" else None,
                 "x": pos.get("x", 0), "y": pos.get("y", 0),
                 "w": pos.get("width", 0), "h": pos.get("height", 0),
                 "z": pos.get("z", 0),

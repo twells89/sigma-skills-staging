@@ -49,6 +49,37 @@ color split. Don't keep a 2-series chart just to get a per-year reset.
 
 ---
 
+## 1b. DM metrics are NOT referenceable as `[Master/Metric]` in a workbook column formula (`beads-sigma-2tf`)
+
+> Sigma platform limitation, not a converter bug. Confirmed on the KitchenSink
+> migration (2026-05-31).
+
+A data-model **metric** (e.g. `Absence Hours Per Head`) flows through to a
+workbook master and shows up in the master's AVAILABLE METRICS (`describe`) and
+in the Sigma UI measure picker — **but it cannot be referenced in a workbook
+column formula** via `[MasterName/Metric Name]`. `POST/PUT /v2/workbooks/spec`
+rejects it with `400 dependency not found: formula reference master/<metric>`.
+(The mcp-v2 `metric('<id>', t)` call also fails to resolve when the metric
+depends on a constant-key `m:m` relationship — "Could not resolve metric
+column".)
+
+**What to do instead (both validated unattended):**
+- **Inline the aggregate formula** in the workbook column. The KitchenSink build
+  re-expresses each DM measure as an inline column formula on the chart element
+  (`Sum([ABS/Hours])`, `CumulativeSum(Sum([ABS/Hours]))`,
+  `Rank(Sum([EMP/Annual Salary]), "desc")`, `PercentOfTotal(Sum([ABS/Hours]),
+  "grand_total")`, …) — this is what `build-workbook-from-pbir.rb` + the
+  `master-map.json` `agg`/`agg_args`/`?`-placeholder do. **0 error columns.**
+- **Or add the measure in the UI** (drag the DM metric into the chart's value
+  shelf) for the genuinely cross-element aggregates that can't be inlined
+  (see §2 — the constant-key denominator case).
+
+Practical rule for the builder: never emit a workbook column whose formula is a
+bare `[Master/<DM metric name>]`. Always emit the *body* (an aggregate over a
+master *column* ref), or surface the metric via the UI / `metric()`.
+
+---
+
 ## 2. The cross-element-ref-returns-NULL trap (and workarounds)
 
 When a DM/workbook measure references a column reached through a relationship,
@@ -190,6 +221,7 @@ grouping above Month**.
 | `DIVIDE([Total], CALCULATE([Total], ALL(T)))` | `PercentOfTotal(Sum([T/A]), "grand_total")` | grouped/pivot/viz only |
 | `SUMX(T, T[Q]*T[P])` | `Sum([T/Q]*[T/P])` | aggregates take row expressions; `AVERAGEX`→`Avg`, `MAXX`→`Max` |
 | `RELATED(C[City])` | `[C/City]` (if related) else `Lookup([C/City],[T/Key],[C/Key])` | `Lookup` = `RELATED`/`LOOKUPVALUE` |
+| `WEEKNUM([Date], 2)` (Mon-start) | `Floor((DateDiff("day", DateTrunc("year",[Date]), [Date]) + Mod(Weekday(DateTrunc("year",[Date])) + 5, 7)) / 7) + 1` | Excel-style week-of-year. **Do NOT use `DatePart("week")`** — it's ISO and DIVERGES at year boundaries (WEEKNUM('2021-01-01',2)=1 but ISO=53; '2019-12-30'=53 but ISO=1). `return_type 1`/default (Sun-start) uses the `+6` offset. Verified EXACT vs PBI on 9 boundary dates. |
 
 ## 6. Translations needing a date-grouped consumer
 
@@ -200,12 +232,109 @@ grouping above Month**.
 | `DATEADD('Date'[Date], -30, DAY)` | `DateLookback(Sum([T/A]), [Day of Date], 30, "day")` | same shape as prior-period |
 | `TOTALYTD` | grouped `CumulativeSum`, §4 | nested Year▸Month grouping + single-series plot |
 
-## 7. No clean Sigma equivalent — flag for design decision
+## 7. The "hard" DAX is migratable via a child element — `dax-restructure-patterns.rb`
+
+The patterns once parked as (c) ("no Sigma path") are actually (b): they need a
+new **data-model element** (custom-SQL or a child grouped table), not a formula
+rewrite. `scripts/dax-restructure-patterns.rb` is a reusable library of pure
+generators (DAX shape in → postable Sigma DM element out) + a `classify(dax)`
+shape detector so this runs unattended. Validated end-to-end against the Comp &
+Distribution model (DM `8c342d40`, all parity-exact vs PBI `executeQueries`).
+
+| DAX pattern | Generator | Sigma element it emits | Verified |
+|---|---|---|---|
+| `CONCATENATEX(VALUES(T[g]), T[txt], sep, …)` | `concatenatex_listagg` | `sql`: `LISTAGG(DISTINCT txt, sep) WITHIN GROUP (ORDER BY …) GROUP BY g` (+ a `COUNT(DISTINCT)` companion) | role lists + per-dept counts 10/8/8/10/11/8 match PBI |
+| `CALCULATE(<agg on B>, TREATAS(VALUES(A[k]), B[k]))` | `treatas_virtual_rel` | `sql`: explicit `B JOIN A ON B.k=A.k … GROUP BY A[grp]` — materializes the virtual relationship as a real join | absence-by-dept 8666/4569.2/… exact |
+| disconnected `GENERATESERIES` bands + "% in band" | `banded_grouping` | `sql`: range-join fact into a `VALUES` band spine, `COUNT(*)` per band (feed `PercentOfTotal` in the viz) | 183/120/32/6 per band, sums to pop |
+| `COUNTROWS(FILTER(T, T[p]=EARLIER(T[p]) && T[m]>EARLIER(T[m])))+1` | `earlier_rank_column` | calc column `RankDense([m],"desc",[p])` | max rank 82 matches |
+| `SUMX(TOPN(n, VALUES(T[g]), [m], DESC), [m])` | `topn_sumx` | `sql`: `SELECT g, <agg> AS t … GROUP BY g QUALIFY ROW_NUMBER() OVER (ORDER BY <agg> DESC) <= n` — keeps the top-n groups; sum them via `GrandTotal(Sum([t]))` in the viz | "Top 5 Role Salary" — same 5 ROLEs in same rank order as PBI (Software Engineer▸VP Sales▸Sales Manager▸Forklift Operator▸Solutions Consultant); residual delta = live-vs-cached snapshot drift (365 vs 363 rows), not logic |
+| `ADDCOLUMNS(CALENDAR(DATE(a),DATE(b)), "Year",YEAR([Date]), …)` | converter (calc-table branch) | `sql` date-spine element: Snowflake `GENERATOR(ROWCOUNT=>N)` + `DATEADD('day',SEQ4(),start)`, derived cols → `EXTRACT(YEAR/MONTH/DAY/QUARTER)` / `TO_CHAR(d,'Mon')` | DimDate = **3287 rows, 2018-01-01..2026-12-31**, derived Year/MonthNo/Month exact vs PBI |
+
+### The TREATAS trap that actually mattered (verify, don't assume)
+`Absence Hours (High Earners)` *looked* like a sophisticated P90-threshold
+TREATAS filter. Probing PBI (`COUNTROWS(HighEarners)` = **363** = full
+population) proved the authored DAX is **degenerate**: the `[P90 Salary]` measure
+inside `FILTER(ALL(EMPLOYEES), SALARY >= [P90 Salary])` context-transitions so the
+predicate is true for every employee — the measure just returns
+`Total Absence Hours`. **The faithful migration is therefore a plain
+absence-by-dept sum, and that's a feature of doing real parity, not a shortcut.**
+Lesson: when a TREATAS/context measure resists 2–3 SQL interpretations, query the
+PBI *intermediate* (`COUNTROWS` of the filtered set, the threshold value) to learn
+what the measure actually computes before building the Sigma element.
+
+### Function-name corrections (Sigma ≠ DAX-ish guesses)
+`PERCENTILEX.INC`→`PercentileCont` (NOT `PercentileInc`); `STDEVX.P`→
+`Sqrt(VariancePop(x))` (there is no `StdDevP`); `VARX.P`→`VariancePop` (NOT
+`VarianceP`); `MID/SEARCH` email-domain → `SplitPart([Email],"@",2)`;
+`COMBINEVALUES(sep,a,b)`→`[a] & sep & [b]`. All of `Median`, `PercentileCont`,
+`VariancePop`, `Exp/Avg/Ln`, `CountIf(Contains(...))`, `RankDense(...,partition)`
+are valid in DM metrics AND workbook chart formulas.
+
+## 8. No clean Sigma equivalent — flag for design decision
 
 - **`USERELATIONSHIP`** (per-evaluation join swap): Sigma joins are static. Build
   a parallel relationship element (e.g. a ShipDate-based join) and aggregate
   against it — doubles model surface. The converter should refuse and emit a
-  "needs data-model design decision" message rather than guess.
+  "needs data-model design decision" message rather than guess. (This is the one
+  genuine (c); everything in §7 is (b) and has a generator.)
+
+## 9. Time-intelligence → a grouped/leveled DM element (or workbook element)
+
+`SAMEPERIODLASTYEAR`, `DATEADD`, `TOTALYTD`, and hand-rolled prior-period
+idioms (`VAR cy=SELECTEDVALUE(Date[Year]) RETURN CALCULATE(SUM(..),ALL(Date[Year]),Date[Year]=cy-1)`)
+are **translatable** — as calc columns on a **grouped element grouped on a date
+column**. This works at the **data-model layer** (a derived `table` element with
+`groupings`) — NOT only in the workbook — so the converter can emit it right
+where the PBI measure lived. (Verified 2026-06-02: DateLookback + CumulativeSum
+calc columns on grouped DM elements posted clean and queried exact vs PBI. This
+is the leveled-table case; contrast `feedback_sigma_window_functions`, which is
+about window fns on FLAT/ungrouped calc cols.) What is NOT possible is a *scalar*
+DM metric — these need the date grouping, which is why `convert_powerbi_to_sigma`
+flags them today.
+
+**Prior period** (`SAMEPERIODLASTYEAR` / `DATEADD` / the SELECTEDVALUE+CALCULATE+ALL
+prior-year pattern) → **`DateLookback(value, date, amount, period)`**:
+```
+# in a table/chart grouped by a date column:
+Year           = DateTrunc("year", [Master/Full Date])      # groupBy (DATE, not the int year!)
+Net Revenue    = Sum([Master/Net Revenue])                  # aggregate
+Net Revenue PY = DateLookback([Net Revenue], [Year], 1, "year")   # references the sibling agg + date
+YoY %          = ([Net Revenue] - [Net Revenue PY]) / [Net Revenue PY]
+```
+groupings: `[{groupBy:[Year], calculations:[Net Revenue, Net Revenue PY, YoY %]}]`.
+Constraints (Sigma docs): the `date` arg must be a **date** column (DateTrunc), the
+`value` must be **unique within the date grouping** (move extra dims to other
+groupings), and `period` ∈ year/quarter/month/week/day/hour/minute/second.
+**Validated 2026-06-02**: this reproduced PBI's YoY on the Retail-Trends migration
+to the cent (2025 +5.38%, 2026 −26.92%; PY null for the first year). The
+`DateLookback` calc was applied to live workbook `01b3487c` and queried back.
+
+**YTD** (`TOTALYTD`) → **`CumulativeSum(Sum([..]))`** in a table with **two
+grouping LEVELS** — Year as a *separate outer* level, Month inner:
+`groupings:[{groupBy:[Year]}, {groupBy:[Month], calculations:[Net, YTD]}]`.
+The cumulative resets per outer (Year) level ONLY when Year is its own level;
+putting `groupBy:[Year,Month]` in ONE level does **not** reset (it ran straight
+through 2024→2025 in testing: Jan-2025 YTD came back as the 2024 total + Jan
+instead of just Jan). Verified the two-level form resets correctly (Dec-2025
+YTD = the 2025 total). See `dax-to-sigma-coverage.md` #3.
+
+> Converter note: today `convert_powerbi_to_sigma` drops these and warns. It should
+> instead recognize the prior-year/YTD idioms and emit a "build a date-grouped
+> element with DateLookback/CumulativeSum" instruction (bead filed). Until then,
+> the agent adds them as workbook calc columns per the recipe above.
+
+## 10. Bar vs Column orientation (chart fidelity)
+
+PBI **`barChart`/`clusteredBarChart`/`stackedBarChart`** render **horizontal**;
+**`columnChart`/`clusteredColumnChart`** render **vertical**. Both map to Sigma
+`bar-chart`; set **`orientation: "horizontal"`** on the element for the *Bar*
+family and **omit** it for the *Column* family. Sigma's `orientation` accepts
+**only `"horizontal"`** — vertical is the default (field absent); sending
+`"vertical"` is rejected `invalid_request`. The xAxis(category)/yAxis(value)
+binding stays the same either way — the flag just flips rendering. Sigma may
+*default* a single-series bar to horizontal, so emit it explicitly to match the
+source. (`extract-pbir.py` HBAR_TYPES + `build-workbook-from-pbir.rb` handle this;
+verified via `/v2/workbooks/{id}/spec` PUT round-trip 2026-06-02.)
 
 ---
 

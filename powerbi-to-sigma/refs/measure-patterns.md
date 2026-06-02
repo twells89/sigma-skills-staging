@@ -278,6 +278,64 @@ are valid in DM metrics AND workbook chart formulas.
   "needs data-model design decision" message rather than guess. (This is the one
   genuine (c); everything in §7 is (b) and has a generator.)
 
+## 9. Time-intelligence → a grouped/leveled DM element (or workbook element)
+
+`SAMEPERIODLASTYEAR`, `DATEADD`, `TOTALYTD`, and hand-rolled prior-period
+idioms (`VAR cy=SELECTEDVALUE(Date[Year]) RETURN CALCULATE(SUM(..),ALL(Date[Year]),Date[Year]=cy-1)`)
+are **translatable** — as calc columns on a **grouped element grouped on a date
+column**. This works at the **data-model layer** (a derived `table` element with
+`groupings`) — NOT only in the workbook — so the converter can emit it right
+where the PBI measure lived. (Verified 2026-06-02: DateLookback + CumulativeSum
+calc columns on grouped DM elements posted clean and queried exact vs PBI. This
+is the leveled-table case; contrast `feedback_sigma_window_functions`, which is
+about window fns on FLAT/ungrouped calc cols.) What is NOT possible is a *scalar*
+DM metric — these need the date grouping, which is why `convert_powerbi_to_sigma`
+flags them today.
+
+**Prior period** (`SAMEPERIODLASTYEAR` / `DATEADD` / the SELECTEDVALUE+CALCULATE+ALL
+prior-year pattern) → **`DateLookback(value, date, amount, period)`**:
+```
+# in a table/chart grouped by a date column:
+Year           = DateTrunc("year", [Master/Full Date])      # groupBy (DATE, not the int year!)
+Net Revenue    = Sum([Master/Net Revenue])                  # aggregate
+Net Revenue PY = DateLookback([Net Revenue], [Year], 1, "year")   # references the sibling agg + date
+YoY %          = ([Net Revenue] - [Net Revenue PY]) / [Net Revenue PY]
+```
+groupings: `[{groupBy:[Year], calculations:[Net Revenue, Net Revenue PY, YoY %]}]`.
+Constraints (Sigma docs): the `date` arg must be a **date** column (DateTrunc), the
+`value` must be **unique within the date grouping** (move extra dims to other
+groupings), and `period` ∈ year/quarter/month/week/day/hour/minute/second.
+**Validated 2026-06-02**: this reproduced PBI's YoY on the Retail-Trends migration
+to the cent (2025 +5.38%, 2026 −26.92%; PY null for the first year). The
+`DateLookback` calc was applied to live workbook `01b3487c` and queried back.
+
+**YTD** (`TOTALYTD`) → **`CumulativeSum(Sum([..]))`** in a table with **two
+grouping LEVELS** — Year as a *separate outer* level, Month inner:
+`groupings:[{groupBy:[Year]}, {groupBy:[Month], calculations:[Net, YTD]}]`.
+The cumulative resets per outer (Year) level ONLY when Year is its own level;
+putting `groupBy:[Year,Month]` in ONE level does **not** reset (it ran straight
+through 2024→2025 in testing: Jan-2025 YTD came back as the 2024 total + Jan
+instead of just Jan). Verified the two-level form resets correctly (Dec-2025
+YTD = the 2025 total). See `dax-to-sigma-coverage.md` #3.
+
+> Converter note: today `convert_powerbi_to_sigma` drops these and warns. It should
+> instead recognize the prior-year/YTD idioms and emit a "build a date-grouped
+> element with DateLookback/CumulativeSum" instruction (bead filed). Until then,
+> the agent adds them as workbook calc columns per the recipe above.
+
+## 10. Bar vs Column orientation (chart fidelity)
+
+PBI **`barChart`/`clusteredBarChart`/`stackedBarChart`** render **horizontal**;
+**`columnChart`/`clusteredColumnChart`** render **vertical**. Both map to Sigma
+`bar-chart`; set **`orientation: "horizontal"`** on the element for the *Bar*
+family and **omit** it for the *Column* family. Sigma's `orientation` accepts
+**only `"horizontal"`** — vertical is the default (field absent); sending
+`"vertical"` is rejected `invalid_request`. The xAxis(category)/yAxis(value)
+binding stays the same either way — the flag just flips rendering. Sigma may
+*default* a single-series bar to horizontal, so emit it explicitly to match the
+source. (`extract-pbir.py` HBAR_TYPES + `build-workbook-from-pbir.rb` handle this;
+verified via `/v2/workbooks/{id}/spec` PUT round-trip 2026-06-02.)
+
 ---
 
 ## Cross-links

@@ -141,6 +141,40 @@ def _scan_bim_measures(bim_path)
   out
 end
 
+# Infer time-intelligence restructure args from the DM spec + measure DAX:
+#   parent  = the denormalized "* View" join element (has fact + dim cols),
+#   date_ref= a date column on it (prefers "Full Date", else a non-key *Date* col),
+#   value   = the DAX inner aggregation (SUM/AVG/...) mapped to the View's column.
+# Returns nil if it can't infer (caller falls back to --restructure-map args).
+def _infer_timeintel(dm, dax)
+  els = (dm['pages']&.first&.dig('elements')) || []
+  parent = els.find { |e| e['name'].to_s =~ /View$/ } ||
+           els.find { |e| (e['metrics'] || []).any? } || els.first
+  return nil unless parent
+  # Converter View cols have only {id, formula} (no name pre-POST); derive the
+  # display name Sigma will assign: [A/Col]->"Col"; [A/DIM/Col]->"Col (DIM)".
+  disp = lambda do |formula|
+    p = formula.to_s.gsub(/^\[|\]$/, '').split('/')
+    p.size <= 2 ? p[-1] : "#{p[-1]} (#{p[-2]})"
+  end
+  last = ->(formula) { formula.to_s.gsub(/^\[|\]$/, '').split('/')[-1] }
+  cols = parent['columns'] || []
+  datec = cols.find { |c| disp.call(c['formula']) =~ /full date/i } ||
+          cols.find { |c| last.call(c['formula']) =~ /date/i && last.call(c['formula']) !~ /key/i }
+  m = dax.match(/\b(SUM|AVERAGE|AVG|MIN|MAX|COUNT|DISTINCTCOUNT)\s*\(\s*'?[^'\[]+'?\[([^\]]+)\]/i)
+  return nil unless datec && m
+  agg = { 'SUM' => 'Sum', 'AVERAGE' => 'Avg', 'AVG' => 'Avg', 'MIN' => 'Min',
+          'MAX' => 'Max', 'COUNT' => 'Count', 'DISTINCTCOUNT' => 'CountDistinct' }[m[1].upcase]
+  col = m[2]
+  vc = cols.find { |c| last.call(c['formula']).to_s.casecmp(col).zero? }
+  return nil unless vc
+  pn = parent['name']
+  { 'parent_id' => parent['id'], 'parent' => pn,
+    'date_ref' => "[#{pn}/#{disp.call(datec['formula'])}]",
+    'value_formula' => "#{agg}([#{pn}/#{disp.call(vc['formula'])}])",
+    'value_name' => disp.call(vc['formula']) }
+end
+
 rmap = opts[:rmap] && File.exist?(opts[:rmap]) ? JSON.parse(File.read(opts[:rmap])) : {}
 conn = opts[:conn] || (dm['pages']&.first&.dig('elements')&.first&.dig('source','connectionId'))
 emitted = []
@@ -152,6 +186,12 @@ if opts[:rbim] || opts[:rmap]
     ov = rmap[name] || {}
     shape = (ov['generator'] && ov['generator'].to_sym) || DaxRestructure.classify(dax)
     args = ov['args'] || {}
+    # Auto-infer time-intel args (parent View + date column + value agg) from the
+    # DM spec + DAX so no manual --restructure-map is needed. Explicit map wins.
+    if %i[time_prior_period time_ytd].include?(shape) && !(args['date_ref'] && args['value_formula'])
+      inf = _infer_timeintel(dm, dax)
+      args = inf.merge(args) if inf
+    end
     begin
       case shape
       when :concatenatex_listagg
@@ -179,6 +219,32 @@ if opts[:rbim] || opts[:rmap]
           name: name, conn: args['conn'] || conn,
           db: args['db'] || opts[:db] || 'CSA', schema: args['schema'] || opts[:schema] || 'TJ',
           table: args['table'], value_col: args['value_col'], bands: args['bands'])
+        emitted << [name, el]
+      when :time_prior_period
+        # prior-period (SAMEPERIODLASTYEAR/DATEADD/hand-rolled prior-year) -> grouped
+        # DateLookback element. Needs the parent (denormalized fact/view) + the date
+        # and value column refs — supplied via --restructure-map (can't infer reliably).
+        pid = args['parent_id'] || begin
+          pel = (dm['pages']&.first&.dig('elements') || []).find { |e| e['name'] == args['parent'] }
+          pel && pel['id']
+        end
+        next unless pid && args['date_ref'] && args['value_formula']
+        el = DaxRestructure.prior_period_element(
+          name: name, parent_id: pid, date_ref: args['date_ref'],
+          value_formula: args['value_formula'], value_name: args['value_name'] || name,
+          amount: args['amount'] || 1, period: args['period'] || 'year',
+          with_yoy: args.fetch('with_yoy', true))
+        emitted << [name, el]
+      when :time_ytd
+        pid = args['parent_id'] || begin
+          pel = (dm['pages']&.first&.dig('elements') || []).find { |e| e['name'] == args['parent'] }
+          pel && pel['id']
+        end
+        next unless pid && args['date_ref'] && args['value_formula']
+        el = DaxRestructure.ytd_element(
+          name: name, parent_id: pid, date_ref: args['date_ref'],
+          value_formula: args['value_formula'], value_name: args['value_name'] || name,
+          outer: args['outer'] || 'year', inner: args['inner'] || 'month')
         emitted << [name, el]
       when :earlier_rank
         # COUNTROWS(FILTER(T, T[p]=EARLIER(T[p]) && T[m]>EARLIER(T[m])))+1 -> RankDense

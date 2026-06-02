@@ -36,6 +36,21 @@ The corporate tenant blocks Entra app creation, Git integration, and XMLA (PPU).
 - DAX measures → Sigma metrics. ~70% mechanical; see `~/sigma-skills-staging/research/dax-to-sigma-coverage.md` and `fixtures/MANIFEST.md` (test oracle: 94 DAX expressions bucketed a/b/c).
 - **Known gap `j89`**: the Snowflake `Snowflake.Databases(...) + Navigation` M pattern isn't parsed → pass `database`/`schema` explicitly until fixed.
 
+## Phase 3.5 — Reuse an existing DM? (avoid sprawl — mirrors tableau Phase 1.5)
+Before posting a NEW data model, check whether an existing Sigma DM already
+covers the same warehouse tables (don't add a 4th near-identical "Orders" DM):
+```
+python3 scripts/pbi-dm-signature.py --bim /tmp/pbix/model.bim --out $WORK/dm-signature.json
+ruby scripts/find-or-pick-dm.rb --workbook-signature $WORK/dm-signature.json \
+  --out $WORK/dm-match.json --auto-pick     # exit 0 = candidate ≥ min-score
+```
+`pbi-dm-signature.py` derives `{warehouse_tables (DB.SCHEMA.TABLE from the M
+nav), referenced_columns, measures}` from the model.bim. If a candidate scores
+high AND there's no tie, `--auto-pick` recommends reuse (sets `auto_picked:true`
+— WARN about inherited columns/RLS/metrics); on a tie it falls back to ASK. To
+reuse: skip Phase 4, point the workbook masters at the matched `recommended_dm_id`
++ its element ids (describe it), and continue at Phase 5. Otherwise post new.
+
 ## Phase 4 — Post the data model
 The converter output (`sigmaDataModel`) needs 3 fixups before `POST /v2/dataModels/spec` (gap `tkd`):
 1. **`schemaVersion: 1`** at top level (else `schemaVersion: Invalid 1: undefined`).

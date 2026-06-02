@@ -214,6 +214,14 @@ def build_element(rec, fields, masters)
     end
     el['xAxis'] = { 'columnId' => dcid }
     el['yAxis'] = { 'columnIds' => ycids }
+    # PBI *Bar* visuals are horizontal; *Column* visuals vertical. Sigma keeps the
+    # same xAxis(category)/yAxis(value) binding and flips rendering via this flag.
+    # Only "horizontal" is a valid value — vertical = omit (Sigma default).
+    el['orientation'] = 'horizontal' if kind == 'bar-chart' && rec['orientation'] == 'horizontal'
+    # Stacking fidelity: emit explicitly so a multi-series clustered PBI chart does
+    # NOT inherit Sigma's stacked default. PBI clustered->"none", stacked->"stacked",
+    # 100%-stacked->"100".
+    el['stacking'] = rec['stacking'] if kind == 'bar-chart' && rec['stacking']
     # c07: default to single series. Only split by color when PBI bound a
     # Series/Legend role. Never auto-color a line by a dimension that PBI did
     # not legend (see refs/measure-patterns.md §1 + §4).

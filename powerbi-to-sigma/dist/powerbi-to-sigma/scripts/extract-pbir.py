@@ -52,6 +52,26 @@ VISUAL_KIND = {
     "map": "bar", "filledMap": "bar", "shapeMap": "bar", "azureMap": "bar",
 }
 
+# PBI bar families: *Bar* visuals render HORIZONTALLY; *Column* visuals render
+# vertically (Sigma's default). Sigma's bar-chart `orientation` field accepts
+# ONLY "horizontal" — vertical is expressed by omitting the field; sending
+# "vertical" is rejected (invalid_request). Verified via /v2/workbooks/{id}/spec
+# PUT round-trip 2026-06-02.
+HBAR_TYPES = {"barChart", "clusteredBarChart", "stackedBarChart",
+              "hundredPercentStackedBarChart"}
+
+# Stacking: PBI clustered -> Sigma "none" (side-by-side), stacked -> "stacked",
+# 100% -> "100". IMPORTANT: emit "none" explicitly — a multi-series Sigma bar
+# defaults to STACKED, so a clustered PBI chart comes out stacked otherwise.
+STACKED_TYPES = {"stackedBarChart", "stackedColumnChart",
+                 "hundredPercentStackedBarChart", "hundredPercentStackedColumnChart"}
+PCT_STACKED_TYPES = {"hundredPercentStackedBarChart", "hundredPercentStackedColumnChart"}
+
+def _stacking(vtype):
+    if vtype in PCT_STACKED_TYPES: return "100"
+    if vtype in STACKED_TYPES: return "stacked"
+    return "none"
+
 
 def _fetch_pbir(ws, report, out_dir):
     """Download a report's PBIR parts into out_dir via Fabric getDefinition."""
@@ -118,6 +138,26 @@ def _textbox_body(visual):
     return None
 
 
+def _visual_title(visual):
+    """The PBI visual's title text (objects.title[].properties.text.expr.Literal.Value).
+    Returns None when the title is hidden/unset so callers can fall back."""
+    for item in visual.get("objects", {}).get("title", []):
+        props = item.get("properties", {})
+        # respect an explicit show:false
+        show = props.get("show", {}).get("expr", {}).get("Literal", {}).get("Value")
+        t = props.get("text", {}).get("expr", {}).get("Literal", {}).get("Value")
+        if t and show != "false":
+            return t.strip("'")
+    return None
+
+
+def _proj_format(proj):
+    """Best-effort numeric format carried on a projection (PBIR rarely inlines it,
+    but newer exports may). Returns a Sigma-ish format hint string or None."""
+    fmt = proj.get("format") or proj.get("formatString")
+    return fmt if isinstance(fmt, str) and fmt else None
+
+
 def extract(pbir_dir):
     defn = os.path.join(pbir_dir, "definition")
     if not os.path.isdir(defn):
@@ -139,15 +179,28 @@ def extract(pbir_dir):
             visual = v.get("visual", {})
             vtype = visual.get("visualType", "unknown")
             qs = visual.get("query", {}).get("queryState", {})
+            # per-field numeric format (queryRef -> format string), when PBIR inlines it
+            formats = {}
+            for _role, _blk in (qs or {}).items():
+                for _p in _blk.get("projections", []):
+                    if isinstance(_p, dict):
+                        _qr = _p.get("queryRef") or _p.get("nativeQueryRef")
+                        _f = _proj_format(_p)
+                        if _qr and _f:
+                            formats[_qr] = _f
             rec = {
                 "visual_id": v.get("name", vid),
                 "visual_type": vtype,
+                "title": _visual_title(visual),
                 "sigma_kind": VISUAL_KIND.get(vtype, "bar"),
+                "orientation": "horizontal" if vtype in HBAR_TYPES else None,
+                "stacking": _stacking(vtype) if VISUAL_KIND.get(vtype) == "bar" else None,
                 "x": pos.get("x", 0), "y": pos.get("y", 0),
                 "w": pos.get("width", 0), "h": pos.get("height", 0),
                 "z": pos.get("z", 0),
                 "parent_group": v.get("parentGroupName"),
                 "bindings": _role_bindings(qs),
+                "formats": formats,
             }
             if rec["sigma_kind"] == "text":
                 rec["text"] = _textbox_body(visual)
