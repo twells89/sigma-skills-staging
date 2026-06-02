@@ -88,6 +88,7 @@ python3 scripts/build-bookmark-workbooks.py --signals $WORK/signals.json \
 - spotlight → keep ONLY the spotlighted visuals (focus); else all-minus-hidden. The all-visible bookmark = the base workbook.
 - **Filter-state bookmarks** (`filters_raw:true`): the `explorationState` filter JSON isn't auto-applied — bake those values as element `filters` / control defaults per the agent's judgment.
 - Validated 2026-06-02 on Retail Trends: Overview(8)/KPIs-Only(3)/Trend-Spotlight(1) → 3 workbooks, screenshot-verified.
+- `build-bookmark-workbooks.py` is **shared** (lives in `tableau-to-sigma/scripts`, symlinked here) and **vendor-neutral**: `--build-script` selects the signals→workbook builder; a normalized state's `filters: {col:[vals]}` is baked as a `list` filter (`{columnId, kind:list, mode:include, values}`) onto the Data-page **master** so every chart inherits it (page-filter semantics — verified end-to-end). Tableau's analog (Custom Views) feeds the same builder via `tableau-to-sigma/scripts/extract-custom-views.py` — note: Tableau REST exposes custom-view *metadata* only, not filter *values* (opaque state), so Tableau filter recovery needs the view-data-diff technique.
 
 ## Reverse direction — author INTO Power BI
 The Fabric API is symmetric: `POST .../semanticModels` (TMSL parts) + `POST .../reports` (PBIR) create live items. Same device-code token (`user_impersonation` covers writes). Needs a Fabric-capacity workspace. See `scripts/fabric-auth-check.py` for the write-capability/capacity check.
