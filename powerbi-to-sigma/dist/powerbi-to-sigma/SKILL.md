@@ -74,6 +74,21 @@ Map each visual's `x,y,w,h` → 24-col grid (`COL_UNIT = page_w/24`, `ROW_UNIT �
 - `sigma-mcp-v2 query` each element → confirm real rows (not blank).
 - True parity: PBI `POST /v1.0/myorg/groups/{ws}/datasets/{id}/executeQueries` (DAX) vs the same Sigma aggregation. DAX-only; breaks under service-principal if RLS.
 
+## Phase 7 — Bookmarks → per-bookmark workbooks (optional)
+PBI bookmarks that **show/hide** or **spotlight** visuals map to Sigma as a
+workbook over the bookmark's *visible subset*:
+```
+python3 scripts/extract-bookmarks.py --pbir-dir /tmp/pbir --out $WORK/bookmarks.json   # or --report-json (classic)
+python3 scripts/build-bookmark-workbooks.py --signals $WORK/signals.json \
+  --bookmarks $WORK/bookmarks.json --master-map $WORK/master-map.json \
+  --data-model <dmId> --folder-id <uuid> --name-prefix "<Report>" --out-dir $WORK/bm
+# then POST each $WORK/bm/<name>/workbook-spec.json + put-layout
+```
+- `extract-bookmarks.py` normalizes each bookmark → `{hidden[], spotlight[], filters_raw}` (reads `definition/bookmarks/*.bookmark.json` shape: `explorationState.sections.<p>.visualContainers.<v>.singleVisual.display.mode` = hidden|spotlight|maximize).
+- spotlight → keep ONLY the spotlighted visuals (focus); else all-minus-hidden. The all-visible bookmark = the base workbook.
+- **Filter-state bookmarks** (`filters_raw:true`): the `explorationState` filter JSON isn't auto-applied — bake those values as element `filters` / control defaults per the agent's judgment.
+- Validated 2026-06-02 on Retail Trends: Overview(8)/KPIs-Only(3)/Trend-Spotlight(1) → 3 workbooks, screenshot-verified.
+
 ## Reverse direction — author INTO Power BI
 The Fabric API is symmetric: `POST .../semanticModels` (TMSL parts) + `POST .../reports` (PBIR) create live items. Same device-code token (`user_impersonation` covers writes). Needs a Fabric-capacity workspace. See `scripts/fabric-auth-check.py` for the write-capability/capacity check.
 
