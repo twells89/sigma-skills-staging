@@ -745,7 +745,6 @@ the chart editor after publish.
 
 | Property | Set via spec? | How to apply post-publish |
 |---|---|---|
-| Bar chart orientation (horizontal vs vertical) | No | Chart editor → Properties → Chart type → Horizontal icon |
 | Trellis (small multiples / panel charts) on any chart kind | No | Chart editor → Trellis panel → drag dimension to Trellis row / column / by-series |
 | Axis label rotation (0°, 45°, 90°) | No | Chart editor → Format → X-axis → Label rotation |
 | Series color | No (not yet) | Chart editor → Properties → Color |
@@ -753,7 +752,26 @@ the chart editor after publish.
 | Font size / axis title | No | Chart editor → Format tab |
 | Text element alignment (center / right) | No | Element editor → Format → Alignment. Confirmed UI-only: spec GET returns only `id`/`kind`/`body` even after centering in the UI. Markdown `# Heading` in `body` always renders left-aligned. |
 
-**`"orientation": "horizontal"` is silently accepted but ignored.** Do not include it — it does nothing.
+### Bar chart orientation — IS spec-settable (verified 2026-06-07, retraction)
+
+**`orientation: "horizontal"` on a `bar-chart` element works** — it persists round-trip
+through PUT/GET and renders the bars horizontally. Verified 2026-06-07 against workbook
+`bb317245` on `tj-wells-1989` (6 charts flipped to horizontal via spec, confirmed in the
+PNG export). The earlier "silently accepted but ignored / UI-only" claim was wrong.
+
+- **Horizontal:** set `"orientation": "horizontal"` on the element.
+- **Vertical:** omit the field (vertical is the Sigma default — there is no `"vertical"` value to set).
+
+A Tableau bar is horizontal when the continuous measure is on the **Columns** shelf (x-axis)
+and the discrete dimension on **Rows** (y-axis). `parse-twb-layout.rb` emits this as
+`zone.bar_orientation` (`"horizontal"` / `"vertical"` / nil), and
+`build-charts-from-signals.rb` emits `orientation: "horizontal"` automatically for horizontal
+bar charts. When hand-writing a spec, set it yourself to match the source orientation.
+
+```json
+{ "kind": "bar-chart", "orientation": "horizontal",
+  "xAxis": {"columnId": "dim"}, "yAxis": {"columnIds": ["meas"]} }
+```
 
 **Series `color` on `yAxis` entries is silently accepted but not persisted.** PUT succeeds without error but GET strips the field. Expected shape for when this is wired up:
 ```json

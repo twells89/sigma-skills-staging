@@ -466,7 +466,21 @@ xml.elements.each('//worksheet') do |ws|
   is_kpi = is_text_mark && !is_crosstab &&
            total_dim_count == 0 && total_measure_count >= 1
 
+  # Bar orientation: a Tableau bar is HORIZONTAL when the continuous measure sits
+  # on the Columns shelf (x-axis) and the discrete dimension on Rows (y-axis);
+  # VERTICAL when the measure is on Rows. Sigma's `orientation: "horizontal"` spec
+  # field reproduces this (verified 2026-06-07 — persists round-trip AND renders;
+  # the old "UI-only" guidance was wrong). Only meaningful for bar marks; nil
+  # otherwise so build-charts only emits it for bar-charts.
+  bar_orientation =
+    if rows_shelf['dim_count'] >= 1 && cols_shelf['measure_count'] >= 1 && cols_shelf['dim_count'] == 0
+      'horizontal'
+    elsif cols_shelf['dim_count'] >= 1 && rows_shelf['measure_count'] >= 1
+      'vertical'
+    end
+
   worksheets[name] = {
+    bar_orientation:  bar_orientation,
     mark_class:       mark_class,
     geo_role:         geo_role,
     has_lat:          has_lat,
@@ -663,6 +677,7 @@ xml.elements.each('//dashboard') do |d|
       'ref_marks'    => (kind == 'chart' ? ws_meta&.dig(:ref_marks)     : nil),
       'axis_formats' => (kind == 'chart' ? ws_meta&.dig(:axis_formats)  : nil),
       'mark_labels_show' => (kind == 'chart' ? ws_meta&.dig(:mark_labels_show) : nil),
+      'bar_orientation' => (kind == 'chart' ? ws_meta&.dig(:bar_orientation) : nil),
       'rows_shelf'   => (kind == 'chart' ? ws_meta&.dig(:rows_shelf)    : nil),
       'cols_shelf'   => (kind == 'chart' ? ws_meta&.dig(:cols_shelf)    : nil),
       'is_crosstab'  => (kind == 'chart' ? ws_meta&.dig(:is_crosstab)   : nil),
@@ -711,6 +726,7 @@ if dashboards.empty? && !worksheets.empty?
         'ref_marks'    => ws_meta[:ref_marks],
         'axis_formats' => ws_meta[:axis_formats],
         'mark_labels_show' => ws_meta[:mark_labels_show],
+        'bar_orientation' => ws_meta[:bar_orientation],
         'rows_shelf'   => ws_meta[:rows_shelf],
         'cols_shelf'   => ws_meta[:cols_shelf],
         'is_crosstab'  => ws_meta[:is_crosstab],
