@@ -111,6 +111,12 @@ def apply_fmt(col, queryref, fields, vfmts)
 end
 
 def measure_formula(fs)
+  # bead qb2i: an explicit `formula` wins — lets the master-map emit a verbatim
+  # Sigma expression the agg/`?` encodings can't express, e.g. window functions
+  # in a grouped calc: "Lag(Sum([INC/Incident Id]), 1)", "Rank(Sum([X/v]), \"desc\")",
+  # or a percent-of-total "Sum([X/v]) / GrandTotal(Sum([X/v]))". Used for the
+  # PBI OFFSET/RANK/%-of-total idioms that previously fell back to a wrong stub.
+  return fs['formula'] if fs['formula'].is_a?(String) && !fs['formula'].empty?
   agg = fs['agg']
   return fs['ref'] if agg.nil? || (agg.respond_to?(:empty?) && agg.empty?)
   # Multi-arg aggregator support (bead 14w c): PercentileCont(col, 0.9), etc.
@@ -169,6 +175,18 @@ def build_element(rec, fields, masters)
 
   master = visual_master(rec, fields)
   master_id = master && masters[master] ? masters[master]['id'] : nil
+  # bead 8vzj: a Sigma element sources exactly ONE master, so a table/visual whose
+  # bound fields resolve to >1 master would silently drop every field not on the
+  # first master. Detect + warn loudly so the agent provides a single JOINED
+  # master (or a per-field override) instead of shipping a half-empty element.
+  if master
+    others = rec['bindings'].values.flatten.map { |qr| (fields[qr] || {})['master'] }.compact.uniq - [master]
+    unless others.empty?
+      warn "[build-workbook] WARN visual '#{(rec['title'] || rec['visual_id'])}' binds fields across " \
+           "multiple masters (#{([master] + others).join(', ')}); a Sigma element sources only '#{master}'. " \
+           "Fields on #{others.join(', ')} will be DROPPED — point them at a single joined master element."
+    end
+  end
   el = { 'id' => eid, 'kind' => kind, 'name' => name }
   el['source'] = { 'elementId' => master_id, 'kind' => 'table' } if master_id
   cols = []
@@ -176,28 +194,60 @@ def build_element(rec, fields, masters)
 
   case kind
   when 'control'
-    # bead 14w(a): a PBI slicer -> a Sigma control (list/value filter), NOT a
-    # bar chart. The control's targets/source are wired in the workbook UI or a
-    # follow-up; here we emit a faithful list control bound to the sliced column.
+    # bead 14w(a)/6z5: a PBI slicer -> a Sigma `list` control bound to the sliced
+    # column on its master element. Valid shape (controls.md): controlType:list +
+    # controlId + mode + selectionMode + values[] + source{kind:source,...} +
+    # filters[]. The control defines NO columns of its own — it references the
+    # master's existing column id, so it both populates from and filters that col.
     qr = (b['Values'] || b['Category'] || b['Fields'] || []).first
-    fs = field_spec(qr, fields)
-    cid = "#{eid}-ctl"
-    cols << { 'id' => cid, 'formula' => fs['ref'], 'name' => (qr || 'Filter').split('.').last }
+    colname = (qr || 'Filter').split('.').last
+    mcols = (master && masters[master] ? (masters[master]['columns'] || []) : [])
+    mcol = mcols.find { |c| c['name'] == colname } || mcols.first
+    tgt = mcol ? mcol['id'] : nil
     el['kind'] = 'control'
-    el['controlType'] = 'list-values'
-    el['columnId'] = cid
-    el.delete('source') # controls bind to a column, not a chart source
-    el['source'] = { 'elementId' => master_id, 'kind' => 'table' } if master_id
+    el['controlId'] = colname.gsub(/[^A-Za-z0-9]/, '') + 'Filter'
+    el['name'] = colname
+    el['controlType'] = 'list'
+    el['mode'] = 'include'
+    el['selectionMode'] = 'multiple'
+    el['values'] = []
+    el.delete('source')
+    if master_id && tgt
+      el['source']  = { 'kind' => 'source', 'source' => { 'kind' => 'table', 'elementId' => master_id }, 'columnId' => tgt }
+      el['filters'] = [{ 'source' => { 'kind' => 'table', 'elementId' => master_id }, 'columnId' => tgt }]
+    end
   when 'kpi-chart'
-    qr = (b['Values'] || b['Y'] || []).first
+    # A single-value PBI card -> kpi-chart. A multiRowCard (multiple Values) ->
+    # ONE kpi-chart tile per measure (bead x81l: a kpi-chart renders only
+    # value.id, so a flat table or single-value KPI would drop the rest).
+    # Returns an ARRAY here; the page/layout assembly flattens + tiles them.
+    vals = (b['Values'] || b['Y'] || [])
+    if vals.length > 1
+      return vals.each_with_index.map do |qr, i|
+        fs = field_spec(qr, fields)
+        kid = "#{eid}-k#{i}"
+        col = { 'id' => "#{kid}-v", 'formula' => measure_formula(fs), 'name' => qr.split('.').last }
+        apply_fmt(col, qr, fields, vfmts)
+        e = { 'id' => kid, 'kind' => 'kpi-chart', 'name' => qr.split('.').last,
+              'columns' => [col], 'value' => { 'columnId' => "#{kid}-v" } }
+        e['source'] = { 'elementId' => master_id, 'kind' => 'table' } if master_id
+        e
+      end
+    end
+    qr = vals.first
     fs = field_spec(qr, fields)
     cid = "#{eid}-v"
     col = { 'id' => cid, 'formula' => measure_formula(fs), 'name' => (qr || 'Value').split('.').last }
     apply_fmt(col, qr, fields, vfmts)
     cols << col
-    el['value'] = { 'id' => cid }
+    # KPI value binds by `columnId` (the API rejects `{id}` -> "value.columnId:
+    # Invalid string"; live readback also normalizes to columnId). NB: pie/donut
+    # `value` uses `{id}` — do not change that one.
+    el['value'] = { 'columnId' => cid }
   when 'bar-chart', 'line-chart', 'area-chart'
-    dim = (b['Category'] || b['Axis'] || b['X'] || []).first
+    # b['Group'] is the treemap/funnel category role (1zh9) — alias it to the dim
+    # so a treemap-as-bar fallback keeps its category instead of emitting '[]'.
+    dim = (b['Category'] || b['Axis'] || b['X'] || b['Group'] || []).first
     meas = (b['Y'] || b['Values'] || [])
     series = (b['Series'] || b['Legend'] || []).first
     dfs = field_spec(dim, fields)
@@ -221,6 +271,9 @@ def build_element(rec, fields, masters)
     # Stacking fidelity: emit explicitly so a multi-series clustered PBI chart does
     # NOT inherit Sigma's stacked default. PBI clustered->"none", stacked->"stacked",
     # 100%-stacked->"100".
+    # Stacking enum is none|stacked|normalized (OpenAPI BarChart.stacking;
+    # "normalized" = scaled to 100%). extract-pbir already maps PBI 100%-stacked
+    # -> "normalized", so pass it through verbatim (bead pi8v).
     el['stacking'] = rec['stacking'] if kind == 'bar-chart' && rec['stacking']
     # c07: default to single series. Only split by color when PBI bound a
     # Series/Legend role. Never auto-color a line by a dimension that PBI did
@@ -231,6 +284,37 @@ def build_element(rec, fields, masters)
       cols << { 'id' => scid, 'formula' => sfs['ref'], 'name' => series.split('.').last }
       el['color'] = { 'by' => 'category', 'column' => scid }
     end
+  when 'combo-chart'
+    # bead 6v5u: PBI lineClustered/StackedColumnComboChart -> Sigma combo. Roles:
+    # Category (x), Y (columns -> primary/left axis), Y2 (lines -> secondary/right
+    # axis). Dual-axis persists via the bare-string-vs-object form of
+    # yAxis.columnIds (feedback_sigma_combo_dual_axis): bare string = primary,
+    # {columnId, type:'line'} = secondary line.
+    dim = (b['Category'] || b['Axis'] || b['X'] || []).first
+    col_meas  = (b['Y'] || b['Values'] || [])
+    line_meas = (b['Y2'] || [])
+    dfs = field_spec(dim, fields)
+    dcid = "#{eid}-x"
+    cols << { 'id' => dcid, 'formula' => dfs['ref'], 'name' => (dim || 'Dim').split('.').last }
+    ycids = []
+    col_meas.each_with_index do |qr, i|
+      fs = field_spec(qr, fields)
+      cid = "#{eid}-y#{i}"
+      col = { 'id' => cid, 'formula' => measure_formula(fs), 'name' => qr.split('.').last }
+      apply_fmt(col, qr, fields, vfmts)
+      cols << col
+      ycids << cid                                   # bare string -> primary (left) bars
+    end
+    line_meas.each_with_index do |qr, i|
+      fs = field_spec(qr, fields)
+      cid = "#{eid}-l#{i}"
+      col = { 'id' => cid, 'formula' => measure_formula(fs), 'name' => qr.split('.').last }
+      apply_fmt(col, qr, fields, vfmts)
+      cols << col
+      ycids << { 'columnId' => cid, 'type' => 'line' } # object -> secondary (right) line
+    end
+    el['xAxis'] = { 'columnId' => dcid }
+    el['yAxis'] = { 'columnIds' => ycids }
   when 'scatter-chart'
     # bead 14w(b): scatter -> xAxis (measure), yAxis (measure), point category for
     # color/detail. PBI scatter binds X + Y (both measures) and a Category/Details.
@@ -267,23 +351,27 @@ def build_element(rec, fields, masters)
     # grouping whose `calculations` lists the measure col ids (bead 14w(f)).
     # The first non-aggregated (dimension) column becomes the groupBy; every
     # aggregated column id goes into that grouping's calculations[].
-    group_id = nil; calc_ids = []
+    # bead ne48: group by ALL leading dimension columns, not just the first —
+    # otherwise a 2-dim matrix (e.g. Order Size Band × Region) collapses to the
+    # wrong grain. A field with an explicit `formula` (bead qb2i window calc) is a
+    # calculation, never a groupBy dimension.
+    group_ids = []; calc_ids = []
     (b['Values'] || []).each_with_index do |qr, i|
       fs = field_spec(qr, fields)
       cid = "#{eid}-c#{i}"
-      is_dim = fs['agg'].to_s.empty?
+      is_dim = fs['agg'].to_s.empty? && fs['formula'].to_s.empty?
       col = { 'id' => cid, 'formula' => is_dim ? fs['ref'] : measure_formula(fs),
               'name' => qr.split('.').last }
       apply_fmt(col, qr, fields, vfmts) unless is_dim
       cols << col
       if is_dim
-        group_id ||= cid
+        group_ids << cid
       else
         calc_ids << cid
       end
     end
-    if group_id && !calc_ids.empty?
-      el['groupings'] = [{ 'id' => "#{eid}-g", 'groupBy' => [group_id], 'calculations' => calc_ids }]
+    if !group_ids.empty? && !calc_ids.empty?
+      el['groupings'] = [{ 'id' => "#{eid}-g", 'groupBy' => group_ids, 'calculations' => calc_ids }]
     end
   when 'pivot-table'
     rows = (b['Rows'] || b['Category'] || [])
@@ -317,7 +405,8 @@ def build_element(rec, fields, masters)
     el['values'] = valids
   end
 
-  el['columns'] = cols
+  # Controls reference a master column; they carry no columns array of their own.
+  el['columns'] = cols unless el['kind'] == 'control'
   el
 end
 
@@ -333,33 +422,84 @@ data_elements = masters.map do |_name, m|
 end
 
 content_pages = signals['pages'].map do |pg|
-  els = pg['visuals'].map { |v| build_element(v, fields, masters) }
+  # build_element may return one element or an array (multiRowCard -> N KPIs).
+  els = pg['visuals'].flat_map do |v|
+    r = build_element(v, fields, masters)
+    r.is_a?(Array) ? r : [r]   # NB: not Array(r) — that explodes a Hash into pairs
+  end
   { 'id' => "page-#{pg['page_id']}", 'name' => pg['page_title'], 'elements' => els }
 end
 
-# ---- 24-col grid layout (research/powerbi-visual-layout.md §4) -------------
-# Built BEFORE the spec is assembled so the layout XML can be EMBEDDED into the
-# workbook spec's top-level `layout` (bead 16i): a bare POST/PUT /workbooks/spec
-# WITHOUT an embedded layout makes Sigma auto-generate a single-column stack
-# that wipes any grid. Embedding it on every write means the layout survives the
-# initial POST; put-layout.rb is still the authoritative FINAL write.
+# ---- Tier-1 "build nicely" design-pass layout ------------------------------
+# A faithful migration must still LOOK built: KPIs grouped in a sized container
+# strip (not crammed boxes that clip their labels — feedback_sigma_kpi_label_height),
+# controls on their own band, charts below in source order. Containers pair with
+# <GridContainer> in the XML (a leaf <LayoutElement> with children silently drops
+# them — see sigma-workbooks/layout.md). Branded hero / recolor / section polish
+# are Tier-2 ENHANCEMENTS, deliberately NOT here. (bead p4h: end lines are
+# floor((start+size)/unit)+1, end-EXCLUSIVE, so adjacent items don't collide.)
+ROW_UNIT = 30.0
 col_for = ->(x, w, pw) {
   unit = pw / 24.0
   cs = (x / unit).floor + 1
-  ce = ((x + w - 1) / unit).floor + 2
+  ce = ((x + w) / unit).floor + 1
+  ce = cs + 1 if ce <= cs
   [[cs, 1].max, [ce, 25].min]
 }
-ROW_UNIT = 30.0
-pages_xml = signals['pages'].map do |pg|
-  pw = pg['page_w'] || 1280
-  les = pg['visuals'].map do |v|
-    cs, ce = col_for.call(v['x'], v['w'], pw)
-    rs = (v['y'] / ROW_UNIT).floor + 1
-    re = ((v['y'] + v['h']) / ROW_UNIT).ceil + 1
-    eid = "el-#{short(v['visual_id'])}"
-    %(  <LayoutElement elementId="#{eid}" gridColumn="#{cs} / #{ce}" gridRow="#{rs} / #{re}"/>)
-  end.join("\n")
-  %(<Page type="grid" gridTemplateColumns="repeat(24, 1fr)" gridTemplateRows="auto" id="page-#{pg['page_id']}">\n#{les}\n</Page>)
+# source position per emitted element id (for non-KPI elements)
+pos_by_id = {}
+signals['pages'].each do |pg|
+  pg['visuals'].each { |v| pos_by_id["el-#{short(v['visual_id'])}"] = v }
+end
+
+pages_xml = content_pages.map do |cp|
+  pid = cp['id']
+  src = signals['pages'].find { |p| "page-#{p['page_id']}" == pid }
+  pw  = (src && src['page_w']) || 1280
+  kpi_ids  = cp['elements'].select { |e| e['kind'] == 'kpi-chart' }.map { |e| e['id'] }
+  ctrl_ids = cp['elements'].select { |e| e['kind'] == 'control' }.map { |e| e['id'] }
+  other    = cp['elements'].reject { |e| %w[kpi-chart control].include?(e['kind']) }.map { |e| e['id'] }
+  lines = []
+  next_row = 1
+  # KPI band -> one sized container strip (each tile full-height for its label)
+  if kpi_ids.any?
+    cid = "kpistrip-#{pid}"
+    cp['elements'] << { 'id' => cid, 'kind' => 'container',
+      'style' => { 'backgroundColor' => '#FFFFFF', 'borderRadius' => 'round',
+                   'borderColor' => '#E2E8F0', 'borderWidth' => 1 } }
+    n = kpi_ids.length
+    inner = kpi_ids.each_with_index.map do |id, i|
+      scs = (i * 24.0 / n).round + 1
+      sce = ((i + 1) * 24.0 / n).round + 1
+      sce = scs + 1 if sce <= scs
+      %(    <LayoutElement elementId="#{id}" gridColumn="#{scs} / #{sce}" gridRow="1 / 6"/>)
+    end.join("\n")
+    lines << %(  <GridContainer elementId="#{cid}" type="grid" gridColumn="1 / 25" gridRow="1 / 6" gridTemplateColumns="repeat(24, 1fr)" gridTemplateRows="auto">\n#{inner}\n  </GridContainer>)
+    next_row = 6
+  end
+  # controls on their own short band, left-aligned
+  ctrl_ids.each_with_index do |id, i|
+    cs = 1 + i * 7
+    lines << %(  <LayoutElement elementId="#{id}" gridColumn="#{cs} / #{[cs + 6, 25].min}" gridRow="#{next_row} / #{next_row + 2}"/>)
+  end
+  next_row += 2 if ctrl_ids.any?
+  # other elements: keep source columns/relative rows, rebased to start below the band
+  src_rows = other.map { |id| (pos = pos_by_id[id]) ? (pos['y'] / ROW_UNIT).floor + 1 : 1 }
+  shift = other.empty? ? 0 : (next_row - src_rows.min)
+  other.each do |id|
+    pos = pos_by_id[id]
+    if pos
+      cs, ce = col_for.call(pos['x'], pos['w'], pw)
+      rs = (pos['y'] / ROW_UNIT).floor + 1 + shift
+      re = ((pos['y'] + pos['h']) / ROW_UNIT).floor + 1 + shift
+      re = rs + 1 if re <= rs
+      lines << %(  <LayoutElement elementId="#{id}" gridColumn="#{cs} / #{ce}" gridRow="#{rs} / #{re}"/>)
+    else
+      lines << %(  <LayoutElement elementId="#{id}" gridColumn="1 / 25" gridRow="#{next_row} / #{next_row + 8}"/>)
+      next_row += 8
+    end
+  end
+  %(<Page type="grid" gridTemplateColumns="repeat(24, 1fr)" gridTemplateRows="auto" id="#{pid}">\n#{lines.join("\n")}\n</Page>)
 end.join("\n")
 layout_xml = %(<?xml version="1.0" encoding="utf-8"?>\n#{pages_xml}\n)
 
