@@ -1,3 +1,6 @@
+> [!WARNING]
+> **ARCHIVED (2026-06-10).** This staging repo is no longer in use. The live, maintained source of truth for all migration skills is **[`twells89/sigma-migration-skills`](https://github.com/twells89/sigma-migration-skills)** (plugin layout — `plugins/<tool>-to-sigma/skills/...`). Content here is stale; several scripts contain bugs already fixed in the live repo (e.g. `find-or-pick-dm.rb` source.path array handling). Do not point agents, symlinks, or docs at this repo.
+
 # Sigma AI Coding-Agent Skills — Staging
 
 Private staging counterpart to [`twells89/sigma-skills`](https://github.com/twells89/sigma-skills). Skills and research living here are **not yet ready to graduate** to the main repo. Expect rough edges, missing docs, and breaking changes between commits.
